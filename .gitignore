@@ -9,4 +9,7 @@ dist/
 !.dev.vars.example
 
 # bun
-bun.lockb
+bun.lock
+
+# plans
+docs/plans/
