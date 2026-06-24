@@ -1,0 +1,12 @@
+node_modules/
+.wrangler/
+dist/
+*.log
+
+# wrangler local secrets
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# bun
+bun.lockb

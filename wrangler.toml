@@ -1,0 +1,31 @@
+name = "cf-edgenix"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# ─────────────────────────────────────────────────────────────
+# Bindings
+#   R2  : NAR / narinfo の正本（source of truth / read path の終点）
+#   KV  : narinfo / nix-cache-info の速度層（結果整合・正本ではない）
+#   D1  : control plane（build履歴 / latest / rollback root / GC live set）
+# spec docs/spec.md §4, §6, §7 を参照。
+# 実 ID は `wrangler r2 bucket create` / `kv namespace create` / `d1 create` で発行して埋める。
+# ─────────────────────────────────────────────────────────────
+
+[[r2_buckets]]
+binding = "NAR_BUCKET"
+bucket_name = "cf-edgenix-nar"
+
+[[kv_namespaces]]
+binding = "META_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[[d1_databases]]
+binding = "CONTROL_DB"
+database_name = "cf-edgenix-control"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[vars]
+# nix-cache-info の Priority。小さいほど優先（公式 cache.nixos.org は 40）。
+CACHE_INFO_PRIORITY = "30"

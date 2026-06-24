@@ -1,0 +1,6 @@
+# wrangler dev 用のローカル秘密値。コピーして .dev.vars を作る。
+# 本番値は `wrangler secret put` / GitHub Actions secret に置く（リポジトリには絶対コミットしない）。
+
+# 管理API（publish / rollback / GC）の認証トークン。
+# Nix の署名検証の外側にある control plane を守るためのもの（spec §9.1）。
+ADMIN_TOKEN="dev-only-change-me"

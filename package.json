@@ -1,0 +1,37 @@
+{
+  "name": "cf-edgenix",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Cloudflare-native Nix binary cache (Workers + R2 + KV + D1)",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:watch": "vitest",
+    "cf-typegen": "wrangler types",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate:local": "wrangler d1 migrations apply CONTROL_DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply CONTROL_DB --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.16.19",
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "@types/bun": "^1.3.14",
+    "drizzle-kit": "^0.31.10",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.9",
+    "wrangler": "^3.78.0"
+  },
+  "dependencies": {
+    "@hono/zod-openapi": "^1.4.0",
+    "@hono/zod-validator": "^0.8.0",
+    "drizzle-orm": "^0.45.2",
+    "drizzle-zod": "^0.8.3",
+    "hono": "^4.12.27",
+    "zod": "^4.4.3"
+  }
+}
