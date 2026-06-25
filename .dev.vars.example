@@ -4,3 +4,5 @@
 # 管理API（publish / rollback / GC）の認証トークン。
 # Nix の署名検証の外側にある control plane を守るためのもの（spec §9.1）。
 ADMIN_TOKEN="dev-only-change-me"
+CF_ANALYTICS_TOKEN="dev-only-or-leave-empty"
+CF_ACCOUNT_ID="your-cloudflare-account-id"

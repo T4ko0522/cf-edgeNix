@@ -29,3 +29,9 @@ migrations_dir = "migrations"
 [vars]
 # nix-cache-info の Priority。小さいほど優先（公式 cache.nixos.org は 40）。
 CACHE_INFO_PRIORITY = "30"
+# quota kill-switch 用。deploy 前に実 Cloudflare Account ID に置換すること。
+CF_ACCOUNT_ID = "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID"
+QUOTA_R2_BUCKET_NAME = "cf-edgenix-nar"
+
+[triggers]
+crons = ["*/5 * * * *"]

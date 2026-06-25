@@ -23,3 +23,6 @@ export function narinfoKVKey(storeHash: string): string {
 
 /** KV 上の nix-cache-info キー。 */
 export const CACHE_INFO_KV_KEY = "nix-cache-info";
+
+/** KV 上の quota kill-switch state キー。 */
+export const QUOTA_STATE_KV_KEY = "quota:state";

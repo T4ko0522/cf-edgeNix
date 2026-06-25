@@ -4,6 +4,8 @@ import { handleCacheInfo } from "./handlers/cacheInfo";
 import { handleNarinfo } from "./handlers/narinfo";
 import { handleNar } from "./handlers/nar";
 import { apiApp } from "./api/app";
+import { checkReadPathAllowed } from "./quota/guard";
+import { runQuotaCheck } from "./quota/cron";
 
 /**
  * cf-edgeNix Worker entry。
@@ -23,6 +25,10 @@ export default {
     }
 
     const r = route(url.pathname);
+    if (r.kind !== "not-found") {
+      const allowed = await checkReadPathAllowed(env);
+      if (!allowed.ok) return allowed.response;
+    }
 
     switch (r.kind) {
       case "cache-info":
@@ -40,6 +46,14 @@ export default {
       case "not-found":
         return new Response("not found\n", { status: 404 });
     }
+  },
+
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (!env.CF_ACCOUNT_ID || !env.CF_ANALYTICS_TOKEN) {
+      console.warn("[quota] CF_ACCOUNT_ID or CF_ANALYTICS_TOKEN not set; skipping check");
+      return;
+    }
+    await runQuotaCheck(env, ctx, new Date());
   },
 } satisfies ExportedHandler<Env>;
 

@@ -23,6 +23,13 @@ import {
   PublishStartRequestSchema,
   PublishStartResponseSchema,
 } from "../schemas/publish";
+import {
+  QuotaAdminStatusResponseSchema,
+  QuotaPublicStatusResponseSchema,
+  QuotaResetResponseSchema,
+} from "../schemas/quota";
+import { currentMonthUtc } from "../quota/guard";
+import { clearQuotaSnapshot, getQuotaSnapshot } from "../quota/state";
 import { getDb } from "../db/client";
 import {
   BuildNotFoundError,
@@ -208,6 +215,26 @@ const gcDryRunRoute = createRoute({
   },
 });
 
+const quotaResetRoute = createRoute({
+  method: "post",
+  path: "/api/quota/reset",
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: {
+      content: { "application/json": { schema: QuotaResetResponseSchema } },
+      description: "quota state reset",
+    },
+    401: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "認証失敗",
+    },
+    403: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "ADMIN_TOKEN 未設定",
+    },
+  },
+});
+
 // ─── read 系 route 定義（認証不要） ──────────────────────────────────────────
 
 const latestBuildRoute = createRoute({
@@ -260,6 +287,37 @@ const manifestRoute = createRoute({
   },
 });
 
+const quotaStatusRoute = createRoute({
+  method: "get",
+  path: "/api/quota/status",
+  responses: {
+    200: {
+      content: { "application/json": { schema: QuotaPublicStatusResponseSchema } },
+      description: "quota state",
+    },
+  },
+});
+
+const quotaMetricsRoute = createRoute({
+  method: "get",
+  path: "/api/quota/metrics",
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: {
+      content: { "application/json": { schema: QuotaAdminStatusResponseSchema } },
+      description: "quota metrics",
+    },
+    401: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "認証失敗",
+    },
+    403: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "ADMIN_TOKEN 未設定",
+    },
+  },
+});
+
 // ─── エラーハンドリングヘルパ ─────────────────────────────────────────────────
 
 function errorStatus(err: unknown): 400 | 404 | 409 | 500 {
@@ -283,6 +341,8 @@ function errorMessage(err: unknown): string {
 
 apiApp.use("/api/publish/*", adminAuthMiddleware);
 apiApp.use("/api/gc/*", adminAuthMiddleware);
+apiApp.use("/api/quota/metrics", adminAuthMiddleware);
+apiApp.use("/api/quota/reset", adminAuthMiddleware);
 apiApp.use(
   "/api/hosts/:host/rollback",
   adminAuthMiddleware,
@@ -356,6 +416,11 @@ apiApp.openapi(gcDryRunRoute, async (c) => {
   }, 200);
 });
 
+apiApp.openapi(quotaResetRoute, async (c) => {
+  await clearQuotaSnapshot(c.env);
+  return c.json({ ok: true as const, state: "ok" as const }, 200);
+});
+
 // ─── read 系 route 登録 ───────────────────────────────────────────────────────
 
 apiApp.openapi(latestBuildRoute, async (c) => {
@@ -419,6 +484,26 @@ apiApp.openapi(manifestRoute, async (c) => {
     manifestHash: manifest.manifestHash,
     createdAt: manifest.createdAt,
   }, 200);
+});
+
+apiApp.openapi(quotaStatusRoute, async (c) => {
+  const snapshot = await getQuotaSnapshot(c.env);
+  if (snapshot === null) {
+    return c.json({ state: "ok" as const, checkedAt: null, month: currentMonthUtc(new Date()) }, 200);
+  }
+  return c.json({
+    state: snapshot.state,
+    checkedAt: snapshot.checkedAt,
+    month: snapshot.month,
+  }, 200);
+});
+
+apiApp.openapi(quotaMetricsRoute, async (c) => {
+  const snapshot = await getQuotaSnapshot(c.env);
+  if (snapshot === null) {
+    return c.json({ state: "ok" as const, checkedAt: null, month: currentMonthUtc(new Date()) }, 200);
+  }
+  return c.json(snapshot, 200);
 });
 
 // ─── OpenAPI document ─────────────────────────────────────────────────────────

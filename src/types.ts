@@ -12,6 +12,12 @@ export interface Env {
 
   /** nix-cache-info の Priority 値（文字列）。 */
   CACHE_INFO_PRIORITY?: string;
+  /** Cloudflare account ID (analytics API の accountTag) */
+  CF_ACCOUNT_ID?: string;
+  /** Cloudflare GraphQL Analytics API token (Account Analytics: Read) */
+  CF_ANALYTICS_TOKEN?: string;
+  /** quota 監視対象の R2 バケット名 */
+  QUOTA_R2_BUCKET_NAME?: string;
   /** 管理API（publish / rollback / GC）の認証トークン（secret）。 */
   ADMIN_TOKEN?: string;
 }
