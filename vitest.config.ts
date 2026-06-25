@@ -13,6 +13,10 @@ export default defineConfig({
             "test/nar/range.test.ts",
             "test/publish/transform.test.ts",
             "test/api.routing.test.ts",
+            "test/quota/evaluate.test.ts",
+            "test/quota/guard.test.ts",
+            "test/quota/state.test.ts",
+            "test/quota/analytics.test.ts",
             // test/db/queries.test.ts は統合テストへ移行（偽陽性解消）
             "test/schemas/params.test.ts",
             "test/schemas/publish.test.ts",

@@ -11,8 +11,10 @@
  *
  * 注: read 系 GET に対し 401/403 が返る場合は認証が誤って挟まっているバグを示す。
  */
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test } from "vitest";
 import { apiApp } from "../src/api/app";
+import { __resetForTest } from "../src/quota/state";
+import type { QuotaSnapshot } from "../src/quota/types";
 
 // ─── テスト用 Env ─────────────────────────────────────────────────────────────
 
@@ -33,15 +35,39 @@ function makeFakeD1(): D1Database {
   } as unknown as D1Database;
 }
 
-function makeEnv(opts?: { adminToken?: string }) {
+function quotaSnapshot(): QuotaSnapshot {
+  return {
+    state: "killed",
+    month: "2026-06",
+    checkedAt: 1_719_273_600,
+    metrics: {
+      storageBytes: { value: 9_500_000_000, limit: 10_000_000_000, ratio: 0.95 },
+      classAOperations: { value: 0, limit: 1_000_000, ratio: 0 },
+      classBOperations: { value: 0, limit: 10_000_000, ratio: 0 },
+    },
+    reason: "storageBytes exceeded 95% (9500000000/10000000000)",
+  };
+}
+
+function makeEnv(opts?: { adminToken?: string; quotaSnapshot?: QuotaSnapshot | null }) {
+  const quotaValue = opts?.quotaSnapshot === undefined
+    ? null
+    : opts.quotaSnapshot === null ? null : JSON.stringify(opts.quotaSnapshot);
   return {
     NAR_BUCKET: {} as R2Bucket,
-    META_KV: {} as KVNamespace,
+    META_KV: {
+      get: async () => quotaValue,
+      put: async () => undefined,
+    } as unknown as KVNamespace,
     CONTROL_DB: makeFakeD1(),
     ADMIN_TOKEN: opts?.adminToken,
     CACHE_INFO_PRIORITY: "r2",
   };
 }
+
+afterEach(() => {
+  __resetForTest();
+});
 
 // ─── write 系: 認証ガード ─────────────────────────────────────────────────────
 
@@ -180,5 +206,39 @@ describe("read 系 GET - 認証不要（401/403 を返さない）", () => {
     const res = await apiApp.fetch(req, env);
     expect(res.status).not.toBe(401);
     expect(res.status).not.toBe(403);
+  });
+
+  test("GET /api/quota/status: 認証なしで public state のみ返す", async () => {
+    const env = makeEnv({ quotaSnapshot: quotaSnapshot() });
+    const req = new Request("https://example.com/api/quota/status");
+    const res = await apiApp.fetch(req, env);
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      state: "killed",
+      checkedAt: 1_719_273_600,
+      month: "2026-06",
+    });
+  });
+});
+
+describe("quota metrics - 管理者専用", () => {
+  test("GET /api/quota/metrics: Authorization なし → 401", async () => {
+    const env = makeEnv({ adminToken: "secret", quotaSnapshot: quotaSnapshot() });
+    const req = new Request("https://example.com/api/quota/metrics");
+    const res = await apiApp.fetch(req, env);
+    expect(res.status).toBe(401);
+  });
+
+  test("GET /api/quota/metrics: 認証ありなら snapshot 全体を返す", async () => {
+    const expected = quotaSnapshot();
+    const env = makeEnv({ adminToken: "secret", quotaSnapshot: expected });
+    const req = new Request("https://example.com/api/quota/metrics", {
+      headers: { Authorization: "Bearer secret" },
+    });
+    const res = await apiApp.fetch(req, env);
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual(expected);
   });
 });
