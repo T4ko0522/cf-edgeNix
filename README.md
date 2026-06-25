@@ -57,11 +57,14 @@ test/                 vitest（unit: node env / integration: @cloudflare/vitest-
 | GET | `/api/hosts/:host/latest` | 不要 | host の latest published build |
 | GET | `/api/hosts/:host/builds` | 不要 | build 履歴 |
 | GET | `/api/builds/:id/manifest.json` | 不要 | 復元用 manifest |
+| GET | `/api/quota/status` | 不要 | R2 無料枠 kill-switch の現在 state |
+| GET | `/api/quota/metrics` | Bearer | R2 無料枠 kill-switch の詳細 metrics |
 | POST | `/api/publish/start` | Bearer | staging build 作成（latest 不変） |
 | POST | `/api/publish/:build_id/ingest` | Bearer | store_paths を chunk 分割で冪等投入 |
 | POST | `/api/publish/:build_id/finalize` | Bearer | D1 published 確定 + latest 更新（1 batch） |
 | POST | `/api/hosts/:host/rollback` | Bearer | rollback root 登録 |
 | POST | `/api/gc/dry-run` | Bearer | GC live-set 計算（削除はしない） |
+| POST | `/api/quota/reset` | Bearer | kill-switch state を `ok` に手動解除 |
 | GET | `/api/openapi.json` | 不要 | OpenAPI 3.0 スキーマ（hono/zod-openapi 自動生成） |
 
 - read 系（GET/HEAD）は認証不要。`nixos-rebuild` から直接叩かれる。
@@ -102,6 +105,8 @@ bun run db:migrate:remote
 ```
 
 ### 4. Worker デプロイ
+
+deploy 前に `wrangler.toml` の `[vars]` にある `CF_ACCOUNT_ID = "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID"` を実 Cloudflare Account ID へ書き換える。
 
 ```bash
 bun run deploy
@@ -160,6 +165,8 @@ bun run dev
 
 ```
 ADMIN_TOKEN=dev-secret
+CF_ANALYTICS_TOKEN=dev-only-or-leave-empty
+CF_ACCOUNT_ID=your-cloudflare-account-id
 ```
 
 ### Cloudflare リソース作成（初回）
@@ -192,9 +199,12 @@ bash scripts/publish.sh
 | --- | --- | --- | --- |
 | `CACHE_PRIVATE_KEY` | Secret | `nix copy` が生成する NAR / narinfo の署名秘密鍵。fork PR に絶対露出させない。 | GitHub Actions Secret（protected environment `production`） |
 | `ADMIN_TOKEN` | Secret | Worker 管理 API（write 系）の Bearer トークン。未設定時は write 系が 403 になる。 | `.dev.vars`（ローカル）/ GitHub Actions Secret |
+| `CF_ANALYTICS_TOKEN` | Secret | Cron が Cloudflare GraphQL Analytics API から R2 月次使用量を読むためのトークン。 | `.dev.vars`（ローカル）/ `wrangler secret put` |
 | `CLOUDFLARE_API_TOKEN` | Secret | R2 write / KV write 最小権限の Cloudflare トークン（wrangler CLI が参照）。 | GitHub Actions Secret |
+| `CF_ACCOUNT_ID` | 変数 | Worker の quota Cron が参照する Cloudflare アカウント ID。 | `wrangler.toml` `[vars]` / `.dev.vars` |
 | `CLOUDFLARE_ACCOUNT_ID` | 変数 | Cloudflare アカウント ID（wrangler CLI が参照）。 | GitHub Actions Variable |
 | `API_BASE_URL` | 変数 | デプロイ済み Worker の URL（例: `https://cf-edgenix.<account>.workers.dev`）。 | GitHub Actions Variable |
+| `QUOTA_R2_BUCKET_NAME` | 変数 | quota 監視対象の R2 バケット名（例: `cf-edgenix-nar`）。 | `wrangler.toml` `[vars]` |
 | `R2_BUCKET_NAME` | 変数 | R2 バケット名（例: `cf-edgenix-nar`）。 | GitHub Actions Variable |
 | `KV_NAMESPACE_ID` | 変数 | KV 名前空間 ID。 | GitHub Actions Variable |
 | `HOST` | 変数 | publish 対象の nixosConfiguration 名（例: `myhost`）。 | GitHub Actions input / スクリプト引数 |
@@ -203,8 +213,15 @@ bash scripts/publish.sh
 | `CLOUDFLARE_D1_TOKEN` | 変数 | drizzle-kit が使う D1 API トークン（`db:generate` 実行時のみ必要）。 | ローカル開発環境 |
 
 - `CLOUDFLARE_API_TOKEN` は R2 write と KV write を最小権限でカバーするトークンを使う。
-- `wrangler.toml` の `[vars]` には `CACHE_INFO_PRIORITY` のみ残す。Secret 類は絶対に `[vars]` に書かない。
+- `wrangler.toml` の `[vars]` には `CACHE_INFO_PRIORITY` / `CF_ACCOUNT_ID` / `QUOTA_R2_BUCKET_NAME` などの非 Secret のみ置く。Secret 類は絶対に `[vars]` に書かない。
+- `CF_ACCOUNT_ID` のプレースホルダーは deploy 前に実 Cloudflare Account ID へ書き換える。
 - `drizzle.config.ts` の `dbCredentials` は環境変数参照のみ（`CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_D1_DATABASE_ID` / `CLOUDFLARE_D1_TOKEN`）。
+
+## 無料枠 kill-switch
+
+Cron Trigger が 5 分ごとに Cloudflare GraphQL Analytics API を読み、R2 の storage / Class A / Class B 操作数が月次無料枠の 80% 以上で `warn`、95% 以上で `killed` に遷移する。`killed` 中は `/api/*` 以外の read path が 503 を返す。
+
+現在 state は `GET /api/quota/status` で確認できる。詳細 metrics は `GET /api/quota/metrics` を Bearer 認証付きで取得する。運用手順、必要な Cloudflare token 権限、手動解除方法は [`docs/quota.md`](docs/quota.md) を参照。
 
 ### 管理 read API の公開について
 
