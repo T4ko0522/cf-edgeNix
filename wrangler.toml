@@ -50,3 +50,9 @@ QUOTA_R2_BUCKET_NAME = "cf-edgenix-nar"
 
 [triggers]
 crons = ["*/5 * * * *"]
+
+# Workers Logs を有効化（dashboard の Logs タブ / wrangler tail で確認可能）。
+# invocation_logs = true で 1 リクエスト 1 行のサマリログも残す。
+[observability.logs]
+enabled = true
+invocation_logs = true
