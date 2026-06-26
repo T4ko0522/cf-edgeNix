@@ -1,34 +1,47 @@
-# 開発
+# Contributing / 開発
+
+## devShell
 
 ```bash
-# devShell に入る（bun / nodejs / zstd / nix はここで提供される）
+# bun / nodejs / zstd / nix が揃った devShell に入る
 nix develop
 
 bun install
 bun run typecheck
+```
 
+## テスト
+
+```bash
 # unit テスト（node 環境）
 bun run test          # = vitest run --project unit
 
 # integration テスト（@cloudflare/vitest-pool-workers / workerd 使用）
 # CI (Ubuntu) では:
 npx vitest run --project integration
-# NixOS 環境では workerd バイナリに動的リンクが必要なため steam-run 必須:
+# NixOS では workerd バイナリの動的リンクのため steam-run が必須:
 steam-run npx vitest run --project integration
+```
 
-# Drizzle schema から migration SQL を再生成（src/db/schema.ts を変更した場合）
+## D1 schema 変更
+
+```bash
+# src/db/schema.ts を変更したら:
 bun run db:generate          # drizzle/ ディレクトリに差分 SQL を生成
 # 内容を確認後、migrations/0001_init.sql へ反映してから:
 bun run db:migrate:local     # ローカル D1 へ適用
+```
 
-# 管理トークンの設定（ローカル開発）
-echo 'ADMIN_TOKEN=dev-secret' >> .dev.vars   # .dev.vars は .gitignore 済み
+## ローカル起動
 
-# ローカル起動（要 wrangler.toml の binding id 設定・.dev.vars に ADMIN_TOKEN）
+```bash
+# 管理トークンの設定（.dev.vars は .gitignore 済み）
+echo 'ADMIN_TOKEN=dev-secret' >> .dev.vars
+
 bun run dev
 ```
 
-## .dev.vars の例
+### `.dev.vars` の例
 
 `.dev.vars` は wrangler がローカル開発時に読む秘密値ファイル。`.gitignore` 済みなのでコミットされない。
 
@@ -38,11 +51,11 @@ CF_ANALYTICS_TOKEN=dev-only-or-leave-empty
 CF_ACCOUNT_ID=your-cloudflare-account-id
 ```
 
-## publish を手動実行する
+## publish を手元から叩く
 
-手元から publish を叩く手順（環境変数と `scripts/publish.sh` の呼び出し方）は [`docs/publish.md` §手動実行](docs/publish.md#手動実行) を参照。
+[`docs/publish.md` §手動実行](docs/publish.md#手動実行) を参照。
 
-## 環境変数・Secret
+## 環境変数 / Secret リファレンス
 
 | 変数名 | 種別 | 用途 | 設定場所 |
 | --- | --- | --- | --- |
@@ -62,5 +75,5 @@ CF_ACCOUNT_ID=your-cloudflare-account-id
 | `CLOUDFLARE_D1_TOKEN` | 変数 | drizzle-kit が使う D1 API トークン（`db:generate` 実行時のみ必要）。 | ローカル開発環境 |
 
 - `CLOUDFLARE_API_TOKEN` は R2 write と KV write を最小権限でカバーするトークンを使う。
-- `wrangler.toml` の `[vars]` には `CACHE_INFO_PRIORITY` / `CF_ACCOUNT_ID` / `QUOTA_R2_BUCKET_NAME` などの非 Secret のみ置く。Secret 類は絶対に `[vars]` に書かない。`CF_ACCOUNT_ID` のプレースホルダー書き換えは README の [Quick Start §4](README.md#4-worker-デプロイ) を参照。
+- `wrangler.toml` の `[vars]` には `CACHE_INFO_PRIORITY` / `CF_ACCOUNT_ID` / `QUOTA_R2_BUCKET_NAME` などの非 Secret のみ置く。Secret 類は絶対に `[vars]` に書かない。`CF_ACCOUNT_ID` のプレースホルダー書き換えは [`docs/setup.md` §4](docs/setup.md#4-worker-デプロイ) を参照。
 - `drizzle.config.ts` の `dbCredentials` は環境変数参照のみ（`CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_D1_DATABASE_ID` / `CLOUDFLARE_D1_TOKEN`）。

@@ -1,109 +1,94 @@
-# cf-edgeNix
+<p align="center">
+  <img src="cf-edgeNix.png" alt="cf-edgeNix — Cloudflare-native NixOS binary cache" />
+</p>
+
+# Cloudflare-native NixOS binary cache
 
 **English** | [日本語](README.ja.md)
 
-A Cloudflare-native NixOS binary cache.  
-GitHub Actions builds the NixOS system closure, and Cloudflare (R2 / KV / D1 / Workers) serves it as a global binary cache.
+cf-edgeNix turns a Cloudflare Workers deployment into a signed [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html). R2 holds the canonical NAR / narinfo, KV and the Workers Cache API are the speed layer, and D1 keeps build history, `latest`, rollback roots, and the GC live-set. Reads go `memory → KV → R2` (narinfo) and `Cache API → R2` (NAR); D1 is never on the read path.
 
-See [`docs/publish.md`](docs/publish.md) for publish operations.
+The goal is a global, signed binary cache that costs nothing on Cloudflare's free tier. A 5-minute cron tracks R2 quota and trips a kill-switch before you ever bill.
 
 ## Architecture
 
+### Read path — narinfo / nix-cache-info
+
 ```mermaid
 flowchart LR
-    Client["Nix client<br/>(nixos-rebuild)"]
-
-    subgraph pub["publish-side repo (e.g. t4ko0522/dotfiles)"]
-        GHA["GitHub Actions<br/>signed builder<br/>builds NixOS closure"]
-    end
-
-    subgraph cf["Cloudflare"]
-        CFB["Workers Builds<br/>auto-deploy on main push"]
-        W["Workers<br/>HTTP gateway + admin API"]
-        MEM[("memory<br/>L0 isolate cache")]
-        KV[("KV: META_KV<br/>narinfo / nix-cache-info<br/>speed layer, eventually consistent")]
-        CACHE[("Cache API<br/>NAR edge cache")]
-        R2[("R2: NAR_BUCKET<br/>NAR / narinfo source of truth")]
-        D1[("D1: CONTROL_DB<br/>build history / latest /<br/>rollback / GC live set")]
-    end
-
-    Client -- "GET narinfo /<br/>nix-cache-info" --> W
-    Client -- "GET/HEAD NAR<br/>(Range supported)" --> W
-    GHA -- "POST /api/publish/*" --> W
-
-    W -- "narinfo read" --> MEM
-    MEM -. "miss" .-> KV
-    KV -. "miss" .-> R2
-
-    W -- "NAR read<br/>(streaming)" --> CACHE
-    CACHE -. "miss" .-> R2
-
-    W <-- "control plane" --> D1
-
-    CFB -. "deploy" .-> W
+    Client[Nix client] --> W[Worker]
+    W --> MEM[(memory<br/>L0 isolate)]
+    MEM -. miss .-> KV[(KV: META_KV)]
+    KV -. miss .-> R2[(R2: NAR_BUCKET)]
 ```
 
-- **The publish workflow lives in the repo that owns the flake, not in cf-edgeNix.** Use the template at [`.github/templates/publish-cache.yml`](.github/templates/publish-cache.yml).
-- Cloudflare Workers Builds auto-deploys on push to `main` (no GitHub Actions deploy workflow).
-- **The narinfo / nix-cache-info read path is `memory → KV → R2` and never touches D1.**
+Three-tier lookup. KV is eventually consistent; R2 is the source of truth. `404` from R2 propagates to the client.
 
-## Quick Start
+### Read path — NAR body
 
-First-time setup walkthrough. Enter the dev shell with `nix develop` before running any of the commands below.
-
-### 1. Generate the signing key
-
-```bash
-# Generate a signing key (e.g. "nix-cache.example.com-1"; "-1" is the rotation number)
-nix-store --generate-binary-cache-key nix-cache.example.com-1 \
-  /path/to/cache-private-key.pem \
-  /path/to/cache-public-key.pem
-
-cat /path/to/cache-public-key.pem   # → note down "nix-cache.example.com-1:xxxx="
+```mermaid
+flowchart LR
+    Client[Nix client] -->|GET/HEAD, Range| W[Worker]
+    W --> CACHE[(Cache API<br/>edge cache)]
+    CACHE -. miss .-> R2[(R2: NAR_BUCKET)]
 ```
 
-Add the public key to your NixOS `trusted-public-keys` (see the client configuration below).
-Keep the private key only in the GitHub Actions `CACHE_PRIVATE_KEY` secret — never commit it.
+`Range: bytes=...` is honoured end-to-end. Misses stream directly from R2 without buffering.
 
-### 2. Create Cloudflare resources
+### Publish path
 
-```bash
-wrangler r2 bucket create cf-edgenix-nar
-wrangler kv namespace create META_KV          # paste the returned id into wrangler.toml META_KV id
-wrangler d1 create cf-edgenix-control         # paste the returned id into wrangler.toml CONTROL_DB database_id
+```mermaid
+flowchart LR
+    GHA[GitHub Actions<br/>publish-side repo] -->|POST /api/publish/*| W[Worker]
+    W --> R2[(R2)]
+    W --> D1[(D1: CONTROL_DB)]
+    W -. warm .-> KV[(KV)]
 ```
 
-### 3. Apply the D1 migration
+`start → ingest × N → finalize` is the only path that moves `latest`. NAR uploads precede narinfo; D1 commit precedes KV warming. Order is enforced in `scripts/publish.ts` and asserted in `test/publish/order.test.ts`.
 
-```bash
-bun run db:migrate:remote
+### Deploy path
+
+```mermaid
+flowchart LR
+    Repo[cf-edgeNix repo<br/>push to main] --> CFB[Cloudflare<br/>Workers Builds]
+    CFB --> W[Worker]
 ```
 
-### 4. Deploy the Worker
+No GitHub Actions deploy workflow. Workers Builds runs `wrangler d1 migrations apply --remote && wrangler deploy` on every push.
 
-Before deploying, replace `CF_ACCOUNT_ID = "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID"` in `wrangler.toml` `[vars]` with your real Cloudflare account ID.
+## Features
 
-#### Initial deploy (manual)
+### Nix binary cache protocol
 
-```bash
-bun run deploy
-# Record the resulting URL (e.g. https://cf-edgenix.<account>.workers.dev) as API_BASE_URL
-```
+- `nix-cache-info` with configurable `Priority` and `WantMassQuery`
+- Signed `.narinfo` (Ed25519, `nix-store --generate-binary-cache-key`)
+- zstd-compressed NAR bodies under `/nar/<file-hash>.nar.zst`
+- HTTP `Range` requests (`bytes=start-end`, `bytes=start-`, `bytes=-suffix`) with `206` responses
+- OpenAPI 3.0 schema auto-generated via `hono/zod-openapi` at `/api/openapi.json`
 
-#### Subsequent auto-deploys (Cloudflare Workers Builds)
+### Control plane (D1)
 
-Cloudflare auto-deploys on every push to `main`. No GitHub Actions deploy workflow is needed.
+- `staging → ingest → finalize` three-phase publish, finalize moves `latest` in a single `db.batch()`
+- Deterministic `build_id` = `sha256(host:system:gitRev:flakeLockHash:toplevelStorePath)[:36]` — re-runs are idempotent
+- Per-host build history with rollback root registration
+- GC dry-run that returns `dead_candidates` (NARs unreachable from any rollback root)
 
-In Cloudflare Dashboard → Workers & Pages → `cf-edgenix` → Settings → **Build**, connect the GitHub repo and configure:
+### Edge & cost
 
-- **Production branch**: `main`
-- **Build command**: `bun install`
-- **Deploy command**: `npx wrangler d1 migrations apply CONTROL_DB --remote && npx wrangler deploy`
-- **Root directory**: `/`
+- L0 in-isolate `memory` cache, L1 KV, L2 Cache API for NARs, R2 as source of truth
+- 5-minute cron polls Cloudflare GraphQL Analytics for R2 storage / Class A / Class B usage
+- `warn` at 80% of monthly free tier, `killed` at 95% — `killed` returns `503` on read paths to prevent billing surprise
+- Manual reset via `POST /api/quota/reset`
 
-Only the Workers Builds Cloudflare permission is needed on the CF side — no Cloudflare token in GitHub Secrets.
+### Operations
 
-### 5. Configure the client (NixOS)
+- Bearer-authenticated admin API (`ADMIN_TOKEN`); unset token fails write requests with `403`
+- Cloudflare Workers Builds auto-deploys on push to `main` (no CI deploy workflow, no Cloudflare token in GitHub Secrets)
+- Per-publish manifest stored in R2 for cold-start restoration
+- Drizzle ORM schema, migrations under `migrations/`
+
+## Using the cache from `nixos-rebuild`
 
 ```nix
 {
@@ -114,53 +99,35 @@ Only the Workers Builds Cloudflare permission is needed on the CF side — no Cl
 }
 ```
 
-### 6. First publish
+Rebuild with `sudo nixos-rebuild switch --flake .#<host>`. For a one-off run:
 
-The publish workflow lives in **the repo that owns the flake (e.g. `t4ko0522/dotfiles`), not in this repo**. Copy the template [`.github/templates/publish-cache.yml`](.github/templates/publish-cache.yml) into that repo's `.github/workflows/` and replace `matrix.host` with the actual nixosConfiguration name.
+```bash
+sudo nixos-rebuild switch --flake .#myhost \
+  --option extra-substituters "https://cf-edgenix.<account>.workers.dev" \
+  --option extra-trusted-public-keys "nix-cache.example.com-1:xxxx="
+```
 
-Register the following Secrets / Variables in the calling repo's `production` environment, then push or trigger the workflow manually.
+`nixos-rebuild` hits the Worker in this order, all unauthenticated:
 
-| Name | Kind | Purpose |
-| --- | --- | --- |
-| `CACHE_PRIVATE_KEY` | Secret | NAR signing key (generated in §1) |
-| `ADMIN_TOKEN` | Secret | Bearer token for the Worker admin API |
-| `CLOUDFLARE_API_TOKEN` | Secret | Least-privilege Cloudflare token (R2 write / KV write) |
-| `CLOUDFLARE_ACCOUNT_ID` | Variable | Cloudflare account ID |
-| `API_BASE_URL` | Variable | Worker URL recorded in §4 |
-| `R2_BUCKET_NAME` | Variable | R2 bucket name (e.g. `cf-edgenix-nar`) |
-| `KV_NAMESPACE_ID` | Variable | KV namespace ID |
+1. `GET /nix-cache-info` — once per session. Nix refuses the cache if `StoreDir` mismatches.
+2. `GET /<store-hash>.narinfo` — one per store path. `404` falls through to the next substituter.
+3. `GET /nar/<file-hash>.nar.zst` — fetched only when narinfo signals a hit. Range-resumable.
 
-Token permissions, value semantics, and the full publish flow are in [`docs/publish.md`](docs/publish.md).
+Quick reachability check:
 
-## Development
+```bash
+curl -sSf https://cf-edgenix.<account>.workers.dev/nix-cache-info
+curl -sSfI https://cf-edgenix.<account>.workers.dev/<store-hash>.narinfo
+```
 
-How to enter the dev shell, run tests, write `.dev.vars`, and invoke publish locally is in [`CONTRIBUTIONS.md`](CONTRIBUTIONS.md).
+## Docs
 
-## Environment Variables / Secrets
-
-The full reference (purpose, where to set, scope) is in [`CONTRIBUTIONS.md`](CONTRIBUTIONS.md#環境変数secret).
-
-## Endpoints
-
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/nix-cache-info` | none | Cache metadata |
-| GET | `/<store-hash>.narinfo` | none | narinfo (memory → KV → R2 → 404) |
-| GET/HEAD | `/nar/<file-hash>.nar.zst` | none | NAR body (Range: bytes=..., 206 support, Cache API → R2 streaming) |
-| GET | `/api/hosts/:host/latest` | none | Latest published build for a host |
-| GET | `/api/hosts/:host/builds` | none | Build history |
-| GET | `/api/builds/:id/manifest.json` | none | Restore manifest |
-| GET | `/api/quota/status` | none | Current R2 free-tier kill-switch state |
-| GET | `/api/quota/metrics` | Bearer | Detailed R2 kill-switch metrics |
-| POST | `/api/publish/start` | Bearer | Create a staging build (latest unchanged) |
-| POST | `/api/publish/:build_id/ingest` | Bearer | Idempotently insert store_paths in chunks |
-| POST | `/api/publish/:build_id/finalize` | Bearer | Mark build published + update latest (single batch) |
-| POST | `/api/hosts/:host/rollback` | Bearer | Register a rollback root |
-| POST | `/api/gc/dry-run` | Bearer | Compute the GC live-set (does not delete) |
-| POST | `/api/quota/reset` | Bearer | Manually reset kill-switch state to `ok` |
-| GET | `/api/openapi.json` | none | OpenAPI 3.0 schema (auto-generated via hono/zod-openapi) |
-
-- Read endpoints (GET/HEAD) are unauthenticated — `nixos-rebuild` hits them directly.
-- Write endpoints (POST) require a Bearer token: `Authorization: Bearer <ADMIN_TOKEN>`.
-- If `ADMIN_TOKEN` is unset, write endpoints return 403 (fail-safe).
-- NAR `GET/HEAD` supports `Range: bytes=start-end` / `bytes=start-` / `bytes=-suffix` and returns 206. Out-of-range requests return 416.
+| Topic | File |
+| --- | --- |
+| First-time setup (keys, Cloudflare resources, deploy, client) | [`docs/setup.md`](docs/setup.md) |
+| Publish flow, idempotency, ordering, troubleshooting | [`docs/publish.md`](docs/publish.md) |
+| Endpoint reference | [`docs/api.md`](docs/api.md) |
+| Quota kill-switch operations | [`docs/quota.md`](docs/quota.md) |
+| Full design spec | [`docs/spec.md`](docs/spec.md) |
+| Open design questions | [`docs/fixme.md`](docs/fixme.md) |
+| Development, tests, env var reference | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
