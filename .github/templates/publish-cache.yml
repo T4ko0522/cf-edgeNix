@@ -34,9 +34,11 @@
 #   - bash .cf-edgenix/scripts/publish.sh が
 #       nix build .#nixosConfigurations.<HOST>...
 #       nix copy --to file://$CACHE_DIR (署名)
+#       bash scripts/prune-upstream.sh (cache.nixos.org にある path を除外)
 #       bun publish.ts → R2 (S3 API) / KV bulk へ反映
 #     を順に実行する
 #   - 1 host が失敗しても残りを試行し、最後に集約して exit する
+#   - SKIP_UPSTREAM_PRUNE=1 / UPSTREAM_CACHE_URL=... で prune 挙動を制御可能 (docs/publish.md)
 
 name: publish-cache
 

@@ -42,6 +42,15 @@ nix copy --to "file://${CACHE_DIR}?compression=zstd&secret-key=${_key_file}" "$o
 echo "build out path: $out"
 echo "local binary cache generated at: ${CACHE_DIR}"
 
+# Phase 1.5: upstream substituter にある path を CACHE_DIR から除外（docs/publish.md）。
+if [ "${SKIP_UPSTREAM_PRUNE:-0}" = "1" ]; then
+  echo "[prune] SKIP_UPSTREAM_PRUNE=1, skipping upstream subtraction"
+else
+  bash "$(dirname "$0")/prune-upstream.sh" \
+    "$CACHE_DIR" \
+    "${UPSTREAM_CACHE_URL:-https://cache.nixos.org}"
+fi
+
 # ─── Phase 2: R2/D1/KV への反映（publish.ts に委譲・env 検証はここで行う） ───
 
 : "${API_BASE_URL:?API_BASE_URL is required}"

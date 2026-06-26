@@ -343,7 +343,7 @@ D1は以下を管理する。
 * rollback可能なbuild / 手動pinされた安定世代
 * 過去世代を remote から復元するための manifest（`build_manifests`）
 * GCしてよい / 守るべき R2 object の判定（live set）
-* system closureに含まれるstore path一覧
+* system closure のうち **自前 R2 で配信している store path 一覧**（cache.nixos.org など upstream にあって R2 に上げていない path は含まない。Nix client 側で extra-substituters により upstream に fall back する前提）
 
 つまりD1は単なるリンク集ではなく、remote binary cacheにおけるcontrol planeになる。
 
