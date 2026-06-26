@@ -42,11 +42,13 @@ GitHub Actions の Environment (`production`) に事前登録する値。
 ## publish の全体フロー
 
 ```
-nix build                     ← NixOS system closure をビルド
+nix build                          ← NixOS system closure をビルド
   ↓
-nix copy --to file://$CACHE_DIR  ← 署名済み .narinfo と nar/*.nar.zst を生成
+nix copy --to file://$CACHE_DIR       ← 署名済み .narinfo と nar/*.nar.zst を生成
   ↓
-scripts/publish.ts             ← R2/D1/KV への反映（以下の 5 段）
+scripts/prune-upstream.sh             ← cache.nixos.org に既にある path を除外
+  ↓
+scripts/publish.ts                    ← R2/D1/KV への反映（以下の 5 段）
   │
   ├── Step 0: closure.json / manifest.json を R2 の manifests/<buildId>/ に put
   ├── Step 1: NAR upload (R2)
@@ -55,7 +57,26 @@ scripts/publish.ts             ← R2/D1/KV への反映（以下の 5 段）
   └── Step 4: KV warming（失敗は警告のみ）
 ```
 
-`scripts/publish.sh` が nix build / copy を行い、続けて `scripts/publish.ts`（bun）に委譲して Step 0–4 を実行する。
+`scripts/publish.sh` が nix build / copy / upstream prune を行い、続けて `scripts/publish.ts`（bun）に委譲して Step 0–4 を実行する。
+
+### upstream prune（R2 容量節約）
+
+`nix copy` は closure 全体（nixpkgs 由来の path を含む）を `CACHE_DIR` に吐く。これをそのまま R2 に上げると、cache.nixos.org に既にある path で容量を浪費する。
+
+`scripts/prune-upstream.sh` は `CACHE_DIR` 直下の各 `<storeHash>.narinfo` について `https://cache.nixos.org/<storeHash>.narinfo` を HEAD で確認し、200 を返すものは narinfo と対応する `nar/<fileHash>.nar.zst` をローカル CACHE_DIR から削除する。`publish.ts` は CACHE_DIR を列挙して R2/D1/KV に反映するため、削除した分は **自動的に全レイヤから除外**される（D1 build_closure にも入らない）。
+
+Nix client 側は `extra-substituters = [ "https://nix.t4ko.pet" ];` のように cf-edgeNix と cache.nixos.org の **両方**を持つ前提なので、自前 cache に無い path は upstream から fetch される。`docs/setup.md` の C4 設定が守られていれば破綻しない。
+
+挙動制御:
+
+| 環境変数 | 既定 | 用途 |
+| --- | --- | --- |
+| `UPSTREAM_CACHE_URL` | `https://cache.nixos.org` | 対象 substituter URL（自前で複数階層 cache を運用するときに使用） |
+| `SKIP_UPSTREAM_PRUNE` | `0` | `1` にすると prune ステップを丸ごとスキップ（デバッグ用） |
+| `PRUNE_CONCURRENCY` | `32` | 並列 curl 数 |
+| `PRUNE_TIMEOUT` | `5` | 1 リクエストの最大秒数 |
+
+upstream が不通の場合（DNS NXDOMAIN / timeout / 5xx 等）は **削除しない**（=「無い扱い」ではなく「不明扱い」で安全側に倒す）。結果として R2 容量節約は効かないが、誤って必要な NAR を消す事故は起きない。
 
 ---
 
