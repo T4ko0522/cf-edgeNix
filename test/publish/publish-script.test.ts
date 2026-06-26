@@ -192,10 +192,21 @@ describe("publish — exec アダプタ注入によるテスト", () => {
       r2PutContent: vi.fn(async (_bucket: string, key: string, _content: string) => {
         r2Calls.push({ op: "putContent", key });
       }),
-      kvPut: vi.fn(async (_ns: string, key: string, _val: string) => {
-        kvCalls.push({ key });
-        if (kvReject) throw new Error("KV failed");
+      r2Has: vi.fn(async (_bucket: string, _key: string) => {
+        // 差分化テスト: デフォルトでは「既存なし」扱いとして全件 PUT させる。
+        // (存在ヒット時のスキップ挙動は別テストで検証)
+        return false;
       }),
+      kvPutBulk: vi.fn(
+        async (
+          _ns: string,
+          items: ReadonlyArray<{ key: string; value: string }>,
+        ) => {
+          // bulk 1 リクエストに含まれる各 key を kvCalls に展開記録 (既存 assertion 互換)。
+          for (const it of items) kvCalls.push({ key: it.key });
+          if (kvReject) throw new Error("KV bulk failed");
+        },
+      ),
       apiPost: vi.fn(async (url: string, _token: string, body: unknown) => {
         apiCalls.push({ url, body });
         if (url.endsWith("/start")) {
@@ -339,5 +350,50 @@ describe("publish — exec アダプタ注入によるテスト", () => {
     expect(body.build.host).toBe(SAMPLE_BUILD_META.host);
     expect(body.build.system).toBe(SAMPLE_BUILD_META.system);
     expect(body.build.toplevelStorePath).toBe(SAMPLE_BUILD_META.toplevelStorePath);
+  });
+
+  test("r2Has が NAR キーごとに呼ばれる (差分化)", async () => {
+    const { adapter } = makeSpyAdapter();
+    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
+
+    // narinfo は 1 件 (mock 設定)、narKey は "nar/sha256:file001.nar.zst"
+    expect(adapter.r2Has).toHaveBeenCalledWith("my-bucket", "nar/sha256:file001.nar.zst");
+  });
+
+  test("r2Has が true を返したら該当 NAR の r2Put はスキップされる", async () => {
+    const r2Calls: { op: "put" | "putContent"; key: string }[] = [];
+    const adapter: ExecAdapter = {
+      r2Put: vi.fn(async (_b: string, key: string) => {
+        r2Calls.push({ op: "put", key });
+      }),
+      r2PutContent: vi.fn(async (_b: string, key: string) => {
+        r2Calls.push({ op: "putContent", key });
+      }),
+      r2Has: vi.fn(async (_b: string, _k: string) => true), // 既存ヒット扱い
+      kvPutBulk: vi.fn(async () => {}),
+      apiPost: vi.fn(async (url: string) => {
+        if (url.endsWith("/start")) return { ok: true, build_id: "test-build-001" };
+        if (url.includes("/ingest")) return { ok: true };
+        if (url.includes("/finalize")) return { ok: true };
+        return {};
+      }),
+    };
+    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
+
+    const narPuts = r2Calls.filter((c) => c.op === "put" && c.key.startsWith("nar/"));
+    expect(narPuts).toHaveLength(0); // すべて既存ヒットでスキップ
+  });
+
+  test("KV warming は kvPutBulk 1 回 (narinfo 数 ≤ chunk size) で全件投入される", async () => {
+    const { adapter } = makeSpyAdapter();
+    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
+
+    // narinfo が 1 件しか無いので bulk 呼び出しも 1 回
+    expect(adapter.kvPutBulk).toHaveBeenCalledTimes(1);
+    const bulkCall = (adapter.kvPutBulk as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(bulkCall?.[0]).toBe("kv-ns-001");
+    const items = bulkCall?.[1] as ReadonlyArray<{ key: string; value: string }>;
+    expect(items).toHaveLength(1);
+    expect(items[0]?.key).toBe("narinfo:abcdef123456aaaa");
   });
 });

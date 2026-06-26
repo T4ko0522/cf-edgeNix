@@ -7,10 +7,13 @@
  *
  * 実行順序（受入 A2）:
  *   1. closure.json / manifest.json を R2 に put（G5）
- *   2. NAR upload (R2) — 既存はスキップ（冪等・G5）
- *   3. narinfo upload (R2)
+ *   2. NAR upload (R2) — HEAD で既存スキップ＋並列 PUT（content-addressed・冪等）
+ *   3. narinfo upload (R2) — 並列 PUT
  *   4. D1 確定 (POST /api/publish/{start,ingest,finalize})
- *   5. KV warming (最後・失敗は警告のみ)
+ *   5. KV warming (最後・失敗は警告のみ) — KV Bulk API で 1 リクエスト最大 5000 件
+ *
+ * R2 へは S3 互換 API を直接叩く (UNSIGNED-PAYLOAD で SigV4 署名)。
+ * `bunx wrangler` の起動コスト (~1s/回) を排除し、ファイルあたり数十 ms に落とす。
  *
  * 必要な env:
  *   HOST                  対象 nixosConfiguration 名
@@ -18,19 +21,18 @@
  *   TOPLEVEL_STORE_PATH   toplevel store path（publish.sh から渡す）
  *   API_BASE_URL          Worker の URL (例: https://cache.example.com)
  *   ADMIN_TOKEN           管理API の Bearer トークン
- *   CLOUDFLARE_ACCOUNT_ID CF アカウント ID (wrangler 用)
- *   CLOUDFLARE_API_TOKEN  CF API トークン (R2 write / KV write 最小権限)
+ *   CLOUDFLARE_ACCOUNT_ID CF アカウント ID
+ *   CLOUDFLARE_API_TOKEN  CF API トークン (KV bulk 書き込み権限)
+ *   R2_ACCESS_KEY_ID      R2 S3 互換 API のアクセスキー (R2 dashboard で発行)
+ *   R2_SECRET_ACCESS_KEY  R2 S3 互換 API のシークレットキー
  *   R2_BUCKET_NAME        R2 バケット名
  *   KV_NAMESPACE_ID       KV 名前空間 ID
- *
- * wrangler CLI 呼び出しは exec アダプタに隔離（テスト時モック可能）。
  */
 
 /// <reference types="@types/bun" />
-import { readdir, readFile, writeFile, unlink } from "fs/promises";
+import { readdir, readFile, writeFile } from "fs/promises";
 import { resolve, join } from "path";
-import { createHash } from "crypto";
-import { tmpdir } from "os";
+import { createHash, createHmac } from "crypto";
 
 // ─── 型定義 ───────────────────────────────────────────────────────────────────
 
@@ -70,97 +72,345 @@ export interface ManifestMeta {
 // ─── exec アダプタ（テスト時モック可能） ─────────────────────────────────────
 
 export interface ExecAdapter {
-  /** wrangler r2 object put (ファイルパス指定) */
+  /** R2 へファイルパスを PUT (NAR / closure.json / manifest.json 等)。 */
   r2Put(bucketName: string, key: string, filePath: string): Promise<void>;
-  /** wrangler r2 object put (文字列コンテンツを stdin --pipe 経由) */
+  /** R2 へ文字列コンテンツを PUT (小さなオブジェクト用)。 */
   r2PutContent(bucketName: string, key: string, content: string): Promise<void>;
-  /** wrangler kv key put (一時ファイル --path 経由・value を argv に露出しない) */
-  kvPut(namespaceId: string, key: string, value: string): Promise<void>;
+  /** R2 で key が存在するか確認 (差分化用)。存在すれば true。 */
+  r2Has(bucketName: string, key: string): Promise<boolean>;
+  /** KV Bulk PUT。items を chunk に切って Cloudflare KV Bulk API へ。 */
+  kvPutBulk(
+    namespaceId: string,
+    items: ReadonlyArray<{ key: string; value: string }>,
+  ): Promise<void>;
   /** 管理 API 呼び出し */
   apiPost(url: string, token: string, body: unknown): Promise<unknown>;
 }
 
+// ─── AWS SigV4 (R2 S3 互換 API 用) ────────────────────────────────────────────
+//
+// R2 の S3 互換エンドポイント: https://<account>.r2.cloudflarestorage.com/<bucket>/<key>
+// region は "auto"、service は "s3"。署名は AWS SigV4 を流用。
+// PUT のペイロードハッシュは UNSIGNED-PAYLOAD を使い、本体は Bun.file の
+// ストリームをそのまま流す（メモリに丸ごと載せない）。HEAD/empty body は実ハッシュ。
+
+const R2_REGION = "auto";
+const R2_SERVICE = "s3";
+const EMPTY_SHA256 =
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+function hmacSha256(key: Buffer | string, data: string): Buffer {
+  return createHmac("sha256", key).update(data, "utf8").digest();
+}
+
+function sha256Hex(input: string | Buffer): string {
+  return createHash("sha256").update(input).digest("hex");
+}
+
 /**
- * 実際の wrangler CLI を使う exec アダプタ。
- * CF token / account ID は環境変数から取得。
+ * AWS SigV4 仕様の URI エンコード。RFC3986 unreserved 以外は %XX。
+ * encodeSlash=false で path 区切りの "/" は素通し。
+ * S3 key に含まれる ":" 等もエンコードされる必要がある (`nar/sha256:foo.nar.zst`)。
  */
-export function makeWranglerAdapter(): ExecAdapter {
-  const spawn = async (cmd: string[]): Promise<{ stdout: string; exitCode: number; stderr: string }> => {
-    const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
-    const stdout = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
-    const exitCode = await proc.exited;
-    return { stdout, stderr, exitCode };
+function awsUriEncode(s: string, encodeSlash: boolean): string {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charAt(i);
+    const isUnreserved =
+      (c >= "A" && c <= "Z") ||
+      (c >= "a" && c <= "z") ||
+      (c >= "0" && c <= "9") ||
+      c === "-" ||
+      c === "_" ||
+      c === "." ||
+      c === "~";
+    if (isUnreserved) {
+      out += c;
+      continue;
+    }
+    if (c === "/" && !encodeSlash) {
+      out += "/";
+      continue;
+    }
+    const bytes = Buffer.from(c, "utf8");
+    for (const b of bytes) {
+      out += "%" + b.toString(16).toUpperCase().padStart(2, "0");
+    }
+  }
+  return out;
+}
+
+function deriveSigningKey(
+  secret: string,
+  dateStamp: string,
+  region: string,
+  service: string,
+): Buffer {
+  return hmacSha256(
+    hmacSha256(
+      hmacSha256(hmacSha256("AWS4" + secret, dateStamp), region),
+      service,
+    ),
+    "aws4_request",
+  );
+}
+
+interface SignR2Opts {
+  method: "GET" | "HEAD" | "PUT";
+  accountId: string;
+  bucket: string;
+  key: string;
+  /** body の sha256 hex か "UNSIGNED-PAYLOAD"。 */
+  payloadHash: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+}
+
+interface SignedR2Request {
+  url: string;
+  headers: Record<string, string>;
+}
+
+function signR2Request(opts: SignR2Opts): SignedR2Request {
+  const host = `${opts.accountId}.r2.cloudflarestorage.com`;
+  const encodedKey = awsUriEncode(opts.key, false);
+  const path = `/${opts.bucket}/${encodedKey}`;
+  const url = `https://${host}${path}`;
+
+  const now = new Date();
+  const amzDate = now
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\.\d{3}/, "");
+  const dateStamp = amzDate.slice(0, 8);
+
+  const headers: Record<string, string> = {
+    host,
+    "x-amz-content-sha256": opts.payloadHash,
+    "x-amz-date": amzDate,
   };
 
-  const spawnOrThrow = async (cmd: string[], opts?: { stdin?: string }): Promise<string> => {
-    const proc = Bun.spawn(cmd, {
-      stdout: "pipe",
-      stderr: "pipe",
-      stdin: opts?.stdin !== undefined ? "pipe" : "inherit",
-    });
-    if (opts?.stdin !== undefined && proc.stdin) {
-      // Bun FileSink: write + flush + end でストリームを閉じる。
-      proc.stdin.write(opts.stdin);
-      await proc.stdin.flush();
-      proc.stdin.end();
-    }
-    const stdout = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
-    const exitCode = await proc.exited;
-    if (exitCode !== 0) {
-      // コマンド全文・秘密値・内部パスを含めない（修正13）。
-      throw new Error(`wrangler command failed (exit ${exitCode})`);
-    }
-    void stderr;
-    return stdout;
-  };
+  const lowerHeaders: Record<string, string> = {};
+  for (const k of Object.keys(headers)) {
+    lowerHeaders[k.toLowerCase()] = String(headers[k]).trim().replace(/\s+/g, " ");
+  }
+  const sortedKeys = Object.keys(lowerHeaders).sort();
+  const canonicalHeaders = sortedKeys
+    .map((k) => `${k}:${lowerHeaders[k]}\n`)
+    .join("");
+  const signedHeaders = sortedKeys.join(";");
+
+  const canonicalRequest = [
+    opts.method,
+    path,
+    "",
+    canonicalHeaders,
+    signedHeaders,
+    opts.payloadHash,
+  ].join("\n");
+
+  const credentialScope = `${dateStamp}/${R2_REGION}/${R2_SERVICE}/aws4_request`;
+  const stringToSign = [
+    "AWS4-HMAC-SHA256",
+    amzDate,
+    credentialScope,
+    sha256Hex(canonicalRequest),
+  ].join("\n");
+
+  const signingKey = deriveSigningKey(
+    opts.secretAccessKey,
+    dateStamp,
+    R2_REGION,
+    R2_SERVICE,
+  );
+  const signature = createHmac("sha256", signingKey)
+    .update(stringToSign, "utf8")
+    .digest("hex");
+
+  const authorization = `AWS4-HMAC-SHA256 Credential=${opts.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
   return {
-    async r2Put(bucketName, key, filePath) {
-      await spawnOrThrow([
-        "bunx", "wrangler", "r2", "object", "put",
-        `${bucketName}/${key}`,
-        "--file", filePath,
-      ]);
+    url,
+    headers: { ...headers, authorization },
+  };
+}
+
+// ─── fetch アダプタ（本番用） ─────────────────────────────────────────────────
+
+export interface FetchAdapterOpts {
+  accountId: string;
+  r2AccessKeyId: string;
+  r2SecretAccessKey: string;
+  /** KV Bulk API 用の CF API トークン (KV write 権限)。 */
+  cfApiToken: string;
+}
+
+/** unknown を安全にメッセージへ変換する (raw error object をログに出さない用)。 */
+function errMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
+
+/**
+ * fetch の指数バックオフ付きリトライ。
+ *
+ * リトライ対象:
+ *   - ネットワーク例外 (fetch 自体の throw)
+ *   - HTTP 429 (rate limit)
+ *   - HTTP 5xx (一過性のサーバエラー)
+ *
+ * リトライ非対象 (即返却):
+ *   - 2xx / 3xx / 4xx (429 除く)
+ *
+ * 遅延: 200ms → 800ms → 3200ms (4 回 attempt = 初回 + 3 retry)。
+ * 呼び出し側で `Retry-After` を厳密に拾わなくても、合計 ~4.2s のジッタは十分。
+ *
+ * `build()` をリトライ毎に呼ぶことで、署名 (amzDate) と body (Bun.file 等) を
+ * 毎回再生成できる。SigV4 は 15 分有効なので原理上は再利用可能だが、
+ * 統一的に再構築した方がストリーム body の再読み込みも含めて安全。
+ */
+async function fetchWithRetry(
+  build: () => { url: string; init: RequestInit },
+  opts?: { maxAttempts?: number; baseDelayMs?: number },
+): Promise<Response> {
+  const maxAttempts = opts?.maxAttempts ?? 4;
+  const baseDelayMs = opts?.baseDelayMs ?? 200;
+  let lastErr: unknown = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) {
+      const delay = baseDelayMs * Math.pow(4, attempt - 1);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    try {
+      const { url, init } = build();
+      const res = await fetch(url, init);
+      const retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
+      if (!retryable) return res;
+      lastErr = new Error(`upstream status ${res.status}`);
+      // body を読まずに次の attempt へ (Connection 再利用は実装依存)。
+    } catch (e) {
+      // ネットワーク例外: e.message のみ保持 (詳細スタックは握り潰す)。
+      lastErr = new Error(`fetch failed: ${errMessage(e)}`);
+    }
+  }
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error("fetchWithRetry exhausted (no error captured)");
+}
+
+/** R2 S3 互換 API + CF KV Bulk API + 管理 API へ fetch で直接送るアダプタ。 */
+export function makeFetchAdapter(opts: FetchAdapterOpts): ExecAdapter {
+  async function putR2(
+    bucket: string,
+    key: string,
+    bodyFactory: () => Buffer | Blob | Uint8Array | string,
+    contentLength?: number,
+  ): Promise<void> {
+    const res = await fetchWithRetry(() => {
+      const signed = signR2Request({
+        method: "PUT",
+        accountId: opts.accountId,
+        bucket,
+        key,
+        payloadHash: "UNSIGNED-PAYLOAD",
+        accessKeyId: opts.r2AccessKeyId,
+        secretAccessKey: opts.r2SecretAccessKey,
+      });
+      const headers: Record<string, string> = { ...signed.headers };
+      if (contentLength !== undefined) {
+        headers["content-length"] = String(contentLength);
+      }
+      return {
+        url: signed.url,
+        init: {
+          method: "PUT",
+          headers,
+          // bodyFactory はリトライ毎に新しい Blob/Buffer を返す。
+          body: bodyFactory() as Blob,
+        },
+      };
+    });
+    if (!res.ok) {
+      // status のみ。詳細レスポンスは秘密値を含み得る。
+      throw new Error(`R2 PUT failed (status ${res.status})`);
+    }
+  }
+
+  return {
+    async r2Put(bucket, key, filePath) {
+      // size は変わらないので先に取る。body はリトライ毎に新しい Bun.file() を作る。
+      const size = Bun.file(filePath).size;
+      await putR2(
+        bucket,
+        key,
+        () => Bun.file(filePath) as unknown as Blob,
+        size,
+      );
     },
-    async r2PutContent(bucketName, key, content) {
-      // content を stdin (--pipe) 経由で wrangler に渡す。
-      // `wrangler r2 object put --pipe` は put に存在するフラグ（実機確認済み）。
-      await spawnOrThrow([
-        "bunx", "wrangler", "r2", "object", "put",
-        `${bucketName}/${key}`,
-        "--pipe",
-      ], { stdin: content });
+    async r2PutContent(bucket, key, content) {
+      const buf = Buffer.from(content, "utf8");
+      await putR2(bucket, key, () => buf, buf.byteLength);
     },
-    async kvPut(namespaceId, key, value) {
-      // value を argv に載せない（security 指摘対応）。
-      // `wrangler kv key put --stdin` は存在しない（実機確認済み）。
-      // `--path <tempfile>` 経由で渡す。パーミッション 600・使用後に確実に削除。
-      const tmpPath = join(tmpdir(), `kv-put-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-      try {
-        await writeFile(tmpPath, value, { encoding: "utf-8", mode: 0o600 });
-        await spawnOrThrow([
-          "bunx", "wrangler", "kv", "key", "put",
-          "--namespace-id", namespaceId,
-          "--path", tmpPath,
+    async r2Has(bucket, key) {
+      const res = await fetchWithRetry(() => {
+        const signed = signR2Request({
+          method: "HEAD",
+          accountId: opts.accountId,
+          bucket,
           key,
-        ]);
-      } finally {
-        await unlink(tmpPath).catch(() => {});
+          payloadHash: EMPTY_SHA256,
+          accessKeyId: opts.r2AccessKeyId,
+          secretAccessKey: opts.r2SecretAccessKey,
+        });
+        return {
+          url: signed.url,
+          init: { method: "HEAD", headers: signed.headers },
+        };
+      });
+      if (res.status === 200) return true;
+      if (res.status === 404) return false;
+      throw new Error(`R2 HEAD unexpected status ${res.status}`);
+    },
+    async kvPutBulk(namespaceId, items) {
+      if (items.length === 0) return;
+      // CF KV Bulk API: 1 リクエスト最大 10000 件 / 100MB。
+      // narinfo は数百 B 〜 数 KB / 件なので 5000 件 chunk で安全マージン。
+      const CHUNK = 5000;
+      const url = `https://api.cloudflare.com/client/v4/accounts/${opts.accountId}/storage/kv/namespaces/${namespaceId}/bulk`;
+      for (let i = 0; i < items.length; i += CHUNK) {
+        const chunk = items.slice(i, i + CHUNK);
+        const body = JSON.stringify(chunk);
+        const res = await fetchWithRetry(() => ({
+          url,
+          init: {
+            method: "PUT",
+            headers: {
+              authorization: `Bearer ${opts.cfApiToken}`,
+              "content-type": "application/json",
+            },
+            body,
+          },
+        }));
+        if (!res.ok) {
+          throw new Error(`KV bulk PUT failed (status ${res.status})`);
+        }
       }
     },
     async apiPost(url, token, body) {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+      const json = JSON.stringify(body);
+      const res = await fetchWithRetry(() => ({
+        url,
+        init: {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${token}`,
+          },
+          body: json,
         },
-        body: JSON.stringify(body),
-      });
+      }));
       if (!res.ok) {
-        // 内部 message/スタックを含めない（修正13）。
         throw new Error(`API POST failed: ${res.status}`);
       }
       return res.json();
@@ -244,24 +494,55 @@ export function buildManifestJson(args: {
   });
 }
 
-/**
- * コンテンツの sha256 ハッシュを "sha256:<hex>" 形式で返す。
- */
-export function sha256Hex(content: string): string {
+/** コンテンツの sha256 ハッシュを "sha256:<hex>" 形式で返す。 */
+export function sha256HexPrefixed(content: string): string {
   return `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
 }
 
-// ─── R2 アップロードヘルパ ────────────────────────────────────────────────────
-// r2Head / r2PutIfAbsent は削除。
-// NAR は content-addressed かつ wrangler r2 object put が上書き安全（idempotent）
-// のため、常に put する方針（A5: 上書き安全で充足）。
-// 将来の最適化として存在チェックを追加する場合は、CF Worker に R2 binding を使う
-// HEAD エンドポイント、または S3 互換 API の HEAD を検討すること（wrangler CLI に
-// `r2 object head` サブコマンドも `get --range` フラグも存在しないため CLI では不可）。
+// 既存 import 互換 (test/publish/publish-script.test.ts が `sha256Hex` を import している)。
+export { sha256HexPrefixed as sha256Hex };
+
+// ─── 並列実行ヘルパ ───────────────────────────────────────────────────────────
+
+/**
+ * items を concurrency 個のワーカで並列処理する。
+ * 1つでも throw すれば即座に reject し、進行中のワーカも止まる。
+ */
+async function runPool<T>(
+  items: ReadonlyArray<T>,
+  concurrency: number,
+  fn: (item: T, idx: number) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return;
+  const workerCount = Math.min(concurrency, items.length);
+  let nextIdx = 0;
+  let firstError: unknown = null;
+  const workers: Promise<void>[] = [];
+  for (let w = 0; w < workerCount; w++) {
+    workers.push(
+      (async () => {
+        while (firstError === null) {
+          const i = nextIdx++;
+          if (i >= items.length) return;
+          try {
+            await fn(items[i] as T, i);
+          } catch (e) {
+            if (firstError === null) firstError = e;
+            return;
+          }
+        }
+      })(),
+    );
+  }
+  await Promise.all(workers);
+  if (firstError !== null) throw firstError;
+}
 
 // ─── メインロジック ───────────────────────────────────────────────────────────
 
-const CHUNK_SIZE = 50;
+const D1_INGEST_CHUNK = 50;
+const HEAD_CONCURRENCY = 32;
+const R2_PUT_CONCURRENCY = 24;
 
 export async function publish(
   cacheDir: string,
@@ -291,11 +572,9 @@ export async function publish(
   const closureJsonKey = `manifests/${buildId}/closure.json`;
   const manifestKey = `manifests/${buildId}/manifest.json`;
 
-  // closure.json をアップロード
   await exec.r2Put(env.r2BucketName, closureJsonKey, closureJsonPath);
   console.log(`[R2] uploaded: ${closureJsonKey}`);
 
-  // manifest.json を生成してアップロード（実ハッシュを計算・G5）
   const manifestJson = buildManifestJson({
     buildId,
     host: buildMeta.host,
@@ -306,55 +585,70 @@ export async function publish(
     narinfos,
     closureJsonKey,
   });
-  const manifestHash = sha256Hex(manifestJson);
+  const manifestHash = sha256HexPrefixed(manifestJson);
 
-  // manifest.json を一時ファイルに書いてアップロード
+  // manifest.json を tmp ファイル経由で r2Put (既存テスト契約: r2Put 経由で 2 番目)。
   const manifestTmpPath = resolve(cacheDir, `__manifest_${buildId}.json`);
   await writeFile(manifestTmpPath, manifestJson, "utf-8");
   await exec.r2Put(env.r2BucketName, manifestKey, manifestTmpPath);
   console.log(`[R2] uploaded: ${manifestKey} (hash: ${manifestHash})`);
 
-  // Step 1: NAR upload（content-addressed・wrangler r2 put は上書き安全・A5 充足）
-  // r2Head による存在チェックは撤去（wrangler CLI に head/range フラグが存在しない）。
-  // 同一 narKey の重複投入を避けるため Set でキー管理し、1 put/unique-key とする。
-  const uploadedNarKeys = new Set<string>();
-  for (const ni of narinfos) {
-    if (!uploadedNarKeys.has(ni.narKey)) {
-      const filePath = resolve(cacheDir, ni.narKey);
-      await exec.r2Put(env.r2BucketName, ni.narKey, filePath);
-      uploadedNarKeys.add(ni.narKey);
-      console.log(`[NAR] uploaded: ${ni.narKey}`);
-    }
-  }
+  // Step 1: NAR upload — HEAD で R2 上の既存を検出してスキップ→不足ぶんを並列 PUT。
+  //   NAR は content-addressed (narKey に file hash が入る) なので既存ヒット時の
+  //   コンテンツ同一性は保証される。
+  const uniqueNarKeys = Array.from(new Set(narinfos.map((ni) => ni.narKey)));
 
-  // Step 2: narinfo upload
-  for (const ni of narinfos) {
+  const missingNarKeys: string[] = [];
+  await runPool(uniqueNarKeys, HEAD_CONCURRENCY, async (key) => {
+    const exists = await exec.r2Has(env.r2BucketName, key);
+    if (!exists) missingNarKeys.push(key);
+  });
+  console.log(
+    `[NAR] ${uniqueNarKeys.length - missingNarKeys.length}/${uniqueNarKeys.length} already on R2, uploading ${missingNarKeys.length}`,
+  );
+
+  let narUploaded = 0;
+  await runPool(missingNarKeys, R2_PUT_CONCURRENCY, async (key) => {
+    const filePath = resolve(cacheDir, key);
+    await exec.r2Put(env.r2BucketName, key, filePath);
+    narUploaded++;
+    if (narUploaded % 50 === 0 || narUploaded === missingNarKeys.length) {
+      console.log(`[NAR] uploaded ${narUploaded}/${missingNarKeys.length}`);
+    }
+  });
+
+  // Step 2: narinfo upload — 並列 PUT。narinfo は署名等で内容が変わり得るので常に上書き。
+  let narinfoUploaded = 0;
+  await runPool(narinfos, R2_PUT_CONCURRENCY, async (ni) => {
     const filePath = resolve(cacheDir, `${ni.storeHash}.narinfo`);
     await exec.r2Put(env.r2BucketName, ni.narinfoKey, filePath);
-    console.log(`[narinfo] uploaded: ${ni.narinfoKey}`);
-  }
+    narinfoUploaded++;
+    if (narinfoUploaded % 100 === 0 || narinfoUploaded === narinfos.length) {
+      console.log(`[narinfo] uploaded ${narinfoUploaded}/${narinfos.length}`);
+    }
+  });
 
   const apiBase = env.apiBaseUrl.replace(/\/$/, "");
   const token = env.adminToken;
 
   // Step 3: D1 確定（start → ingest chunks → finalize）
-  const startRes = await exec.apiPost(
+  const startRes = (await exec.apiPost(
     `${apiBase}/api/publish/start`,
     token,
     { build: buildMeta },
-  ) as { build_id: string };
+  )) as { build_id: string };
   const confirmedBuildId = startRes.build_id;
   console.log(`[D1] build started: ${confirmedBuildId}`);
 
-  for (let i = 0; i < narinfos.length; i += CHUNK_SIZE) {
-    const chunk = narinfos.slice(i, i + CHUNK_SIZE);
+  for (let i = 0; i < narinfos.length; i += D1_INGEST_CHUNK) {
+    const chunk = narinfos.slice(i, i + D1_INGEST_CHUNK);
     await exec.apiPost(
       `${apiBase}/api/publish/${confirmedBuildId}/ingest`,
       token,
       { storePaths: chunk },
     );
-    console.log(`[D1] ingested chunk ${Math.floor(i / CHUNK_SIZE) + 1}`);
   }
+  console.log(`[D1] ingested ${narinfos.length} store paths`);
 
   const manifestMeta: ManifestMeta = {
     closureJsonKey,
@@ -374,21 +668,25 @@ export async function publish(
   );
   console.log(`[D1] finalized: ${confirmedBuildId}`);
 
-  // Step 4: KV warming（失敗は警告のみ）
+  // Step 4: KV warming — 全件を bulk API で 1〜数リクエストにまとめる。失敗は警告のみ。
   try {
+    const items: Array<{ key: string; value: string }> = [];
     for (const ni of narinfos) {
-      const content = await readFile(resolve(cacheDir, `${ni.storeHash}.narinfo`), "utf-8");
-      await exec.kvPut(env.kvNamespaceId, `narinfo:${ni.storeHash}`, content);
+      const content = await readFile(
+        resolve(cacheDir, `${ni.storeHash}.narinfo`),
+        "utf-8",
+      );
+      items.push({ key: `narinfo:${ni.storeHash}`, value: content });
     }
-    console.log(`[KV] warming complete`);
+    await exec.kvPutBulk(env.kvNamespaceId, items);
+    console.log(`[KV] warming complete (${items.length} entries)`);
   } catch (e) {
-    console.warn(`[KV] warming failed (non-fatal):`, e);
+    // raw error は request detail を含み得るので message のみログ出力。
+    console.warn(`[KV] warming failed (non-fatal): ${errMessage(e)}`);
   }
 }
 
 // ─── エントリポイント ─────────────────────────────────────────────────────────
-// import.meta.filename === process.argv[1] のとき（直接実行）のみ実行する。
-// vitest でインポートされるときはこのブロックをスキップする。
 
 if (
   typeof process !== "undefined" &&
@@ -404,8 +702,12 @@ if (
   const gitRev = process.env["GIT_REV"] ?? "unknown";
   const system = process.env["SYSTEM"] ?? "x86_64-linux";
   const flakeLockHash = process.env["FLAKE_LOCK_HASH"] ?? "unknown";
-  // publish.sh が出力した toplevel store path（実値・G5）
   const toplevelStorePath = process.env["TOPLEVEL_STORE_PATH"];
+
+  const accountId = process.env["CLOUDFLARE_ACCOUNT_ID"];
+  const cfApiToken = process.env["CLOUDFLARE_API_TOKEN"];
+  const r2AccessKeyId = process.env["R2_ACCESS_KEY_ID"];
+  const r2SecretAccessKey = process.env["R2_SECRET_ACCESS_KEY"];
 
   if (!host || !cacheDir || !apiBaseUrl || !adminToken || !r2BucketName || !kvNamespaceId) {
     console.error(
@@ -419,8 +721,14 @@ if (
     process.exit(1);
   }
 
-  // build_id は決定的に生成（host + system + gitRev + flakeLockHash + toplevelStorePath から SHA256）。
-  // system と toplevelStorePath を含めることで意味的衝突を検出できる（修正6）。
+  if (!accountId || !cfApiToken || !r2AccessKeyId || !r2SecretAccessKey) {
+    console.error(
+      "Missing required env: CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY",
+    );
+    process.exit(1);
+  }
+
+  // build_id は決定的に生成 (修正6)。
   const buildIdInput = `${host}:${system}:${gitRev}:${flakeLockHash}:${toplevelStorePath}`;
   const buildId = createHash("sha256").update(buildIdInput).digest("hex").slice(0, 36);
 
@@ -434,12 +742,24 @@ if (
     createdAt: Date.now(),
   };
 
-  publish(cacheDir, buildMeta, { apiBaseUrl, adminToken, r2BucketName, kvNamespaceId }, makeWranglerAdapter())
+  const adapter = makeFetchAdapter({
+    accountId,
+    r2AccessKeyId,
+    r2SecretAccessKey,
+    cfApiToken,
+  });
+
+  publish(
+    cacheDir,
+    buildMeta,
+    { apiBaseUrl, adminToken, r2BucketName, kvNamespaceId },
+    adapter,
+  )
     .then(() => {
       console.log("publish complete");
     })
     .catch((e: unknown) => {
-      console.error("publish failed:", e);
+      console.error(`publish failed: ${errMessage(e)}`);
       process.exit(1);
     });
 }
