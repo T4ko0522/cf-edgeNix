@@ -46,9 +46,11 @@ GC を実装するのは retention が実際に問題になってから。
 ### TODO
 
 - [ ] grace period の具体値を決める（暫定: 7日）
+- [ ] grace period は `POST /api/gc/execute` の `phase=narinfo` と `phase=nar` 分離で運用対応する
 - [ ] KV / edge purge の対象キー設計（narinfo key の一覧化）
 - [ ] R2 削除を実行する worker / cron の置き場所
 - [x] 削除実行前の dry-run（live set との差分ログ）— 実装済み（`POST /api/gc/dry-run`）`live_nar_keys` と `dead_candidates` を返す。実 R2 物理削除は引き続き未実装。`computeLiveSet` は published builds の closure + rollback_roots の union から `build_closure → store_paths` を辿り live/dead を算出する実装済み（`src/db/queries.ts`・999 件分割クエリ）。integration テストで動作確認済み。
+- [x] dead の実消去 — 実装済み（`POST /api/gc/execute`）。`phase=narinfo` で KV/R2 narinfo を先に unpublish し、`phase=nar` で R2 NAR と D1 (`store_paths` / `nar_files` / orphan `build_closure`) を削除する。`phase=all` はこの順序を 1 回のリクエスト内で守る。Free プランの subrequest 上限 50/invocation に収まるよう `max_deletes` のデフォルトは 40 / 上限 50 にハードキャップ。それ以上は paid プランへの移行 or 複数回呼び出しで対応。
 
 ---
 
