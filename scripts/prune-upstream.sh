@@ -38,7 +38,7 @@ export PRUNE_TIMEOUT_SEC="$timeout"
 # curl -f は 404 で exit 22 になり stdout を失うので使わず、http_code を文字列比較する。
 prune_one() {
   local narinfo_file="$1"
-  local hash status nar_rel
+  local hash status
   hash="$(basename "$narinfo_file" .narinfo)"
 
   status="$(curl -sS -o /dev/null --head \
@@ -50,12 +50,10 @@ prune_one() {
     return 0
   fi
 
-  nar_rel="$(awk -F': ' '/^URL:/ {print $2; exit}' "$narinfo_file" | tr -d '\r')"
-
+  # NAR は content-addressed なので異なる storeHash が同じ URL を共有しうる。
+  # 共有先の narinfo が残っているとき NAR を消すと publish.ts のアップロードが落ちるため、
+  # narinfo だけ削除して NAR ファイルは触らない (publish.ts は narinfo を起点に NAR を選ぶ)。
   rm -f "$narinfo_file"
-  if [ -n "$nar_rel" ]; then
-    rm -f "${PRUNE_CACHE_DIR}/${nar_rel}"
-  fi
   printf 'pruned %s\n' "$hash"
 }
 export -f prune_one
