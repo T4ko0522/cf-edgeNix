@@ -4,6 +4,21 @@ compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
 # ─────────────────────────────────────────────────────────────
+# Static landing site (SvelteKit + adapter-static, web/build)
+#   - /, /favicon.svg, /_app/* 等のアセット一致時はそのまま配信
+#   - /nix-cache-info, /<hash>.narinfo, /nar/*, /api/* はアセット未マッチで
+#     Worker (src/index.ts) にフォールバック
+#   - [build] でデプロイ前に web 側の build を走らせる（Workers Builds 対応）
+# ─────────────────────────────────────────────────────────────
+
+[assets]
+binding = "ASSETS"
+directory = "./web/build"
+
+[build]
+command = "bun run build:web"
+
+# ─────────────────────────────────────────────────────────────
 # Bindings
 #   R2  : NAR / narinfo の正本（source of truth / read path の終点）
 #   KV  : narinfo / nix-cache-info の速度層（結果整合・正本ではない）

@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:web": "cd web && bun run dev",
+    "build:web": "cd web && bun install && bun run build",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
