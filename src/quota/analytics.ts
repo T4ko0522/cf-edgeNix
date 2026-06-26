@@ -100,12 +100,15 @@ export async function fetchR2Usage(env: Env, now: Date): Promise<Usage> {
   });
 
   if (!response.ok) {
-    throw new Error(`Cloudflare GraphQL API failed: ${response.status}`);
+    const body = await response.text();
+    throw new Error(`Cloudflare GraphQL API failed: ${response.status} ${body}`);
   }
 
   const payload = await response.json() as GraphQLResponse;
   if (payload.errors && payload.errors.length > 0) {
-    throw new Error(`Cloudflare GraphQL API returned errors: ${JSON.stringify(payload.errors)}`);
+    throw new Error(
+      `Cloudflare GraphQL API returned errors: ${payload.errors.map((e) => e.message ?? "(no message)").join("; ")}`,
+    );
   }
 
   const account = payload.data?.viewer?.accounts?.[0];
@@ -140,7 +143,7 @@ function monthStartUtc(now: Date): Date {
 }
 
 const R2_USAGE_QUERY = `
-query R2Usage($accountTag: String!, $bucketName: String!, $since: Time!, $until: Time!) {
+query R2Usage($accountTag: string!, $bucketName: string!, $since: Time!, $until: Time!) {
   viewer {
     accounts(filter: { accountTag: $accountTag }) {
       r2StorageAdaptiveGroups(

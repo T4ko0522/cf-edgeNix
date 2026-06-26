@@ -103,8 +103,8 @@ describe("fetchR2Usage", () => {
     );
     expect(warn).toHaveBeenCalledWith("[quota] unknown actionType:", "Other");
     const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { query: string };
-    expect(body.query).toContain("$accountTag: String!");
-    expect(body.query).toContain("$bucketName: String!");
+    expect(body.query).toContain("$accountTag: string!");
+    expect(body.query).toContain("$bucketName: string!");
     expect(body.query).toContain("$since: Time!");
     expect(body.query).toContain("$until: Time!");
   });
