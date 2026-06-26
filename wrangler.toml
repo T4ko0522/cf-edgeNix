@@ -18,19 +18,19 @@ bucket_name = "cf-edgenix-nar"
 
 [[kv_namespaces]]
 binding = "META_KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "396c7db249e04c2c819d4c25d2b47cd4"
 
 [[d1_databases]]
 binding = "CONTROL_DB"
 database_name = "cf-edgenix-control"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "ed98598e-2cfc-443d-9c62-a6bff0e3235e"
 migrations_dir = "migrations"
 
 [vars]
 # nix-cache-info の Priority。小さいほど優先（公式 cache.nixos.org は 40）。
 CACHE_INFO_PRIORITY = "30"
 # quota kill-switch 用。deploy 前に実 Cloudflare Account ID に置換すること。
-CF_ACCOUNT_ID = "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID"
+CF_ACCOUNT_ID = "8aa8b75c4cc3e97fdcef331a87539b11"
 QUOTA_R2_BUCKET_NAME = "cf-edgenix-nar"
 
 [triggers]
