@@ -27,6 +27,44 @@ export const GcDryRunResponseSchema = z.object({
 
 export type GcDryRunResponse = z.infer<typeof GcDryRunResponseSchema>;
 
+// ─── POST /api/gc/execute ───────────────────────────────────────────────────
+
+export const GcExecuteRequestSchema = z.object({
+  // phase デフォルトは narinfo (= grace period を挟む前提で narinfo を先に unpublish する)。
+  // NAR の物理削除は grace 経過後に明示的に `phase: "nar"` で呼び直すこと。
+  // `phase: "all"` は grace を無視した即時削除であり edge / Nix client が古い narinfo を
+  // 持つ間 404 を撒くリスクがあるため、開発・テスト用途以外では使わない。
+  phase: z.enum(["narinfo", "nar", "all"]).default("narinfo"),
+  // Free プラン subrequest 上限 50/invocation に収めるため KV narinfo delete (=1 subreq/件) の本数を絞る。
+  // computeLiveSet + listDeadStorePaths + R2 bulk delete×2 + D1 COUNT×3 + D1 batch×3 で固定 ~14 subreq 消費するため KV に使える残予算は ~36 件。
+  // デフォルトは余裕を見て 40、上限も 50 にハードキャップ。
+  max_deletes: z.number().int().positive().max(50).default(40),
+  dry_run: z.boolean().default(false),
+});
+
+// `*_attempted` は KV/R2 の delete を呼んだ件数 (no-op を含む)。`d1_*` は事前 COUNT で確定した実削除件数。
+export const GcExecuteDeletedSchema = z.object({
+  kv_narinfo_attempted: z.number().int().nonnegative(),
+  r2_narinfo_attempted: z.number().int().nonnegative(),
+  r2_nar_attempted: z.number().int().nonnegative(),
+  d1_store_paths: z.number().int().nonnegative(),
+  d1_nar_files: z.number().int().nonnegative(),
+  d1_build_closure: z.number().int().nonnegative(),
+});
+
+export const GcExecuteResponseSchema = z.object({
+  ok: z.literal(true),
+  phase: z.enum(["narinfo", "nar", "all"]),
+  dry_run: z.boolean(),
+  dead_total: z.number().int().nonnegative(),
+  processed: z.number().int().nonnegative(),
+  dead_remaining: z.number().int().nonnegative(),
+  deleted: GcExecuteDeletedSchema,
+});
+
+export type GcExecuteRequest = z.infer<typeof GcExecuteRequestSchema>;
+export type GcExecuteResponse = z.infer<typeof GcExecuteResponseSchema>;
+
 // ─── GET /api/hosts/:host/latest ─────────────────────────────────────────────
 
 export const LatestBuildResponseSchema = z.object({

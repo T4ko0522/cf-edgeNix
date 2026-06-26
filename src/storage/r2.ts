@@ -27,3 +27,17 @@ export async function getObject(
 export async function headObject(env: Env, key: string): Promise<R2Object | null> {
   return await env.NAR_BUCKET.head(key);
 }
+
+/** R2 object を削除する。存在しない key は R2 側で no-op。 */
+export async function deleteObject(env: Env, key: string): Promise<void> {
+  await env.NAR_BUCKET.delete(key);
+}
+
+/** R2 object を 1000 件ずつまとめて削除する。 */
+export async function deleteObjects(env: Env, keys: string[]): Promise<void> {
+  for (let i = 0; i < keys.length; i += 1000) {
+    const chunk = keys.slice(i, i + 1000);
+    if (chunk.length === 0) continue;
+    await env.NAR_BUCKET.delete(chunk);
+  }
+}

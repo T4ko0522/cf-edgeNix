@@ -12,6 +12,7 @@
 import { beforeEach, describe, expect, test } from "vitest";
 import { env } from "cloudflare:test";
 import { apiApp } from "../../src/api/app";
+import { handleNarinfo } from "../../src/handlers/narinfo";
 import type { Env } from "../../src/types";
 
 // ─── ヘルパ ─────────────────────────────────────────────────────────────────
@@ -63,6 +64,8 @@ const liveNarKey = `nar/${GC_HASH}.nar.zst`;
 // dead: store_paths に存在するが live build の closure に含まれない NAR
 const deadHash = "dddd4444dddd4444eeee5555eeee5555";
 const deadNarKey = `nar/${deadHash}.nar.zst`;
+const deadNarinfoKey = `${deadHash}.narinfo`;
+const deadKvNarinfoKey = `narinfo:${deadHash}`;
 
 const startBody = {
   build: {
@@ -117,19 +120,28 @@ async function cleanupTables(db1: D1Database) {
 }
 
 // dead store_path を直接 D1 に INSERT するヘルパ（live build の closure には含めない）
-async function insertDeadStorePath(db1: D1Database) {
-  const deadFileHash = "sha256:" + "e".repeat(64);
+async function insertDeadStorePath(
+  db1: D1Database,
+  input: {
+    storeHash?: string;
+    narKey?: string;
+    fileHash?: string;
+  } = {},
+) {
+  const storeHash = input.storeHash ?? deadHash;
+  const narKey = input.narKey ?? deadNarKey;
+  const fileHash = input.fileHash ?? "sha256:" + "e".repeat(64);
   await db1.prepare(
     `INSERT INTO store_paths (store_hash, store_path, narinfo_key, nar_key, nar_hash, nar_size, file_hash, file_size, compression, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
-    deadHash,
-    `/nix/store/${deadHash}-dead`,
-    `${deadHash}.narinfo`,
-    deadNarKey,
+    storeHash,
+    `/nix/store/${storeHash}-dead`,
+    `${storeHash}.narinfo`,
+    narKey,
     "sha256:" + "d".repeat(64),
     9999,
-    deadFileHash,
+    fileHash,
     4999,
     "zstd",
     Date.now(),
@@ -138,7 +150,20 @@ async function insertDeadStorePath(db1: D1Database) {
   await db1.prepare(
     `INSERT INTO nar_files (file_hash, nar_key, file_size, compression, created_at)
      VALUES (?, ?, ?, ?, ?)`
-  ).bind(deadFileHash, deadNarKey, 4999, "zstd", Date.now()).run();
+  ).bind(fileHash, narKey, 4999, "zstd", Date.now()).run();
+}
+
+async function countRows(db1: D1Database, table: string, column: string, value: string) {
+  const row = await db1.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${column} = ?`)
+    .bind(value)
+    .first<{ count: number }>();
+  return row?.count ?? 0;
+}
+
+async function putDeadObjects(eenv: Env, storeHash = deadHash, narKey = deadNarKey) {
+  await eenv.META_KV.put(`narinfo:${storeHash}`, `StorePath: /nix/store/${storeHash}-dead`);
+  await eenv.NAR_BUCKET.put(`${storeHash}.narinfo`, `StorePath: /nix/store/${storeHash}-dead`);
+  await eenv.NAR_BUCKET.put(narKey, "dead nar");
 }
 
 beforeEach(async () => {
@@ -374,5 +399,196 @@ describe("POST /api/gc/dry-run（G8）", () => {
     // ここが rollback_roots 分岐の独立寄与を検証するポイント。
     // Build B は published でないため、rollback_roots テーブルの寄与がなければ dead になる。
     expect(liveKeys).toContain(buildBNarKey);
+  });
+});
+
+// ─── POST /api/gc/execute ─────────────────────────────────────────────────────
+
+describe("POST /api/gc/execute", () => {
+  test("dry_run=true: 削除せず件数だけ返す", async () => {
+    const eenv = authedEnv();
+    const db1 = (env as unknown as Env).CONTROL_DB;
+    await insertDeadStorePath(db1);
+    await putDeadObjects(eenv);
+
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/execute", { dry_run: true }),
+      eenv,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body["phase"]).toBe("narinfo");
+    expect(body["processed"]).toBe(1);
+    expect(body["deleted"]).toEqual({
+      kv_narinfo_attempted: 0,
+      r2_narinfo_attempted: 0,
+      r2_nar_attempted: 0,
+      d1_store_paths: 0,
+      d1_nar_files: 0,
+      d1_build_closure: 0,
+    });
+    expect(await eenv.META_KV.get(deadKvNarinfoKey, "text")).not.toBeNull();
+    expect(await eenv.NAR_BUCKET.get(deadNarinfoKey)).not.toBeNull();
+    expect(await countRows(db1, "store_paths", "store_hash", deadHash)).toBe(1);
+  });
+
+  test("phase=narinfo: KV/R2 narinfo だけ削除する", async () => {
+    const eenv = authedEnv();
+    const db1 = (env as unknown as Env).CONTROL_DB;
+    await insertDeadStorePath(db1);
+    await putDeadObjects(eenv);
+
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/execute", { phase: "narinfo" }),
+      eenv,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body["deleted"]).toEqual({
+      kv_narinfo_attempted: 1,
+      r2_narinfo_attempted: 1,
+      r2_nar_attempted: 0,
+      d1_store_paths: 0,
+      d1_nar_files: 0,
+      d1_build_closure: 0,
+    });
+    expect(await eenv.META_KV.get(deadKvNarinfoKey, "text")).toBeNull();
+    expect(await eenv.NAR_BUCKET.get(deadNarinfoKey)).toBeNull();
+    expect(await eenv.NAR_BUCKET.get(deadNarKey)).not.toBeNull();
+    expect(await countRows(db1, "store_paths", "store_hash", deadHash)).toBe(1);
+    expect(await countRows(db1, "nar_files", "nar_key", deadNarKey)).toBe(1);
+  });
+
+  test("phase=narinfo: 同一 isolate のメモリキャッシュも破棄する", async () => {
+    const eenv = authedEnv();
+    const db1 = (env as unknown as Env).CONTROL_DB;
+    await insertDeadStorePath(db1);
+    await putDeadObjects(eenv);
+
+    // L0 にロードさせる
+    const warm = await handleNarinfo(eenv, deadHash);
+    expect(warm.status).toBe(200);
+
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/execute", { phase: "narinfo" }),
+      eenv,
+    );
+
+    expect(res.status).toBe(200);
+    // KV / R2 / メモリすべて消えているはず → 404
+    const stale = await handleNarinfo(eenv, deadHash);
+    expect(stale.status).toBe(404);
+  });
+
+  test("phase=all: narinfo / NAR / D1 を削除し live NAR は残す", async () => {
+    const eenv = authedEnv();
+    const db1 = (env as unknown as Env).CONTROL_DB;
+
+    await apiApp.fetch(makeWriteReq("/api/publish/start", startBody), eenv);
+    await apiApp.fetch(makeWriteReq(`/api/publish/${BUILD_ID}/ingest`, ingestBody), eenv);
+    await apiApp.fetch(makeWriteReq(`/api/publish/${BUILD_ID}/finalize`, finalizeBody), eenv);
+    await eenv.NAR_BUCKET.put(liveNarKey, "live nar");
+
+    await insertDeadStorePath(db1);
+    await putDeadObjects(eenv);
+    await db1.prepare(
+      `INSERT INTO build_closure (build_id, store_hash) VALUES (?, ?)`
+    ).bind("dead-build", deadHash).run();
+
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/execute", { phase: "all" }),
+      eenv,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body["dead_total"]).toBe(1);
+    expect(body["processed"]).toBe(1);
+    expect(body["dead_remaining"]).toBe(0);
+    expect(body["deleted"]).toEqual({
+      kv_narinfo_attempted: 1,
+      r2_narinfo_attempted: 1,
+      r2_nar_attempted: 1,
+      d1_store_paths: 1,
+      d1_nar_files: 1,
+      d1_build_closure: 1,
+    });
+    expect(await eenv.META_KV.get(deadKvNarinfoKey, "text")).toBeNull();
+    expect(await eenv.NAR_BUCKET.get(deadNarinfoKey)).toBeNull();
+    expect(await eenv.NAR_BUCKET.get(deadNarKey)).toBeNull();
+    expect(await eenv.NAR_BUCKET.get(liveNarKey)).not.toBeNull();
+    expect(await countRows(db1, "store_paths", "store_hash", deadHash)).toBe(0);
+    expect(await countRows(db1, "nar_files", "nar_key", deadNarKey)).toBe(0);
+    expect(await countRows(db1, "build_closure", "store_hash", deadHash)).toBe(0);
+  });
+
+  test("max_deletes で処理件数を制限する", async () => {
+    const eenv = authedEnv();
+    const db1 = (env as unknown as Env).CONTROL_DB;
+    const hashes = [
+      "dead0001dead0001dead0001dead0001",
+      "dead0002dead0002dead0002dead0002",
+      "dead0003dead0003dead0003dead0003",
+    ];
+
+    for (const [index, storeHash] of hashes.entries()) {
+      const narKey = `nar/${storeHash}.nar.zst`;
+      await insertDeadStorePath(db1, {
+        storeHash,
+        narKey,
+        fileHash: "sha256:" + String(index + 1).repeat(64),
+      });
+      await putDeadObjects(eenv, storeHash, narKey);
+    }
+
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/execute", { phase: "all", max_deletes: 1 }),
+      eenv,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body["processed"]).toBe(1);
+    expect(body["dead_remaining"]).toBe(2);
+
+    const remaining = await db1.prepare("SELECT COUNT(*) AS count FROM store_paths").first<{ count: number }>();
+    expect(remaining?.count).toBe(2);
+    const remainingObjects = await Promise.all(
+      hashes.map((storeHash) => eenv.NAR_BUCKET.get(`nar/${storeHash}.nar.zst`)),
+    );
+    expect(remainingObjects.filter((obj) => obj !== null)).toHaveLength(2);
+  });
+
+  test("ADMIN_TOKEN なしで 403", async () => {
+    const e = { ...(env as object) } as Record<string, unknown>;
+    delete e["ADMIN_TOKEN"];
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/execute", {}),
+      e as unknown as Env,
+    );
+    expect(res.status).toBe(403);
+  });
+
+  test("dead が 0 件でも 200 と削除 0 件を返す", async () => {
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/execute", {}),
+      authedEnv(),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body["phase"]).toBe("narinfo");
+    expect(body["dead_total"]).toBe(0);
+    expect(body["processed"]).toBe(0);
+    expect(body["deleted"]).toEqual({
+      kv_narinfo_attempted: 0,
+      r2_narinfo_attempted: 0,
+      r2_nar_attempted: 0,
+      d1_store_paths: 0,
+      d1_nar_files: 0,
+      d1_build_closure: 0,
+    });
   });
 });

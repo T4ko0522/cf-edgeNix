@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, count, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "./client";
 import {
   buildClosure,
@@ -80,6 +80,13 @@ export interface RollbackRootInput {
 export interface LiveSet {
   liveNarKeys: string[];
   deadCandidates: string[];
+}
+
+export interface DeadStorePath {
+  storeHash: string;
+  narinfoKey: string;
+  narKey: string;
+  fileHash: string;
 }
 
 // ─── read クエリ ─────────────────────────────────────────────────────────────
@@ -411,6 +418,105 @@ export async function registerRollbackRoot(db: Db, input: RollbackRootInput): Pr
       createdAt: Date.now(),
     }),
   ]);
+}
+
+/**
+ * dead 判定済み NAR key から削除対象 store_path を引く。
+ * inArray は SQLite 変数上限(999)を超えないよう 999 件ごとに分割する。
+ */
+export async function listDeadStorePaths(
+  db: Db,
+  deadNarKeys: string[],
+): Promise<DeadStorePath[]> {
+  if (deadNarKeys.length === 0) return [];
+
+  const rows: DeadStorePath[] = [];
+  for (let i = 0; i < deadNarKeys.length; i += 999) {
+    const chunk = deadNarKeys.slice(i, i + 999);
+    const rows_ = await db
+      .select({
+        storeHash: storePaths.storeHash,
+        narinfoKey: storePaths.narinfoKey,
+        narKey: storePaths.narKey,
+        fileHash: storePaths.fileHash,
+      })
+      .from(storePaths)
+      .where(inArray(storePaths.narKey, chunk));
+    rows.push(...rows_);
+  }
+  return rows;
+}
+
+async function countByChunks<TColumn>(
+  db: Db,
+  table: typeof storePaths | typeof narFiles | typeof buildClosure,
+  column: TColumn,
+  values: string[],
+): Promise<number> {
+  let total = 0;
+  for (let i = 0; i < values.length; i += 999) {
+    const chunk = values.slice(i, i + 999);
+    const rows = await db
+      .select({ value: count() })
+      .from(table)
+      .where(inArray(column as never, chunk));
+    total += rows[0]?.value ?? 0;
+  }
+  return total;
+}
+
+/**
+ * dead store_paths / nar_files / orphan build_closure を物理削除する。
+ * D1 delete 結果の差異を避けるため、削除件数は事前 COUNT で確定する。
+ */
+export async function deleteDeadStorePaths(
+  db: Db,
+  storeHashes: string[],
+  fileHashes: string[],
+): Promise<{
+  storePathsDeleted: number;
+  narFilesDeleted: number;
+  buildClosureDeleted: number;
+}> {
+  const uniqueStoreHashes = [...new Set(storeHashes)];
+  const uniqueFileHashes = [...new Set(fileHashes)];
+
+  const [storePathsDeleted, narFilesDeleted, buildClosureDeleted] = await Promise.all([
+    countByChunks(db, storePaths, storePaths.storeHash, uniqueStoreHashes),
+    countByChunks(db, narFiles, narFiles.fileHash, uniqueFileHashes),
+    countByChunks(db, buildClosure, buildClosure.storeHash, uniqueStoreHashes),
+  ]);
+
+  const storePathDeletes = [];
+  for (let i = 0; i < uniqueStoreHashes.length; i += 999) {
+    const chunk = uniqueStoreHashes.slice(i, i + 999);
+    storePathDeletes.push(db.delete(storePaths).where(inArray(storePaths.storeHash, chunk)));
+  }
+  if (storePathDeletes.length > 0) {
+    await db.batch(storePathDeletes as unknown as Parameters<Db["batch"]>[0]);
+  }
+
+  const narFileDeletes = [];
+  for (let i = 0; i < uniqueFileHashes.length; i += 999) {
+    const chunk = uniqueFileHashes.slice(i, i + 999);
+    narFileDeletes.push(db.delete(narFiles).where(inArray(narFiles.fileHash, chunk)));
+  }
+  if (narFileDeletes.length > 0) {
+    await db.batch(narFileDeletes as unknown as Parameters<Db["batch"]>[0]);
+  }
+
+  const buildClosureDeletes = [];
+  for (let i = 0; i < uniqueStoreHashes.length; i += 999) {
+    const chunk = uniqueStoreHashes.slice(i, i + 999);
+    buildClosureDeletes.push(
+      db.delete(buildClosure).where(inArray(buildClosure.storeHash, chunk)),
+    );
+  }
+  if (buildClosureDeletes.length > 0) {
+    await db.batch(buildClosureDeletes as unknown as Parameters<Db["batch"]>[0]);
+  }
+
+  return { storePathsDeleted, narFilesDeleted, buildClosureDeleted };
 }
 
 /**
