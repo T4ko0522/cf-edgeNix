@@ -13,3 +13,5 @@ bun.lock
 
 # plans
 docs/plans/
+
+*.pem
