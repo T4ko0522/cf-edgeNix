@@ -28,3 +28,8 @@ export function set(key: string, value: string): void {
     store.delete(oldest);
   }
 }
+
+/** メモリキャッシュからキーを破棄する。GC unpublish 時に narinfo を即時 stale 化するために使う。他 isolate は不可侵なので best-effort。 */
+export function del(key: string): void {
+  store.delete(key);
+}

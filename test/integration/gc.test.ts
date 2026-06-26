@@ -12,6 +12,7 @@
 import { beforeEach, describe, expect, test } from "vitest";
 import { env } from "cloudflare:test";
 import { apiApp } from "../../src/api/app";
+import { handleNarinfo } from "../../src/handlers/narinfo";
 import type { Env } from "../../src/types";
 
 // ─── ヘルパ ─────────────────────────────────────────────────────────────────
@@ -417,6 +418,7 @@ describe("POST /api/gc/execute", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json() as Record<string, unknown>;
+    expect(body["phase"]).toBe("narinfo");
     expect(body["processed"]).toBe(1);
     expect(body["deleted"]).toEqual({
       kv_narinfo_attempted: 0,
@@ -457,6 +459,27 @@ describe("POST /api/gc/execute", () => {
     expect(await eenv.NAR_BUCKET.get(deadNarKey)).not.toBeNull();
     expect(await countRows(db1, "store_paths", "store_hash", deadHash)).toBe(1);
     expect(await countRows(db1, "nar_files", "nar_key", deadNarKey)).toBe(1);
+  });
+
+  test("phase=narinfo: 同一 isolate のメモリキャッシュも破棄する", async () => {
+    const eenv = authedEnv();
+    const db1 = (env as unknown as Env).CONTROL_DB;
+    await insertDeadStorePath(db1);
+    await putDeadObjects(eenv);
+
+    // L0 にロードさせる
+    const warm = await handleNarinfo(eenv, deadHash);
+    expect(warm.status).toBe(200);
+
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/execute", { phase: "narinfo" }),
+      eenv,
+    );
+
+    expect(res.status).toBe(200);
+    // KV / R2 / メモリすべて消えているはず → 404
+    const stale = await handleNarinfo(eenv, deadHash);
+    expect(stale.status).toBe(404);
   });
 
   test("phase=all: narinfo / NAR / D1 を削除し live NAR は残す", async () => {
@@ -556,6 +579,7 @@ describe("POST /api/gc/execute", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json() as Record<string, unknown>;
+    expect(body["phase"]).toBe("narinfo");
     expect(body["dead_total"]).toBe(0);
     expect(body["processed"]).toBe(0);
     expect(body["deleted"]).toEqual({

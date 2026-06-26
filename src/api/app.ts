@@ -48,6 +48,7 @@ import {
   startBuild,
 } from "../db/queries";
 import { narinfoKVKey } from "../storage/keys";
+import * as memory from "../cache/memory";
 import { deleteText as deleteKvText } from "../storage/kv";
 import { deleteObjects } from "../storage/r2";
 
@@ -502,7 +503,12 @@ apiApp.openapi(gcExecuteRoute, async (c) => {
     await runWithConcurrency(
       uniqueStoreHashes,
       50,
-      (storeHash) => deleteKvText(c.env, narinfoKVKey(storeHash)),
+      async (storeHash) => {
+        const key = narinfoKVKey(storeHash);
+        // 同 isolate の L0 メモリも破棄して即時 stale 化する。他 isolate は不可侵 (best-effort)。
+        memory.del(key);
+        await deleteKvText(c.env, key);
+      },
     );
     await deleteObjects(c.env, uniqueNarinfoKeys);
     deleted.kv_narinfo_attempted = uniqueStoreHashes.length;
