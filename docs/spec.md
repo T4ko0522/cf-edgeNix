@@ -437,7 +437,8 @@ trap "rm -f '$_key_file'" EXIT
 printf '%s' "$CACHE_PRIVATE_KEY" > "$_key_file"
 
 # Nix が署名済み .narinfo と nar/<file-hash>.nar.zst を生成する
-nix copy --to "file://${CACHE_DIR}?compression=zstd&secret-key=${_key_file}" "$out"
+ZSTD_LEVEL="${ZSTD_LEVEL:-9}"
+nix copy --to "file://${CACHE_DIR}?compression=zstd&compression-level=${ZSTD_LEVEL}&secret-key=${_key_file}" "$out"
 ```
 
 基本手順は以下。`scripts/publish.sh` が 1–3 を担い、`scripts/publish.ts`（bun）が 0・4–8 を担う。

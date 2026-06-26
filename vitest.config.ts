@@ -24,6 +24,7 @@ export default defineConfig({
             "test/integration/read-path-no-d1.test.ts",
           // G4/G5/G9: scripts/publish.ts のロジック unit テスト
             "test/publish/publish-script.test.ts",
+            "test/publish/publish-sh.test.ts",
           ],
           environment: "node",
         },

@@ -9,6 +9,7 @@
 #   HOST               対象 nixosConfiguration 名
 #   CACHE_DIR          nix copy の出力先（file:// ローカル binary cache）
 #   CACHE_PRIVATE_KEY  NAR 署名用 secret key（fork PR では絶対に露出させない・§9.1）
+#   ZSTD_LEVEL         zstd compression-level（省略時: 9）
 #   API_BASE_URL       Worker の URL
 #   ADMIN_TOKEN        管理API Bearer トークン
 #   R2_BUCKET_NAME     R2 バケット名
@@ -18,6 +19,12 @@ set -euo pipefail
 : "${HOST:?HOST is required}"
 : "${CACHE_DIR:?CACHE_DIR is required}"
 : "${CACHE_PRIVATE_KEY:?CACHE_PRIVATE_KEY is required}"
+: "${ZSTD_LEVEL:=9}"
+
+if ! [[ "$ZSTD_LEVEL" =~ ^-?[0-9]+$ ]]; then
+  echo "ZSTD_LEVEL must be an integer" >&2
+  exit 2
+fi
 
 # ─── Phase 1: nix build + nix copy（署名付き binary cache 生成） ──────────────
 
@@ -37,7 +44,7 @@ trap "rm -f '$_key_file'" EXIT
 
 printf '%s' "$CACHE_PRIVATE_KEY" > "$_key_file"
 
-nix copy --to "file://${CACHE_DIR}?compression=zstd&secret-key=${_key_file}" "$out"
+nix copy --to "file://${CACHE_DIR}?compression=zstd&compression-level=${ZSTD_LEVEL}&secret-key=${_key_file}" "$out"
 
 echo "build out path: $out"
 echo "local binary cache generated at: ${CACHE_DIR}"
