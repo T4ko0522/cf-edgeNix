@@ -6,7 +6,13 @@
 
 [English](README.md) | **日本語**
 
-cf-edgeNix は Cloudflare Workers を署名付き [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html) に変える。R2 が NAR / narinfo の正本、KV と Workers Cache API が速度層、D1 が build 履歴・`latest`・rollback root・GC live-set を持つ control plane。read path は narinfo が `memory → KV → R2`、NAR は `Cache API → R2`、いずれも D1 を経由しない。
+cf-edgeNix は Cloudflare Workers を署名付き [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html) に変える。  
+R2 が NAR / narinfo の正本、KV と Workers Cache API が速度層、D1 が build 履歴・`latest`・rollback root・GC live-set を持つ control plane。read path は narinfo が `memory → KV → R2`、NAR は `Cache API → R2`、いずれも D1 を経由しない。
+
+**Self-hosted、かつ Cloudflare 内で完結。** 自分の Cloudflare アカウントに自分の Worker を deploy する形なので、cache も署名鍵も完全に自分の手元にあり、サードパーティを経由しない。  
+さらに実体は Cloudflare のエッジ（Workers + R2 + KV + D1 + Cache API + Workers Builds）に閉じており、**VPS も origin server もコンテナも、GitHub Actions の deploy pipeline も不要**。  
+Cloudflare の外で動くのは、自分の NixOS flake repo に置いた GitHub Actions job が cf-edgeNix を checkout してその `scripts/publish.sh` を回し、署名済み NAR を build & upload する部分だけ。  
+> flake repo 側に publish ロジックは持たず、[`.github/templates/publish-cache.yml`](.github/templates/publish-cache.yml) の workflow テンプレートをそのまま配置するだけで済む。
 
 目標は **Cloudflare 無料枠で global な署名付き binary cache を持つ** こと。5 分おきの Cron が R2 使用量を監視し、課金が発生する前に kill-switch を踏む。
 
@@ -45,7 +51,8 @@ flowchart LR
     W -. warm .-> KV[(KV)]
 ```
 
-`latest` を動かすのは `start → ingest × N → finalize` の 1 ルートのみ。NAR upload → narinfo upload → D1 確定 → KV warming の順で `scripts/publish.ts` が保証し、`test/publish/order.test.ts` で assert している。
+`latest` を動かすのは `start → ingest × N → finalize` の 1 ルートのみ。  
+NAR upload → narinfo upload → D1 確定 → KV warming の順で `scripts/publish.ts` が保証し、`test/publish/order.test.ts` で assert している。
 
 ### Deploy path
 
@@ -55,7 +62,8 @@ flowchart LR
     CFB --> W[Worker]
 ```
 
-GitHub Actions の deploy workflow は持たない。Workers Builds が push のたびに `wrangler d1 migrations apply --remote && wrangler deploy` を回す。
+GitHub Actions の deploy workflow は持たない。  
+Workers Builds が push のたびに `wrangler d1 migrations apply --remote && wrangler deploy` を回す。
 
 ## 機能
 

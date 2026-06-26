@@ -6,7 +6,13 @@
 
 **English** | [日本語](README.ja.md)
 
-cf-edgeNix turns a Cloudflare Workers deployment into a signed [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html). R2 holds the canonical NAR / narinfo, KV and the Workers Cache API are the speed layer, and D1 keeps build history, `latest`, rollback roots, and the GC live-set. Reads go `memory → KV → R2` (narinfo) and `Cache API → R2` (NAR); D1 is never on the read path.
+cf-edgeNix turns a Cloudflare Workers deployment into a signed [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html).  
+R2 holds the canonical NAR / narinfo, KV and the Workers Cache API are the speed layer, and D1 keeps build history, `latest`, rollback roots, and the GC live-set. Reads go `memory → KV → R2` (narinfo) and `Cache API → R2` (NAR); D1 is never on the read path.
+
+**Self-hosted, fully on Cloudflare.** You deploy your own Worker on your own Cloudflare account — the cache is yours, the signing key is yours, nothing routes through a third party.  
+And it stays entirely inside Cloudflare's edge (Workers + R2 + KV + D1 + Cache API + Workers Builds): **no VPS, no origin server, no container, no GitHub Actions deploy pipeline to maintain.**  
+The only thing running outside Cloudflare is a GitHub Actions job in your NixOS flake repo that checks out cf-edgeNix and runs its `scripts/publish.sh` to build, sign, and upload NARs.  
+> Your flake repo holds no publish logic of its own — just drop in the workflow template from [`.github/templates/publish-cache.yml`](.github/templates/publish-cache.yml).
 
 The goal is a global, signed binary cache that costs nothing on Cloudflare's free tier. A 5-minute cron tracks R2 quota and trips a kill-switch before you ever bill.
 
@@ -45,7 +51,8 @@ flowchart LR
     W -. warm .-> KV[(KV)]
 ```
 
-`start → ingest × N → finalize` is the only path that moves `latest`. NAR uploads precede narinfo; D1 commit precedes KV warming. Order is enforced in `scripts/publish.ts` and asserted in `test/publish/order.test.ts`.
+`start → ingest × N → finalize` is the only path that moves `latest`.  
+NAR uploads precede narinfo; D1 commit precedes KV warming. Order is enforced in `scripts/publish.ts` and asserted in `test/publish/order.test.ts`.
 
 ### Deploy path
 
@@ -55,7 +62,8 @@ flowchart LR
     CFB --> W[Worker]
 ```
 
-No GitHub Actions deploy workflow. Workers Builds runs `wrangler d1 migrations apply --remote && wrangler deploy` on every push.
+No GitHub Actions deploy workflow.  
+Workers Builds runs `wrangler d1 migrations apply --remote && wrangler deploy` on every push.
 
 ## Features
 
