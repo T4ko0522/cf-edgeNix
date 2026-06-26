@@ -163,6 +163,147 @@ describe("NarinfoMetaSchema", () => {
     const { firstSeenBuildId: _, ...rest } = { ...validNarinfoMeta, firstSeenBuildId: "build-1" };
     expect(NarinfoMetaSchema.safeParse(rest).success).toBe(true);
   });
+
+  describe("narHash / fileHash 形式", () => {
+    // Nix が narinfo に実出力する Nix-base32 (e/o/t/u を除外した [0-9a-df-np-sv-z])。
+    // 既定の `nix copy --to file://...` 出力はこの形になる。
+    const NIX_BASE32_HASH = "sha256:0pyfgwnyk3pqzgr3qqd9khsa1k1akl04bwpa3wnk7xfvjnvfwbf4";
+    // SRI 形 (sha256-<base64>=)。modern Nix の一部経路で出る。
+    const SRI_HASH = "sha256-q1MqDP3p9c+aE6m2YsP3vRwjLk2sZmYbN0Q3rXY+aBc=";
+
+    test("narHash が Nix-base32 → 成功 (本番 narinfo の実形式)", () => {
+      expect(
+        NarinfoMetaSchema.safeParse({ ...validNarinfoMeta, narHash: NIX_BASE32_HASH }).success,
+      ).toBe(true);
+    });
+
+    test("fileHash が Nix-base32 → 成功", () => {
+      expect(
+        NarinfoMetaSchema.safeParse({ ...validNarinfoMeta, fileHash: NIX_BASE32_HASH }).success,
+      ).toBe(true);
+    });
+
+    test("narHash が SRI (sha256-<base64>=) → 成功", () => {
+      expect(
+        NarinfoMetaSchema.safeParse({ ...validNarinfoMeta, narHash: SRI_HASH }).success,
+      ).toBe(true);
+    });
+
+    test("narHash に hex でも Nix-base32 でもない 'o' が含まれる → 失敗", () => {
+      // hex は [0-9a-f] なので o は不可。Nix-base32 も e/o/t/u を除外しているので o は不可。
+      // 両方の alternation で弾かれることを保証する。
+      expect(
+        NarinfoMetaSchema.safeParse({
+          ...validNarinfoMeta,
+          narHash: "sha256:" + "o".repeat(52),
+        }).success,
+      ).toBe(false);
+    });
+
+    test("narHash に大文字 → 失敗 (hex/base32 いずれも小文字限定)", () => {
+      expect(
+        NarinfoMetaSchema.safeParse({
+          ...validNarinfoMeta,
+          narHash: "sha256:" + "A".repeat(64),
+        }).success,
+      ).toBe(false);
+    });
+
+    test("narHash がプレフィックスなし → 失敗", () => {
+      expect(
+        NarinfoMetaSchema.safeParse({
+          ...validNarinfoMeta,
+          narHash: "0".repeat(64),
+        }).success,
+      ).toBe(false);
+    });
+
+    describe("長さ境界 (sha256 の各 encoding に固定)", () => {
+      test("hex が 63 文字 → 失敗", () => {
+        expect(
+          NarinfoMetaSchema.safeParse({
+            ...validNarinfoMeta,
+            narHash: "sha256:" + "a".repeat(63),
+          }).success,
+        ).toBe(false);
+      });
+
+      test("hex が 65 文字 → 失敗", () => {
+        expect(
+          NarinfoMetaSchema.safeParse({
+            ...validNarinfoMeta,
+            narHash: "sha256:" + "a".repeat(65),
+          }).success,
+        ).toBe(false);
+      });
+
+      test("Nix-base32 が 51 文字 → 失敗", () => {
+        expect(
+          NarinfoMetaSchema.safeParse({
+            ...validNarinfoMeta,
+            // 全 alphabet 内字だが 1 文字足りない
+            narHash: "sha256:" + "a".repeat(51),
+          }).success,
+        ).toBe(false);
+      });
+
+      test("Nix-base32 が 53 文字 → 失敗", () => {
+        expect(
+          NarinfoMetaSchema.safeParse({
+            ...validNarinfoMeta,
+            narHash: "sha256:" + "a".repeat(53),
+          }).success,
+        ).toBe(false);
+      });
+
+      test("SRI が base64 43 文字 + パディングなし → 失敗", () => {
+        expect(
+          NarinfoMetaSchema.safeParse({
+            ...validNarinfoMeta,
+            narHash: "sha256-q1MqDP3p9c+aE6m2YsP3vRwjLk2sZmYbN0Q3rXY+aBc",
+          }).success,
+        ).toBe(false);
+      });
+
+      test("SRI が base64 42 文字 + パディング → 失敗 (長さ不足)", () => {
+        expect(
+          NarinfoMetaSchema.safeParse({
+            ...validNarinfoMeta,
+            narHash: "sha256-" + "A".repeat(42) + "=",
+          }).success,
+        ).toBe(false);
+      });
+    });
+
+    describe("Nix-base32 除外文字 (e/o/t/u) は長さ 52 でも禁止", () => {
+      // hex の長さ固定 (64) により、52 文字なら必ず base32 側で評価される。
+      // 除外文字を 52 文字並べた値が弾かれることで alphabet 制約を保証する。
+      for (const c of ["e", "o", "t", "u"] as const) {
+        test(`'${c}' を 52 文字 → 失敗`, () => {
+          expect(
+            NarinfoMetaSchema.safeParse({
+              ...validNarinfoMeta,
+              narHash: "sha256:" + c.repeat(52),
+            }).success,
+          ).toBe(false);
+        });
+      }
+    });
+
+    describe("Nix-base32 alphabet 境界文字 (range 記述ミス検出)", () => {
+      // `[0-9a-df-np-sv-z]` の各 range の両端 (d/f, n/p, s/v) を 52 文字並べて全て成功すること。
+      for (const c of ["d", "f", "n", "p", "s", "v"] as const) {
+        test(`'${c}' を 52 文字 → 成功`, () => {
+          expect(
+            NarinfoMetaSchema.safeParse({
+              ...validNarinfoMeta,
+              narHash: "sha256:" + c.repeat(52),
+            }).success,
+          ).toBe(true);
+        });
+      }
+    });
+  });
 });
 
 // ─── BuildMetaSchema ─────────────────────────────────────────────────────────
@@ -280,5 +421,16 @@ describe("PublishFinalizeRequestSchema", () => {
         manifest: { ...validManifestMeta, host: "host with space" },
       }).success,
     ).toBe(false);
+  });
+
+  test("manifest.manifestHash が Nix-base32 → 成功 (sha256 各 encoding 受理の保証)", () => {
+    expect(
+      PublishFinalizeRequestSchema.safeParse({
+        manifest: {
+          ...validManifestMeta,
+          manifestHash: "sha256:0pyfgwnyk3pqzgr3qqd9khsa1k1akl04bwpa3wnk7xfvjnvfwbf4",
+        },
+      }).success,
+    ).toBe(true);
   });
 });

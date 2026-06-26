@@ -3,12 +3,21 @@ import { BuildIdSchema, HostSchema, StoreHashSchema } from "./params";
 
 // ─── フィールド制約 ───────────────────────────────────────────────────────────
 
-/** Nix hash: sha256:<hex> または sha256-<base64> 形式 */
-const NixHashSchema = z
+/**
+ * sha256 ハッシュ専用スキーマ。受理形式と長さは sha256 (32 bytes) の各 encoding に固定。
+ *
+ *   - `sha256:<hex>`         hex (base16) — 64 文字
+ *   - `sha256:<nix-base32>`  Nix-base32 — 52 文字。alphabet `0123456789abcdfghijklmnpqrsvwxyz` (e/o/t/u を除外)
+ *   - `sha256-<base64>=`     SRI / 標準 base64 — 43 文字 + `=` パディング 1 つ
+ *
+ * Nix が narinfo (`NarHash:` / `FileHash:`) に書く既定表現は Nix-base32。
+ * sha512 等の他アルゴリズムは対象外 (必要になったら別 schema を切る)。
+ */
+const Sha256NixHashSchema = z
   .string()
   .regex(
-    /^sha256:[0-9a-f]+$|^sha256-[A-Za-z0-9+/]+=*$/,
-    "Invalid Nix hash format (must be sha256:<hex> or sha256-<base64>)",
+    /^sha256:([0-9a-f]{64}|[0-9a-df-np-sv-z]{52})$|^sha256-[A-Za-z0-9+/]{43}=$/,
+    "Invalid sha256 hash format (must be sha256:<hex(64)|nix-base32(52)> or sha256-<base64(43)>=)",
   );
 
 /** R2/KV key: 安全な文字集合のみ、`.` 連続・`..` 不可、先頭末尾スラッシュ不可 */
@@ -55,9 +64,9 @@ export const NarinfoMetaSchema = z.object({
   storePath: StorePathSchema,
   narinfoKey: NarinfoKeySchema,
   narKey: NarKeySchema,
-  narHash: NixHashSchema,
+  narHash: Sha256NixHashSchema,
   narSize: z.number().int().positive(),
-  fileHash: NixHashSchema,
+  fileHash: Sha256NixHashSchema,
   fileSize: z.number().int().positive(),
   compression: CompressionSchema,
   firstSeenBuildId: z.string().optional(),
@@ -89,7 +98,7 @@ export const ManifestMetaSchema = z.object({
   toplevelStorePath: StorePathSchema,
   closureJsonKey: SafeKeySchema,
   manifestKey: SafeKeySchema,
-  manifestHash: NixHashSchema,
+  manifestHash: Sha256NixHashSchema,
 });
 
 export type ManifestMetaInput = z.input<typeof ManifestMetaSchema>;
