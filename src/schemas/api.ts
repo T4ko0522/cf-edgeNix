@@ -18,6 +18,22 @@ export const RollbackResponseSchema = z.object({
 export type RollbackRequest = z.infer<typeof RollbackRequestSchema>;
 export type RollbackResponse = z.infer<typeof RollbackResponseSchema>;
 
+// ─── PATCH /api/builds/:build_id ─────────────────────────────────────────────
+
+export const PatchBuildRequestSchema = z.object({
+  pinned: z.boolean(),
+  reason: z.string().optional(),
+});
+
+export const PatchBuildResponseSchema = z.object({
+  ok: z.literal(true),
+  build_id: z.string(),
+  pinned: z.boolean(),
+});
+
+export type PatchBuildRequest = z.infer<typeof PatchBuildRequestSchema>;
+export type PatchBuildResponse = z.infer<typeof PatchBuildResponseSchema>;
+
 // ─── POST /api/gc/dry-run ────────────────────────────────────────────────────
 
 export const GcDryRunResponseSchema = z.object({

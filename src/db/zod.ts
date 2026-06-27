@@ -4,6 +4,7 @@ import {
   buildManifests,
   builds,
   narFiles,
+  pinnedBuilds,
   rollbackRoots,
   storePaths,
 } from "./schema";
@@ -20,6 +21,9 @@ export const StorePathInsertSchema = createInsertSchema(storePaths);
 
 export const NarFileSelectSchema = createSelectSchema(narFiles);
 export const NarFileInsertSchema = createInsertSchema(narFiles);
+
+export const PinnedBuildSelectSchema = createSelectSchema(pinnedBuilds);
+export const PinnedBuildInsertSchema = createInsertSchema(pinnedBuilds);
 
 export const BuildClosureSelectSchema = createSelectSchema(buildClosure);
 export const BuildClosureInsertSchema = createInsertSchema(buildClosure);

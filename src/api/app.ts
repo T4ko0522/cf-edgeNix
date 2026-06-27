@@ -14,6 +14,8 @@ import {
   GcExecuteResponseSchema,
   LatestBuildResponseSchema,
   ManifestJsonResponseSchema,
+  PatchBuildRequestSchema,
+  PatchBuildResponseSchema,
   RollbackRequestSchema,
   RollbackResponseSchema,
 } from "../schemas/api";
@@ -44,8 +46,10 @@ import {
   ingestStorePaths,
   listDeadStorePaths,
   listBuilds,
+  pinBuild,
   registerRollbackRoot,
   startBuild,
+  unpinBuild,
 } from "../db/queries";
 import { narinfoKVKey } from "../storage/keys";
 import * as memory from "../cache/memory";
@@ -199,6 +203,45 @@ const rollbackRoute = createRoute({
     404: {
       content: { "application/json": { schema: ApiErrorSchema } },
       description: "build_id 不在",
+    },
+  },
+});
+
+const patchBuildRoute = createRoute({
+  method: "patch",
+  path: "/api/builds/{buildId}",
+  security: [{ bearerAuth: [] }],
+  request: {
+    params: z.object({ buildId: BuildIdSchema }),
+    body: {
+      content: { "application/json": { schema: PatchBuildRequestSchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { "application/json": { schema: PatchBuildResponseSchema } },
+      description: "build pin 状態更新成功",
+    },
+    400: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "入力不正",
+    },
+    401: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "認証失敗",
+    },
+    403: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "ADMIN_TOKEN 未設定",
+    },
+    404: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "build_id 不在",
+    },
+    500: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "サーバ内部エラー",
     },
   },
 });
@@ -381,6 +424,7 @@ apiApp.use("/api/publish/*", adminAuthMiddleware);
 apiApp.use("/api/gc/*", adminAuthMiddleware);
 apiApp.use("/api/quota/metrics", adminAuthMiddleware);
 apiApp.use("/api/quota/reset", adminAuthMiddleware);
+apiApp.use("/api/builds/:buildId", adminAuthMiddleware);
 apiApp.use(
   "/api/hosts/:host/rollback",
   adminAuthMiddleware,
@@ -442,6 +486,23 @@ apiApp.openapi(rollbackRoute, async (c) => {
   } catch (err) {
     const status = errorStatus(err);
     return c.json({ error: errorMessage(err) }, status as 404);
+  }
+});
+
+apiApp.openapi(patchBuildRoute, async (c) => {
+  const db = getDb(c.env);
+  const { buildId } = c.req.valid("param");
+  const body = c.req.valid("json");
+  try {
+    if (body.pinned) {
+      await pinBuild(db, buildId, body.reason);
+    } else {
+      await unpinBuild(db, buildId);
+    }
+    return c.json({ ok: true as const, build_id: buildId, pinned: body.pinned }, 200);
+  } catch (err) {
+    const status = errorStatus(err);
+    return c.json({ error: errorMessage(err) }, status as 404 | 500);
   }
 });
 
