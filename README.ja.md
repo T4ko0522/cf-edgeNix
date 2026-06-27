@@ -6,6 +6,9 @@
 
 [English](README.md) | **日本語**
 
+> cf-edgeNixは独立したプロジェクトであり、Cloudflare社とは提携、推奨、または出資を受けているものではありません。  
+Cloudflare、Cloudflare Workers、およびR2は、Cloudflare, Inc.の商標です。  
+
 cf-edgeNix は Cloudflare Workers を署名付き [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html) に変える。  
 R2 が NAR / narinfo の正本、KV と Workers Cache API が速度層、D1 が build 履歴・`latest`・rollback root・GC live-set を持つ control plane。read path は narinfo が `memory → KV → R2`、NAR は `Cache API → R2`、いずれも D1 を経由しない。
 

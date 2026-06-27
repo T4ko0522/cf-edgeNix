@@ -6,6 +6,9 @@
 
 **English** | [日本語](README.ja.md)
 
+> cf-edgeNix is an independent project and is not affiliated with, endorsed by, or sponsored by Cloudflare.
+Cloudflare, Cloudflare Workers, and R2 are trademarks of Cloudflare, Inc.  
+
 cf-edgeNix turns a Cloudflare Workers deployment into a signed [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html).  
 R2 holds the canonical NAR / narinfo, KV and the Workers Cache API are the speed layer, and D1 keeps build history, `latest`, rollback roots, and the GC live-set. Reads go `memory → KV → R2` (narinfo) and `Cache API → R2` (NAR); D1 is never on the read path.
 
