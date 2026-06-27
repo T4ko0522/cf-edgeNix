@@ -143,7 +143,7 @@ function monthStartUtc(now: Date): Date {
 }
 
 const R2_USAGE_QUERY = `
-query R2Usage($accountTag: string!, $bucketName: string!, $since: Time!, $until: Time!) {
+query R2Usage($accountTag: String!, $bucketName: String!, $since: Time!, $until: Time!) {
   viewer {
     accounts(filter: { accountTag: $accountTag }) {
       r2StorageAdaptiveGroups(
