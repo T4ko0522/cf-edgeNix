@@ -102,11 +102,59 @@ describe("fetchR2Usage", () => {
       }),
     );
     expect(warn).toHaveBeenCalledWith("[quota] unknown actionType:", "Other");
-    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { query: string };
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as {
+      query: string;
+      variables: Record<string, string>;
+    };
     expect(body.query).toContain("$accountTag: String!");
     expect(body.query).toContain("$bucketName: String!");
-    expect(body.query).toContain("$since: Time!");
-    expect(body.query).toContain("$until: Time!");
+    expect(body.query).toContain("$storageSince: Time!");
+    expect(body.query).toContain("$opsSince: Time!");
+    expect(body.query).toContain("$opsUntil: Time!");
+    expect(body.query).toContain("orderBy: [datetime_DESC]");
+    expect(body.variables.storageSince).toBe("2026-06-25T11:00:00.000Z");
+    expect(body.variables.opsSince).toBe("2026-06-01T00:00:00.000Z");
+    expect(body.variables.opsUntil).toBe("2026-06-25T12:00:00.000Z");
+  });
+
+  test("storage は直近スナップショットのみを採用 (月内ピークは無視)", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [{
+            r2StorageAdaptiveGroups: [
+              { dimensions: { datetime: "2026-06-25T11:55:00Z" }, max: { payloadSize: 1_500_000_000 } },
+            ],
+            r2OperationsAdaptiveGroups: [],
+          }],
+        },
+      },
+    })));
+
+    await expect(fetchR2Usage(makeEnv(), new Date("2026-06-25T12:00:00.000Z"))).resolves.toEqual({
+      storageBytes: 1_500_000_000,
+      classAOperations: 0,
+      classBOperations: 0,
+    });
+  });
+
+  test("storage 結果が空でも 0 を返す (throw しない)", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [{
+            r2StorageAdaptiveGroups: [],
+            r2OperationsAdaptiveGroups: [],
+          }],
+        },
+      },
+    })));
+
+    await expect(fetchR2Usage(makeEnv(), new Date("2026-06-25T12:00:00.000Z"))).resolves.toEqual({
+      storageBytes: 0,
+      classAOperations: 0,
+      classBOperations: 0,
+    });
   });
 
   test("response.ok === false は throw", async () => {
