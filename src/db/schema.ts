@@ -63,6 +63,12 @@ export const rollbackRoots = sqliteTable("rollback_roots", {
   createdAt: integer("created_at").notNull(),
 });
 
+export const pinnedBuilds = sqliteTable("pinned_builds", {
+  buildId: text("build_id").primaryKey(),
+  pinnedAt: integer("pinned_at").notNull(),
+  reason: text("reason"),
+});
+
 export const buildManifests = sqliteTable(
   "build_manifests",
   {
@@ -85,4 +91,5 @@ export type StorePath = typeof storePaths.$inferSelect;
 export type NarFile = typeof narFiles.$inferSelect;
 export type BuildClosure = typeof buildClosure.$inferSelect;
 export type RollbackRoot = typeof rollbackRoots.$inferSelect;
+export type PinnedBuild = typeof pinnedBuilds.$inferSelect;
 export type BuildManifest = typeof buildManifests.$inferSelect;

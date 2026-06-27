@@ -5,6 +5,7 @@ import {
   buildManifests,
   builds,
   narFiles,
+  pinnedBuilds,
   rollbackRoots,
   storePaths,
 } from "./schema";
@@ -421,6 +422,55 @@ export async function registerRollbackRoot(db: Db, input: RollbackRootInput): Pr
 }
 
 /**
+ * build を GC 保護対象として pinned_builds に登録する。
+ * 参照先 build_id が存在しなければ BuildNotFoundError (404)。
+ */
+export async function pinBuild(db: Db, buildId: string, reason?: string): Promise<void> {
+  const existing = await db
+    .select({ id: builds.id })
+    .from(builds)
+    .where(eq(builds.id, buildId))
+    .limit(1);
+
+  if (!existing[0]) {
+    throw new BuildNotFoundError(`build ${buildId} not found`);
+  }
+
+  await db
+    .insert(pinnedBuilds)
+    .values({
+      buildId,
+      pinnedAt: Date.now(),
+      reason: reason ?? null,
+    })
+    .onConflictDoUpdate({
+      target: pinnedBuilds.buildId,
+      set: {
+        pinnedAt: Date.now(),
+        reason: reason ?? null,
+      },
+    });
+}
+
+/**
+ * build の GC 保護 pin を解除する。
+ * 参照先 build_id が存在しなければ BuildNotFoundError (404)。
+ */
+export async function unpinBuild(db: Db, buildId: string): Promise<void> {
+  const existing = await db
+    .select({ id: builds.id })
+    .from(builds)
+    .where(eq(builds.id, buildId))
+    .limit(1);
+
+  if (!existing[0]) {
+    throw new BuildNotFoundError(`build ${buildId} not found`);
+  }
+
+  await db.delete(pinnedBuilds).where(eq(pinnedBuilds.buildId, buildId));
+}
+
+/**
  * dead 判定済み NAR key から削除対象 store_path を引く。
  * inArray は SQLite 変数上限(999)を超えないよう 999 件ごとに分割する。
  */
@@ -525,31 +575,57 @@ export async function deleteDeadStorePaths(
  * 実 R2 削除はしない。
  * G8: latest published build の closure を live root に含める。
  */
-export async function computeLiveSet(db: Db): Promise<LiveSet> {
-  // 1. live build ID 集合を構築: published builds + rollback_roots の build_id の union。
-  const publishedBuilds = await db
-    .select({ id: builds.id })
-    .from(builds)
-    .where(eq(builds.status, "published"));
+export async function computeLiveSet(db: Db, keepGenerations = 3): Promise<LiveSet> {
+  const generationLimit = Math.max(0, keepGenerations);
 
-  const rollbackRootRows = await db
-    .select({ buildId: rollbackRoots.buildId })
-    .from(rollbackRoots);
-
-  const liveBuildIds = new Set<string>([
-    ...publishedBuilds.map((b) => b.id),
-    ...rollbackRootRows.map((r) => r.buildId),
+  // 1. live build ID 集合を構築: published builds + rollback_roots + protected builds。
+  const [allBuildRows, rollbackRootRows, pinnedBuildRows] = await Promise.all([
+    db.select({
+      id: builds.id,
+      host: builds.host,
+      status: builds.status,
+      createdAt: builds.createdAt,
+      publishedAt: builds.publishedAt,
+    }).from(builds),
+    db.select({ buildId: rollbackRoots.buildId }).from(rollbackRoots),
+    db.select({ buildId: pinnedBuilds.buildId }).from(pinnedBuilds),
   ]);
 
-  if (liveBuildIds.size === 0) {
-    // live build なし: 全 store_paths の narKey を dead_candidates とする。
-    const allPaths = await db.select({ narKey: storePaths.narKey }).from(storePaths);
-    const deadKeys = [...new Set(allPaths.map((p) => p.narKey))];
-    return { liveNarKeys: [], deadCandidates: deadKeys };
+  const rollbackBuildIds = new Set(rollbackRootRows.map((r) => r.buildId));
+  const liveBuildIds = new Set<string>();
+  for (const build of allBuildRows) {
+    if (build.status === "published") {
+      liveBuildIds.add(build.id);
+    }
+  }
+  for (const buildId of rollbackBuildIds) {
+    liveBuildIds.add(buildId);
+  }
+
+  const deadBuildRows = allBuildRows.filter(
+    (build) =>
+      build.status !== "published" &&
+      build.status !== "staging" &&
+      !rollbackBuildIds.has(build.id),
+  );
+  const deadBuildsByHost = new Map<string, typeof deadBuildRows>();
+  for (const build of deadBuildRows) {
+    const hostBuilds = deadBuildsByHost.get(build.host) ?? [];
+    hostBuilds.push(build);
+    deadBuildsByHost.set(build.host, hostBuilds);
+  }
+  for (const hostBuilds of deadBuildsByHost.values()) {
+    hostBuilds
+      .sort((a, b) => (b.publishedAt ?? b.createdAt) - (a.publishedAt ?? a.createdAt))
+      .slice(0, generationLimit)
+      .forEach((build) => liveBuildIds.add(build.id));
+  }
+  for (const pinned of pinnedBuildRows) {
+    liveBuildIds.add(pinned.buildId);
   }
 
   // 2. live build_id に対応する build_closure から live storeHash を取得。
-  // inArray は 999 件ごとに分割（修正2: SQLite 変数上限対策）。
+  // inArray は 999 件ごとに分割（SQLite 変数上限対策）。
   const liveBuildIdList = [...liveBuildIds];
   const liveClosure: (typeof buildClosure.$inferSelect)[] = [];
   for (let i = 0; i < liveBuildIdList.length; i += 999) {
@@ -562,13 +638,6 @@ export async function computeLiveSet(db: Db): Promise<LiveSet> {
   }
 
   const liveStoreHashes = new Set(liveClosure.map((c) => c.storeHash));
-
-  if (liveStoreHashes.size === 0) {
-    // live closure が空: 全 NAR は dead candidate。
-    const allPaths = await db.select({ narKey: storePaths.narKey }).from(storePaths);
-    const deadKeys = [...new Set(allPaths.map((p) => p.narKey))];
-    return { liveNarKeys: [], deadCandidates: deadKeys };
-  }
 
   // 3. live storeHash に対応する narKey を取得（inArray 999 件分割）。
   const liveStoreHashList = [...liveStoreHashes];
@@ -586,10 +655,56 @@ export async function computeLiveSet(db: Db): Promise<LiveSet> {
 
   // 4. dead candidates: live でない narKey を持つ store_paths。
   // notInArray も 999 件制限があるため、全件取得して JS 側でフィルタする。
-  const allPaths = await db.select({ narKey: storePaths.narKey }).from(storePaths);
-  const deadCandidates = [...new Set(
-    allPaths.map((p) => p.narKey).filter((k) => !liveNarKeySet.has(k)),
-  )];
+  const allPaths = await db
+    .select({ storeHash: storePaths.storeHash, narKey: storePaths.narKey })
+    .from(storePaths);
+  const storeHashToNarKey = new Map(allPaths.map((p) => [p.storeHash, p.narKey]));
+  const candidateNarKeys = new Set(
+    allPaths.map((p) => p.narKey).filter((narKey) => !liveNarKeySet.has(narKey)),
+  );
+
+  // 5. staleness: 候補を参照する dead build の MAX(published_at)。
+  const deadBuildIdList = deadBuildRows.map((build) => build.id);
+  const deadPublishedAtByBuildId = new Map(
+    deadBuildRows.map((build) => [build.id, build.publishedAt]),
+  );
+  const candidateStalenessByNarKey = new Map<string, number | null>();
+  for (let i = 0; i < deadBuildIdList.length; i += 999) {
+    const chunk = deadBuildIdList.slice(i, i + 999);
+    const rows_ = await db
+      .select({ buildId: buildClosure.buildId, storeHash: buildClosure.storeHash })
+      .from(buildClosure)
+      .where(inArray(buildClosure.buildId, chunk));
+
+    for (const row of rows_) {
+      const narKey = storeHashToNarKey.get(row.storeHash);
+      if (!narKey || !candidateNarKeys.has(narKey)) continue;
+
+      const publishedAt = deadPublishedAtByBuildId.get(row.buildId) ?? null;
+      if (publishedAt === null) {
+        candidateStalenessByNarKey.set(
+          narKey,
+          candidateStalenessByNarKey.get(narKey) ?? null,
+        );
+        continue;
+      }
+
+      const current = candidateStalenessByNarKey.get(narKey);
+      if (current === undefined || current === null || publishedAt > current) {
+        candidateStalenessByNarKey.set(narKey, publishedAt);
+      }
+    }
+  }
+
+  const stalenessValue = (narKey: string) => candidateStalenessByNarKey.get(narKey) ?? null;
+  const deadCandidates = [...candidateNarKeys].sort((a, b) => {
+    const stalenessA = stalenessValue(a);
+    const stalenessB = stalenessValue(b);
+    if (stalenessA === null && stalenessB === null) return a.localeCompare(b);
+    if (stalenessA === null) return -1;
+    if (stalenessB === null) return 1;
+    return stalenessA - stalenessB || a.localeCompare(b);
+  });
 
   return {
     liveNarKeys: [...liveNarKeySet],

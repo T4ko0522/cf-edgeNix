@@ -12,6 +12,8 @@
 import { beforeEach, describe, expect, test } from "vitest";
 import { env } from "cloudflare:test";
 import { apiApp } from "../../src/api/app";
+import { getDb } from "../../src/db/client";
+import { computeLiveSet } from "../../src/db/queries";
 import { handleNarinfo } from "../../src/handlers/narinfo";
 import type { Env } from "../../src/types";
 
@@ -26,6 +28,7 @@ async function applyMigrations(db1: D1Database) {
     `CREATE TABLE IF NOT EXISTS \`builds\` (\`id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`system\` text NOT NULL, \`git_rev\` text NOT NULL, \`flake_lock_hash\` text NOT NULL, \`toplevel_store_path\` text NOT NULL, \`status\` text DEFAULT 'staging' NOT NULL, \`retention_class\` text, \`created_at\` integer NOT NULL, \`published_at\` integer)`,
     `CREATE INDEX IF NOT EXISTS \`idx_builds_host_published\` ON \`builds\` (\`host\`, \`published_at\`)`,
     `CREATE TABLE IF NOT EXISTS \`nar_files\` (\`file_hash\` text PRIMARY KEY NOT NULL, \`nar_key\` text NOT NULL, \`file_size\` integer NOT NULL, \`compression\` text NOT NULL, \`created_at\` integer NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS \`pinned_builds\` (\`build_id\` text PRIMARY KEY NOT NULL, \`pinned_at\` integer NOT NULL, \`reason\` text)`,
     `CREATE TABLE IF NOT EXISTS \`rollback_roots\` (\`id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`build_id\` text NOT NULL, \`reason\` text, \`pinned\` integer DEFAULT 0 NOT NULL, \`keep_until\` integer, \`created_at\` integer NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS \`store_paths\` (\`store_hash\` text PRIMARY KEY NOT NULL, \`store_path\` text NOT NULL, \`narinfo_key\` text NOT NULL, \`nar_key\` text NOT NULL, \`nar_hash\` text NOT NULL, \`nar_size\` integer NOT NULL, \`file_hash\` text NOT NULL, \`file_size\` integer NOT NULL, \`compression\` text NOT NULL, \`first_seen_build_id\` text, \`created_at\` integer NOT NULL)`,
   ];
@@ -41,6 +44,17 @@ function authedEnv() {
 function makeWriteReq(path: string, body: unknown) {
   return new Request(`https://example.com${path}`, {
     method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer gc-test-token",
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+function makePatchReq(path: string, body: unknown) {
+  return new Request(`https://example.com${path}`, {
+    method: "PATCH",
     headers: {
       "content-type": "application/json",
       authorization: "Bearer gc-test-token",
@@ -111,6 +125,7 @@ async function cleanupTables(db1: D1Database) {
     "build_closure",
     "build_manifests",
     "nar_files",
+    "pinned_builds",
     "rollback_roots",
     "store_paths",
     "builds",
@@ -164,6 +179,104 @@ async function putDeadObjects(eenv: Env, storeHash = deadHash, narKey = deadNarK
   await eenv.META_KV.put(`narinfo:${storeHash}`, `StorePath: /nix/store/${storeHash}-dead`);
   await eenv.NAR_BUCKET.put(`${storeHash}.narinfo`, `StorePath: /nix/store/${storeHash}-dead`);
   await eenv.NAR_BUCKET.put(narKey, "dead nar");
+}
+
+async function createStagingBuild(
+  eenv: Env,
+  input: {
+    buildId: string;
+    storeHash: string;
+    createdAt: number;
+    fileHashChar: string;
+  },
+) {
+  const narKey = `nar/${input.storeHash}.nar.zst`;
+  const startRes = await apiApp.fetch(
+    makeWriteReq("/api/publish/start", {
+      build: {
+        id: input.buildId,
+        host: HOST,
+        system: "x86_64-linux",
+        gitRev: `rev-${input.buildId}`,
+        flakeLockHash: `sha256:lock-${input.buildId}`,
+        toplevelStorePath: `/nix/store/${input.storeHash}-pkg`,
+        createdAt: input.createdAt,
+      },
+    }),
+    eenv,
+  );
+  expect(startRes.status).toBe(200);
+
+  const ingestRes = await apiApp.fetch(
+    makeWriteReq(`/api/publish/${input.buildId}/ingest`, {
+      storePaths: [{
+        storeHash: input.storeHash,
+        storePath: `/nix/store/${input.storeHash}-pkg`,
+        narinfoKey: `${input.storeHash}.narinfo`,
+        narKey,
+        narHash: "sha256:" + input.fileHashChar.repeat(64),
+        narSize: 3000,
+        fileHash: "sha256:" + input.fileHashChar.repeat(64),
+        fileSize: 1500,
+        compression: "zstd",
+      }],
+    }),
+    eenv,
+  );
+  expect(ingestRes.status).toBe(200);
+
+  return { narKey };
+}
+
+async function insertFailedBuildWithClosure(
+  db1: D1Database,
+  input: {
+    buildId: string;
+    storeHash: string;
+    createdAt: number;
+    publishedAt: number | null;
+    fileHashChar: string;
+  },
+) {
+  const narKey = `nar/${input.storeHash}.nar.zst`;
+  await db1.prepare(
+    `INSERT INTO builds (id, host, system, git_rev, flake_lock_hash, toplevel_store_path, status, created_at, published_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(
+    input.buildId,
+    HOST,
+    "x86_64-linux",
+    `rev-${input.buildId}`,
+    `sha256:lock-${input.buildId}`,
+    `/nix/store/${input.storeHash}-pkg`,
+    "failed",
+    input.createdAt,
+    input.publishedAt,
+  ).run();
+  await db1.prepare(
+    `INSERT INTO store_paths (store_hash, store_path, narinfo_key, nar_key, nar_hash, nar_size, file_hash, file_size, compression, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(
+    input.storeHash,
+    `/nix/store/${input.storeHash}-pkg`,
+    `${input.storeHash}.narinfo`,
+    narKey,
+    "sha256:" + input.fileHashChar.repeat(64),
+    3000,
+    "sha256:" + input.fileHashChar.repeat(64),
+    1500,
+    "zstd",
+    input.createdAt,
+  ).run();
+  await db1.prepare(
+    `INSERT INTO nar_files (file_hash, nar_key, file_size, compression, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).bind("sha256:" + input.fileHashChar.repeat(64), narKey, 1500, "zstd", input.createdAt).run();
+  await db1.prepare(
+    `INSERT INTO build_closure (build_id, store_hash) VALUES (?, ?)`,
+  ).bind(input.buildId, input.storeHash).run();
+
+  return { narKey };
 }
 
 beforeEach(async () => {
@@ -399,6 +512,169 @@ describe("POST /api/gc/dry-run（G8）", () => {
     // ここが rollback_roots 分岐の独立寄与を検証するポイント。
     // Build B は published でないため、rollback_roots テーブルの寄与がなければ dead になる。
     expect(liveKeys).toContain(buildBNarKey);
+  });
+
+  test("keep_generations: host ごとに新しい 3 世代分の dead build が保護される", async () => {
+    const eenv = authedEnv();
+    const db1 = (env as unknown as Env).CONTROL_DB;
+
+    const buildsToCreate = [
+      {
+        buildId: "gc-keep-build-1",
+        storeHash: "keep0001keep0001keep0001keep0001",
+        createdAt: 1700000001000,
+        publishedAt: 1000,
+        fileHashChar: "1",
+      },
+      {
+        buildId: "gc-keep-build-2",
+        storeHash: "keep0002keep0002keep0002keep0002",
+        createdAt: 1700000002000,
+        publishedAt: 2000,
+        fileHashChar: "2",
+      },
+      {
+        buildId: "gc-keep-build-3",
+        storeHash: "keep0003keep0003keep0003keep0003",
+        createdAt: 1700000003000,
+        publishedAt: 3000,
+        fileHashChar: "3",
+      },
+      {
+        buildId: "gc-keep-build-4",
+        storeHash: "keep0004keep0004keep0004keep0004",
+        createdAt: 1700000004000,
+        publishedAt: 4000,
+        fileHashChar: "4",
+      },
+    ];
+
+    const created: Awaited<ReturnType<typeof insertFailedBuildWithClosure>>[] = [];
+    for (const build of buildsToCreate) {
+      created.push(await insertFailedBuildWithClosure(db1, build));
+    }
+
+    const liveSet = await computeLiveSet(getDb(eenv));
+    const liveKeys = liveSet.liveNarKeys;
+    const deadCandidates = liveSet.deadCandidates;
+
+    expect(liveKeys).toEqual(expect.arrayContaining([
+      created[1]!.narKey,
+      created[2]!.narKey,
+      created[3]!.narKey,
+    ]));
+    expect(deadCandidates).toContain(created[0]!.narKey);
+    expect(deadCandidates).not.toEqual(expect.arrayContaining([
+      created[1]!.narKey,
+      created[2]!.narKey,
+      created[3]!.narKey,
+    ]));
+  });
+
+  test("pinned_builds: pin された build の closure が live 扱いになる", async () => {
+    const eenv = authedEnv();
+    const { narKey } = await createStagingBuild(eenv, {
+      buildId: "gc-pinned-build-1",
+      storeHash: "pin00001pin00001pin00001pin00001",
+      createdAt: 1700000001000,
+      fileHashChar: "5",
+    });
+
+    const patchRes = await apiApp.fetch(
+      makePatchReq("/api/builds/gc-pinned-build-1", {
+        pinned: true,
+        reason: "integration test pin",
+      }),
+      eenv,
+    );
+    expect(patchRes.status).toBe(200);
+
+    const liveSet = await computeLiveSet(getDb(eenv), 0);
+    expect(liveSet.liveNarKeys).toContain(narKey);
+    expect(liveSet.deadCandidates).not.toContain(narKey);
+  });
+
+  test("dead_candidates は staleness が古い順に並ぶ", async () => {
+    const eenv = authedEnv();
+    const db1 = (env as unknown as Env).CONTROL_DB;
+
+    const newest = await insertFailedBuildWithClosure(db1, {
+      buildId: "gc-stale-build-newest",
+      storeHash: "stale003stale003stale003stale003",
+      createdAt: 1700000003000,
+      publishedAt: 3000,
+      fileHashChar: "6",
+    });
+    const oldest = await insertFailedBuildWithClosure(db1, {
+      buildId: "gc-stale-build-oldest",
+      storeHash: "stale001stale001stale001stale001",
+      createdAt: 1700000001000,
+      publishedAt: 1000,
+      fileHashChar: "7",
+    });
+    const middle = await insertFailedBuildWithClosure(db1, {
+      buildId: "gc-stale-build-middle",
+      storeHash: "stale002stale002stale002stale002",
+      createdAt: 1700000002000,
+      publishedAt: 2000,
+      fileHashChar: "8",
+    });
+
+    const liveSet = await computeLiveSet(getDb(eenv), 0);
+    expect(liveSet.deadCandidates).toEqual([
+      oldest.narKey,
+      middle.narKey,
+      newest.narKey,
+    ]);
+  });
+});
+
+// ─── PATCH /api/builds/:id ───────────────────────────────────────────────────
+
+describe("PATCH /api/builds/:id", () => {
+  test("pin/unpin が pinned_builds を更新し、存在しない build_id は 404 を返す", async () => {
+    const eenv = authedEnv();
+    const db1 = (env as unknown as Env).CONTROL_DB;
+
+    await createStagingBuild(eenv, {
+      buildId: "gc-api-pin-build-1",
+      storeHash: "apipin01apipin01apipin01apipin01",
+      createdAt: 1700000001000,
+      fileHashChar: "9",
+    });
+
+    const pinRes = await apiApp.fetch(
+      makePatchReq("/api/builds/gc-api-pin-build-1", {
+        pinned: true,
+        reason: "manual keep",
+      }),
+      eenv,
+    );
+    expect(pinRes.status).toBe(200);
+    expect(await pinRes.json()).toEqual({
+      ok: true,
+      build_id: "gc-api-pin-build-1",
+      pinned: true,
+    });
+    expect(await countRows(db1, "pinned_builds", "build_id", "gc-api-pin-build-1")).toBe(1);
+
+    const unpinRes = await apiApp.fetch(
+      makePatchReq("/api/builds/gc-api-pin-build-1", { pinned: false }),
+      eenv,
+    );
+    expect(unpinRes.status).toBe(200);
+    expect(await unpinRes.json()).toEqual({
+      ok: true,
+      build_id: "gc-api-pin-build-1",
+      pinned: false,
+    });
+    expect(await countRows(db1, "pinned_builds", "build_id", "gc-api-pin-build-1")).toBe(0);
+
+    const missingRes = await apiApp.fetch(
+      makePatchReq("/api/builds/gc-api-missing-build", { pinned: true }),
+      eenv,
+    );
+    expect(missingRes.status).toBe(404);
   });
 });
 

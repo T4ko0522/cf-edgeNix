@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "9956c7a1-0f54-4d22-925c-655968bec616",
-  "prevId": "00000000-0000-0000-0000-000000000000",
+  "id": "1b2f0c4f-3c5f-4b8c-9b5a-9d5a4d3b2a11",
+  "prevId": "9956c7a1-0f54-4d22-925c-655968bec616",
   "tables": {
     "build_closure": {
       "name": "build_closure",
@@ -259,6 +259,37 @@
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "pinned_builds": {
+      "name": "pinned_builds",
+      "columns": {
+        "build_id": {
+          "name": "build_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "pinned_at": {
+          "name": "pinned_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "reason": {
+          "name": "reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         }
       },
