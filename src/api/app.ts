@@ -239,6 +239,10 @@ const patchBuildRoute = createRoute({
       content: { "application/json": { schema: ApiErrorSchema } },
       description: "build_id 不在",
     },
+    500: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "サーバ内部エラー",
+    },
   },
 });
 
@@ -498,7 +502,7 @@ apiApp.openapi(patchBuildRoute, async (c) => {
     return c.json({ ok: true as const, build_id: buildId, pinned: body.pinned }, 200);
   } catch (err) {
     const status = errorStatus(err);
-    return c.json({ error: errorMessage(err) }, status as 404);
+    return c.json({ error: errorMessage(err) }, status as 404 | 500);
   }
 });
 

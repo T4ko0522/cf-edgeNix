@@ -436,18 +436,20 @@ export async function pinBuild(db: Db, buildId: string, reason?: string): Promis
     throw new BuildNotFoundError(`build ${buildId} not found`);
   }
 
+  const now = Date.now();
+  const reasonValue = reason ?? null;
   await db
     .insert(pinnedBuilds)
     .values({
       buildId,
-      pinnedAt: Date.now(),
-      reason: reason ?? null,
+      pinnedAt: now,
+      reason: reasonValue,
     })
     .onConflictDoUpdate({
       target: pinnedBuilds.buildId,
       set: {
-        pinnedAt: Date.now(),
-        reason: reason ?? null,
+        pinnedAt: now,
+        reason: reasonValue,
       },
     });
 }
