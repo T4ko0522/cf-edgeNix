@@ -2,6 +2,10 @@ import type { Env } from "../types";
 
 const GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
 
+// storage は「現時点の積載量」で判定したいので直近 N 時間の最新スナップショットを取る。
+// 月内ピーク (publish 直後など) を引きずると GC 後に積載が減っても kill が解除されない。
+const STORAGE_LOOKBACK_HOURS = 1;
+
 const CLASS_A_ACTIONS = new Set([
   "ListBuckets",
   "PutBucket",
@@ -17,6 +21,9 @@ const CLASS_A_ACTIONS = new Set([
   "PutBucketEncryption",
   "PutBucketCors",
   "PutBucketLifecycleConfiguration",
+  "PutBucketNotificationConfiguration",
+  "PutBucketSippyConfiguration",
+  "PutBucketStorageClass",
 ]);
 
 const CLASS_B_ACTIONS = new Set([
@@ -28,12 +35,19 @@ const CLASS_B_ACTIONS = new Set([
   "GetBucketLocation",
   "GetBucketCors",
   "GetBucketLifecycleConfiguration",
+  "GetBucketNotificationConfiguration",
+  "GetBucketSippyConfiguration",
+  "GetBucketStorageClass",
 ]);
 
 const FREE_ACTIONS = new Set([
   "DeleteObject",
   "DeleteBucket",
   "AbortMultipartUpload",
+  "DeleteBucketEncryption",
+  "DeleteBucketCors",
+  "DeleteBucketLifecycleConfiguration",
+  "DeleteBucketSippyConfiguration",
 ]);
 
 type Usage = {
@@ -55,6 +69,9 @@ type GraphQLResponse = {
 };
 
 type StorageGroup = {
+  dimensions?: {
+    datetime?: string;
+  };
   max?: {
     payloadSize?: number;
   };
@@ -93,8 +110,9 @@ export async function fetchR2Usage(env: Env, now: Date): Promise<Usage> {
       variables: {
         accountTag: env.CF_ACCOUNT_ID,
         bucketName: env.QUOTA_R2_BUCKET_NAME,
-        since: monthStartUtc(now).toISOString(),
-        until: now.toISOString(),
+        storageSince: storageLookbackStart(now).toISOString(),
+        opsSince: monthStartUtc(now).toISOString(),
+        opsUntil: now.toISOString(),
       },
     }),
   });
@@ -116,12 +134,10 @@ export async function fetchR2Usage(env: Env, now: Date): Promise<Usage> {
     return { storageBytes: 0, classAOperations: 0, classBOperations: 0 };
   }
 
-  // R2 課金は GB-month 月平均だが、kill-switch 目的では現在 R2 に載っている量の最大値で
-  // 10GB 超過を防ぐ近似 guard として割り切る。
-  const storageBytes = Math.max(
-    0,
-    ...((account.r2StorageAdaptiveGroups ?? []).map((group) => group.max?.payloadSize ?? 0)),
-  );
+  // R2 課金は GB-month 月平均だが、kill-switch 目的では「現在 R2 に載っている量」で
+  // 10GB 超過を防ぐ近似 guard として割り切る。直近 STORAGE_LOOKBACK_HOURS 内の
+  // 最新スナップショット 1 件の payloadSize を採用 (月内ピークは引きずらない)。
+  const storageBytes = account.r2StorageAdaptiveGroups?.[0]?.max?.payloadSize ?? 0;
   let classAOperations = 0;
   let classBOperations = 0;
 
@@ -142,21 +158,35 @@ function monthStartUtc(now: Date): Date {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
 }
 
+function storageLookbackStart(now: Date): Date {
+  return new Date(now.getTime() - STORAGE_LOOKBACK_HOURS * 60 * 60 * 1000);
+}
+
 const R2_USAGE_QUERY = `
-query R2Usage($accountTag: String!, $bucketName: String!, $since: Time!, $until: Time!) {
+query R2Usage(
+  $accountTag: String!
+  $bucketName: String!
+  $storageSince: Time!
+  $opsSince: Time!
+  $opsUntil: Time!
+) {
   viewer {
     accounts(filter: { accountTag: $accountTag }) {
       r2StorageAdaptiveGroups(
-        limit: 100
-        filter: { bucketName: $bucketName, datetime_geq: $since, datetime_leq: $until }
+        limit: 1
+        filter: { bucketName: $bucketName, datetime_geq: $storageSince }
+        orderBy: [datetime_DESC]
       ) {
+        dimensions {
+          datetime
+        }
         max {
           payloadSize
         }
       }
       r2OperationsAdaptiveGroups(
         limit: 1000
-        filter: { bucketName: $bucketName, datetime_geq: $since, datetime_leq: $until }
+        filter: { bucketName: $bucketName, datetime_geq: $opsSince, datetime_leq: $opsUntil }
       ) {
         dimensions {
           actionType
