@@ -4,12 +4,13 @@ import { checkReadPathAllowed, currentMonthUtc, secondsUntilMonthEnd } from "../
 import { __resetForTest, setQuotaSnapshot } from "../../src/quota/state";
 import type { QuotaSnapshot } from "../../src/quota/types";
 
-function makeEnv(value: string | null = null): Env {
+function makeEnv(): Env {
+  const kvStore = new Map<string, string>();
   return {
     NAR_BUCKET: {} as R2Bucket,
     META_KV: {
-      get: vi.fn(async () => value),
-      put: vi.fn(async () => undefined),
+      get: vi.fn(async (key: string) => kvStore.get(key) ?? null),
+      put: vi.fn(async (key: string, val: string) => { kvStore.set(key, val); }),
     } as unknown as KVNamespace,
     CONTROL_DB: {} as D1Database,
   };

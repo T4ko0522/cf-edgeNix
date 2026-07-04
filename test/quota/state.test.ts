@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { Env } from "../../src/types";
 import { __resetForTest, getQuotaSnapshot, setQuotaSnapshot } from "../../src/quota/state";
 import type { QuotaSnapshot } from "../../src/quota/types";
+import { QUOTA_EPOCH_KV_KEY, QUOTA_STATE_KV_KEY } from "../../src/storage/keys";
 
 function snapshot(): QuotaSnapshot {
   return {
@@ -16,9 +17,13 @@ function snapshot(): QuotaSnapshot {
   };
 }
 
-function makeEnv(value: string | null): { env: Env; get: ReturnType<typeof vi.fn>; put: ReturnType<typeof vi.fn> } {
-  const get = vi.fn(async () => value);
-  const put = vi.fn(async () => undefined);
+function makeEnv(value: string | null, epoch = 0): { env: Env; get: ReturnType<typeof vi.fn>; put: ReturnType<typeof vi.fn> } {
+  const kvStore = new Map<string, string>();
+  if (value !== null) kvStore.set(QUOTA_STATE_KV_KEY, value);
+  kvStore.set(QUOTA_EPOCH_KV_KEY, String(epoch));
+
+  const get = vi.fn(async (key: string) => kvStore.get(key) ?? null);
+  const put = vi.fn(async (key: string, val: string) => { kvStore.set(key, val); });
   return {
     env: {
       NAR_BUCKET: {} as R2Bucket,
@@ -31,22 +36,20 @@ function makeEnv(value: string | null): { env: Env; get: ReturnType<typeof vi.fn
 }
 
 afterEach(() => {
-  vi.useRealTimers();
   vi.restoreAllMocks();
   __resetForTest();
 });
 
 describe("quota state", () => {
-  test("memory L0 が KV 呼び出しを抑制", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-06-25T00:00:00.000Z"));
+  test("epoch 一致時は L0 ヒットで snapshot KV 読み取りを抑制", async () => {
     const expected = snapshot();
     const { env, get } = makeEnv(JSON.stringify(expected));
 
     await expect(getQuotaSnapshot(env)).resolves.toEqual(expected);
     await expect(getQuotaSnapshot(env)).resolves.toEqual(expected);
 
-    expect(get).toHaveBeenCalledTimes(1);
+    const snapshotReads = get.mock.calls.filter((args) => args[0] === QUOTA_STATE_KV_KEY);
+    expect(snapshotReads).toHaveLength(1);
   });
 
   test("setQuotaSnapshot 後の getQuotaSnapshot が同一値を返す", async () => {
@@ -56,7 +59,34 @@ describe("quota state", () => {
     await setQuotaSnapshot(env, expected);
     await expect(getQuotaSnapshot(env)).resolves.toEqual(expected);
 
-    expect(put).toHaveBeenCalledWith("quota:state", JSON.stringify(expected));
+    expect(put).toHaveBeenCalledWith(QUOTA_STATE_KV_KEY, JSON.stringify(expected));
+    expect(put).toHaveBeenCalledWith(QUOTA_EPOCH_KV_KEY, expect.any(String));
+  });
+
+  test("setQuotaSnapshot が epoch をインクリメントする", async () => {
+    const { env, put } = makeEnv(null, 5);
+
+    await setQuotaSnapshot(env, snapshot());
+
+    expect(put).toHaveBeenCalledWith(QUOTA_EPOCH_KV_KEY, "6");
+  });
+
+  test("epoch 変化時に L0 を破棄して KV から再取得する", async () => {
+    const v1 = snapshot();
+    const { env, get } = makeEnv(JSON.stringify(v1), 1);
+
+    await expect(getQuotaSnapshot(env)).resolves.toEqual(v1);
+
+    const v2: QuotaSnapshot = { ...v1, state: "ok" };
+    const kvStore = new Map<string, string>();
+    kvStore.set(QUOTA_STATE_KV_KEY, JSON.stringify(v2));
+    kvStore.set(QUOTA_EPOCH_KV_KEY, "2");
+    get.mockImplementation(async (key: string) => kvStore.get(key) ?? null);
+
+    await expect(getQuotaSnapshot(env)).resolves.toEqual(v2);
+
+    const snapshotReads = get.mock.calls.filter((args) => args[0] === QUOTA_STATE_KV_KEY);
+    expect(snapshotReads).toHaveLength(2);
   });
 
   test("不正 JSON 文字列は null を返し L0 に入れない", async () => {
@@ -66,7 +96,8 @@ describe("quota state", () => {
     await expect(getQuotaSnapshot(env)).resolves.toBeNull();
     await expect(getQuotaSnapshot(env)).resolves.toBeNull();
 
-    expect(get).toHaveBeenCalledTimes(2);
+    const snapshotReads = get.mock.calls.filter((args) => args[0] === QUOTA_STATE_KV_KEY);
+    expect(snapshotReads).toHaveLength(2);
     expect(warn).toHaveBeenCalled();
   });
 
@@ -77,7 +108,8 @@ describe("quota state", () => {
     await expect(getQuotaSnapshot(env)).resolves.toBeNull();
     await expect(getQuotaSnapshot(env)).resolves.toBeNull();
 
-    expect(get).toHaveBeenCalledTimes(2);
+    const snapshotReads = get.mock.calls.filter((args) => args[0] === QUOTA_STATE_KV_KEY);
+    expect(snapshotReads).toHaveLength(2);
     expect(warn).toHaveBeenCalledWith(
       "[quota] snapshot schema validation failed:",
       expect.anything(),

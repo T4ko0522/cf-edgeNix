@@ -4,6 +4,7 @@ import { fetchR2Usage } from "../../src/quota/analytics";
 import { runQuotaCheck } from "../../src/quota/cron";
 import { __resetForTest } from "../../src/quota/state";
 import type { QuotaSnapshot } from "../../src/quota/types";
+import { QUOTA_STATE_KV_KEY } from "../../src/storage/keys";
 
 vi.mock("../../src/quota/analytics", () => ({
   fetchR2Usage: vi.fn(),
@@ -30,21 +31,26 @@ function makeEnv(initial: QuotaSnapshot | null): {
   put: ReturnType<typeof vi.fn>;
   stored: () => QuotaSnapshot | null;
 } {
-  let value = initial === null ? null : JSON.stringify(initial);
-  const put = vi.fn(async (_key: string, next: string) => {
-    value = next;
+  const kvStore = new Map<string, string>();
+  if (initial !== null) kvStore.set(QUOTA_STATE_KV_KEY, JSON.stringify(initial));
+
+  const put = vi.fn(async (key: string, val: string) => {
+    kvStore.set(key, val);
   });
   return {
     env: {
       NAR_BUCKET: {} as R2Bucket,
       META_KV: {
-        get: vi.fn(async () => value),
+        get: vi.fn(async (key: string) => kvStore.get(key) ?? null),
         put,
       } as unknown as KVNamespace,
       CONTROL_DB: {} as D1Database,
     },
     put,
-    stored: () => value === null ? null : JSON.parse(value) as QuotaSnapshot,
+    stored: () => {
+      const val = kvStore.get(QUOTA_STATE_KV_KEY);
+      return val === undefined ? null : JSON.parse(val) as QuotaSnapshot;
+    },
   };
 }
 

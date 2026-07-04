@@ -26,3 +26,6 @@ export const CACHE_INFO_KV_KEY = "nix-cache-info";
 
 /** KV 上の quota kill-switch state キー。 */
 export const QUOTA_STATE_KV_KEY = "quota:state";
+
+/** KV 上の quota epoch カウンタキー。state 更新のたびにインクリメントし、L0 キャッシュの世代管理に使う。 */
+export const QUOTA_EPOCH_KV_KEY = "quota:epoch";
