@@ -66,13 +66,16 @@ curl -X POST \
   https://cf-edgenix.example.workers.dev/api/quota/reset
 ```
 
-memory L0 cache（30秒 TTL）のため、他 isolate では reset 後最大 30 秒は古い state を返す可能性がある。
+L0 cache は epoch カウンタで管理されており、reset API は epoch をインクリメントするため即座に反映される。ただし他 isolate では KV edge cache の伝播遅延（最大 60 秒程度）により古い state を返す可能性がある。
 
-3. KV の state を削除する。
+3. KV の state と epoch を削除する。
 
 ```bash
 bunx wrangler kv key delete --binding=META_KV quota:state
+bunx wrangler kv key delete --binding=META_KV quota:epoch
 ```
+
+`quota:epoch` を削除しないと、既存 isolate の L0 cache が無効化されず古い state を返し続ける。
 
 手動解除しても同じ月の使用量が 95% 以上のままなら、次の Cron で再び `killed` になる。
 

@@ -1,20 +1,25 @@
 import type { Env } from "../types";
 import { QuotaSnapshotSchema } from "../schemas/quota";
-import { QUOTA_STATE_KV_KEY } from "../storage/keys";
+import { QUOTA_STATE_KV_KEY, QUOTA_EPOCH_KV_KEY } from "../storage/keys";
 import { R2_FREE_TIER } from "./limits";
 import type { QuotaSnapshot } from "./types";
 
-const L0_TTL_MS = 30_000;
+let l0: { snapshot: QuotaSnapshot | null; epoch: number } | null = null;
 
-let l0: { snapshot: QuotaSnapshot | null; expiresAt: number } | null = null;
+async function readEpoch(env: Env): Promise<number> {
+  const raw = await env.META_KV.get(QUOTA_EPOCH_KV_KEY, "text");
+  if (raw === null) return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
 
 export async function getQuotaSnapshot(env: Env): Promise<QuotaSnapshot | null> {
-  const now = Date.now();
-  if (l0 && l0.expiresAt > now) return l0.snapshot;
+  const remoteEpoch = await readEpoch(env);
+  if (l0 && l0.epoch === remoteEpoch) return l0.snapshot;
 
   const raw = await env.META_KV.get(QUOTA_STATE_KV_KEY, "text");
   if (raw === null) {
-    l0 = { snapshot: null, expiresAt: now + L0_TTL_MS };
+    l0 = { snapshot: null, epoch: remoteEpoch };
     return null;
   }
 
@@ -33,13 +38,17 @@ export async function getQuotaSnapshot(env: Env): Promise<QuotaSnapshot | null> 
   }
 
   const snapshot = result.data;
-  l0 = { snapshot, expiresAt: now + L0_TTL_MS };
+  l0 = { snapshot, epoch: remoteEpoch };
   return snapshot;
 }
 
 export async function setQuotaSnapshot(env: Env, snapshot: QuotaSnapshot): Promise<void> {
+  const nextEpoch = (await readEpoch(env)) + 1;
+  // state → epoch の順で直列書き込み。逆順だと reader が新 epoch + 旧 state を
+  // L0 にキャッシュし、次の epoch 更新まで回復しない stale を生む。
   await env.META_KV.put(QUOTA_STATE_KV_KEY, JSON.stringify(snapshot));
-  l0 = { snapshot, expiresAt: Date.now() + L0_TTL_MS };
+  await env.META_KV.put(QUOTA_EPOCH_KV_KEY, String(nextEpoch));
+  l0 = { snapshot, epoch: nextEpoch };
 }
 
 export async function clearQuotaSnapshot(env: Env): Promise<void> {
