@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { Env } from "../../src/types";
-import { __resetForTest, getQuotaSnapshot, setQuotaSnapshot } from "../../src/quota/state";
+import { __resetForTest, clearQuotaSnapshot, getQuotaSnapshot, setQuotaSnapshot } from "../../src/quota/state";
 import type { QuotaSnapshot } from "../../src/quota/types";
 import { QUOTA_EPOCH_KV_KEY, QUOTA_STATE_KV_KEY } from "../../src/storage/keys";
 
@@ -119,6 +119,71 @@ describe("quota state", () => {
   test("前月 snapshot は state 層では正常値として返す", async () => {
     const expected = { ...snapshot(), month: "2026-05" };
     const { env } = makeEnv(JSON.stringify(expected));
+
+    await expect(getQuotaSnapshot(env)).resolves.toEqual(expected);
+  });
+
+  test("setQuotaSnapshot は state を epoch より先に書く", async () => {
+    const writeOrder: string[] = [];
+    const kvStore = new Map<string, string>();
+    kvStore.set(QUOTA_EPOCH_KV_KEY, "0");
+    const env: Env = {
+      NAR_BUCKET: {} as R2Bucket,
+      META_KV: {
+        get: vi.fn(async (key: string) => kvStore.get(key) ?? null),
+        put: vi.fn(async (key: string, val: string) => {
+          writeOrder.push(key);
+          kvStore.set(key, val);
+        }),
+      } as unknown as KVNamespace,
+      CONTROL_DB: {} as D1Database,
+    };
+
+    await setQuotaSnapshot(env, snapshot());
+
+    expect(writeOrder).toEqual([QUOTA_STATE_KV_KEY, QUOTA_EPOCH_KV_KEY]);
+  });
+
+  test("clearQuotaSnapshot が epoch をインクリメントする", async () => {
+    const { env, put } = makeEnv(null, 3);
+
+    await clearQuotaSnapshot(env);
+
+    expect(put).toHaveBeenCalledWith(QUOTA_EPOCH_KV_KEY, "4");
+    expect(put).toHaveBeenCalledWith(QUOTA_STATE_KV_KEY, expect.any(String));
+  });
+
+  test("KV に epoch が存在しない場合は 0 として扱い正常動作する", async () => {
+    const expected = snapshot();
+    const kvStore = new Map<string, string>();
+    kvStore.set(QUOTA_STATE_KV_KEY, JSON.stringify(expected));
+
+    const env: Env = {
+      NAR_BUCKET: {} as R2Bucket,
+      META_KV: {
+        get: vi.fn(async (key: string) => kvStore.get(key) ?? null),
+        put: vi.fn(async (key: string, val: string) => { kvStore.set(key, val); }),
+      } as unknown as KVNamespace,
+      CONTROL_DB: {} as D1Database,
+    };
+
+    await expect(getQuotaSnapshot(env)).resolves.toEqual(expected);
+  });
+
+  test("epoch が不正値の場合は 0 にフォールバックする", async () => {
+    const expected = snapshot();
+    const kvStore = new Map<string, string>();
+    kvStore.set(QUOTA_STATE_KV_KEY, JSON.stringify(expected));
+    kvStore.set(QUOTA_EPOCH_KV_KEY, "not-a-number");
+
+    const env: Env = {
+      NAR_BUCKET: {} as R2Bucket,
+      META_KV: {
+        get: vi.fn(async (key: string) => kvStore.get(key) ?? null),
+        put: vi.fn(async (key: string, val: string) => { kvStore.set(key, val); }),
+      } as unknown as KVNamespace,
+      CONTROL_DB: {} as D1Database,
+    };
 
     await expect(getQuotaSnapshot(env)).resolves.toEqual(expected);
   });

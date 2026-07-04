@@ -44,10 +44,10 @@ export async function getQuotaSnapshot(env: Env): Promise<QuotaSnapshot | null> 
 
 export async function setQuotaSnapshot(env: Env, snapshot: QuotaSnapshot): Promise<void> {
   const nextEpoch = (await readEpoch(env)) + 1;
-  await Promise.all([
-    env.META_KV.put(QUOTA_STATE_KV_KEY, JSON.stringify(snapshot)),
-    env.META_KV.put(QUOTA_EPOCH_KV_KEY, String(nextEpoch)),
-  ]);
+  // state → epoch の順で直列書き込み。逆順だと reader が新 epoch + 旧 state を
+  // L0 にキャッシュし、次の epoch 更新まで回復しない stale を生む。
+  await env.META_KV.put(QUOTA_STATE_KV_KEY, JSON.stringify(snapshot));
+  await env.META_KV.put(QUOTA_EPOCH_KV_KEY, String(nextEpoch));
   l0 = { snapshot, epoch: nextEpoch };
 }
 
