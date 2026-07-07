@@ -12,7 +12,7 @@ import {
   PublishStartResponseSchema,
 } from "../../schemas/publish";
 import { getDb } from "../../db/client";
-import { finalizeBuild, ingestStorePaths, listClosureStoreHashes, startBuild } from "../../db/queries";
+import { finalizeBuild, ingestStorePaths, listClosurePurgeTargets, startBuild } from "../../db/queries";
 import { purgeTags, purgerFrom } from "../../cache/purge";
 import { errorMessage, errorStatus } from "../helpers";
 
@@ -164,16 +164,18 @@ publishApp.openapi(publishFinalizeRoute, async (c) => {
   try {
     const { publishedAt } = await finalizeBuild(db, buildId, body.manifest);
 
-    // publish 直前に引かれた narinfo は edge に 404 negative cache として残っている
-    // 可能性がある。closure の narinfo タグを best-effort で purge し、公開を即時反映する
+    // publish 直前に引かれた narinfo / NAR は edge に 404 negative cache として残っている
+    // 可能性がある。closure の narinfo / nar タグを best-effort で purge し、公開を即時反映する
     // （purge しなくても negative cache の TTL 60 秒で自然解消する）。
     try {
       const purger = purgerFrom(c.executionCtx);
       if (purger !== null) {
-        const storeHashes = await listClosureStoreHashes(db, buildId);
-        c.executionCtx.waitUntil(
-          purgeTags(purger, storeHashes.map((h) => `narinfo:${h}`)),
-        );
+        const targets = await listClosurePurgeTargets(db, buildId);
+        const tags = targets.flatMap((t) => [
+          `narinfo:${t.storeHash}`,
+          `nar:${t.narKey.replace(/^nar\//, "")}`,
+        ]);
+        c.executionCtx.waitUntil(purgeTags(purger, tags));
       }
     } catch {
       // executionCtx 不在（テスト等）は purge 非対応として扱う

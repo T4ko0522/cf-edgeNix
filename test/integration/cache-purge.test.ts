@@ -272,6 +272,24 @@ describe("publish finalize の edge purge", () => {
     expect(purgedTags.flat()).toContain(`narinfo:${HASH}`);
   });
 
+  test("finalize は NAR の negative cache（nar:<fileName>）も purge する（Codex 指摘）", async () => {
+    const eenv = authedEnv();
+    const { ctx, purgedTags, flush } = makePurgeCtx();
+
+    await apiApp.fetch(makeWriteReq("/api/publish/start", startBody), eenv, ctx);
+    await apiApp.fetch(makeWriteReq(`/api/publish/${BUILD_ID}/ingest`, ingestBody), eenv, ctx);
+    const res = await apiApp.fetch(
+      makeWriteReq(`/api/publish/${BUILD_ID}/finalize`, finalizeBody),
+      eenv,
+      ctx,
+    );
+    await flush();
+
+    expect(res.status).toBe(200);
+    // ingestBody の narKey は nar/<HASH>.nar.zst → タグは nar:<HASH>.nar.zst
+    expect(purgedTags.flat()).toContain(`nar:${HASH}.nar.zst`);
+  });
+
   test("purge 非対応ランタイムでも finalize は成功する", async () => {
     const eenv = authedEnv();
     const ctx = makePlainCtx();

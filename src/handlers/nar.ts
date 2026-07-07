@@ -41,6 +41,7 @@ export async function handleNar(
     // なので size は不変 = isolate メモリのキャッシュで R2 HeadObject を省略できる
     // （Range 応答は Workers Cache に保存されないため、ここが唯一の節約手段）。
     let size = cachedSize(fileName);
+    let sizeFromCache = size !== undefined;
     if (size === undefined) {
       const head = await r2.headObject(env, key);
       if (!head) return notFound(fileName);
@@ -48,7 +49,19 @@ export async function handleNar(
       rememberSize(fileName, size);
     }
 
-    const parsed = parseSingleRange(rangeHeader, size);
+    let parsed = parseSingleRange(rangeHeader, size);
+
+    // キャッシュ size による unsatisfiable は R2 で再検証する。object が GC 済みなら
+    // 416 ではなく 404 を返すべきで、size キャッシュだけでは区別できないため
+    // （satisfiable 側は直後の getObject が存在確認を兼ねるので再検証不要）。
+    if (parsed.kind === "unsatisfiable" && sizeFromCache) {
+      const head = await r2.headObject(env, key);
+      if (!head) return notFound(fileName);
+      size = head.size;
+      rememberSize(fileName, size);
+      sizeFromCache = false;
+      parsed = parseSingleRange(rangeHeader, size);
+    }
 
     if (parsed.kind === "unsatisfiable") {
       return new Response(null, {
