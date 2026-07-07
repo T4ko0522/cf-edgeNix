@@ -17,6 +17,8 @@ export default defineConfig({
             "test/quota/guard.test.ts",
             "test/quota/state.test.ts",
             "test/quota/analytics.test.ts",
+            // Workers Cache タグ purge ヘルパの unit テスト
+            "test/cache/purge.test.ts",
             // test/db/queries.test.ts は統合テストへ移行（偽陽性解消）
             "test/schemas/params.test.ts",
             "test/schemas/publish.test.ts",

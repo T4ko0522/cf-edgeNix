@@ -93,14 +93,15 @@ describe("read path handlers: D1 関連シンボルが含まれない", () => {
 // ─── read path handlers: 依存する storage 層のみを import することを確認 ──────
 
 describe("read path handlers: 許可された依存のみ使用", () => {
-  test("handlers/nar.ts は storage/r2、storage/keys、types のみに依存する", () => {
+  test("handlers/nar.ts は storage/r2、storage/keys、cache/memory、types のみに依存する", () => {
     const src = readSource("handlers/nar.ts");
 
-    // 許可された import
+    // 許可された import（cache/memory は NAR size の L0 キャッシュ用）
     const allowedPatterns = [
       /from\s+["'].*\/types["']/,
       /from\s+["'].*\/storage\/r2["']/,
       /from\s+["'].*\/storage\/keys["']/,
+      /from\s+["'].*\/cache\/memory["']/,
     ];
 
     // 全 import 文を抽出
@@ -119,7 +120,7 @@ describe("read path handlers: 許可された依存のみ使用", () => {
           const isRelative = importPath.startsWith(".");
           if (isRelative) {
             // 相対 import はすべて許可リストと照合
-            expect(importPath).toMatch(/\/(types|storage\/(r2|keys))/);
+            expect(importPath).toMatch(/\/(types|storage\/(r2|keys)|cache\/memory)/);
           }
         }
       }

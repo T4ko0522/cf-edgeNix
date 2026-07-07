@@ -1,4 +1,5 @@
 import type { Env } from "../types";
+import * as memory from "../cache/memory";
 import * as r2 from "../storage/r2";
 import { narR2Key } from "../storage/keys";
 
@@ -27,6 +28,7 @@ export async function handleNar(
   if (req.method === "HEAD") {
     const head = await r2.headObject(env, key);
     if (!head) return notFound(fileName);
+    rememberSize(fileName, head.size);
     const headers = baseHeaders(head, fileName);
     headers.set("content-length", String(head.size));
     return new Response(null, { status: 200, headers });
@@ -35,17 +37,24 @@ export async function handleNar(
   const rangeHeader = req.headers.get("range");
 
   if (rangeHeader) {
-    // size を先取得して satisfiable 判定。
-    const head = await r2.headObject(env, key);
-    if (!head) return notFound(fileName);
+    // satisfiable 判定に必要な size を取得する。NAR は content-addressed + immutable
+    // なので size は不変 = isolate メモリのキャッシュで R2 HeadObject を省略できる
+    // （Range 応答は Workers Cache に保存されないため、ここが唯一の節約手段）。
+    let size = cachedSize(fileName);
+    if (size === undefined) {
+      const head = await r2.headObject(env, key);
+      if (!head) return notFound(fileName);
+      size = head.size;
+      rememberSize(fileName, size);
+    }
 
-    const parsed = parseSingleRange(rangeHeader, head.size);
+    const parsed = parseSingleRange(rangeHeader, size);
 
     if (parsed.kind === "unsatisfiable") {
       return new Response(null, {
         status: 416,
         headers: {
-          "content-range": `bytes */${head.size}`,
+          "content-range": `bytes */${size}`,
           "cache-control": "no-store",
         },
       });
@@ -53,16 +62,17 @@ export async function handleNar(
 
     if (parsed.kind === "range") {
       // suffix が size を超える場合はクランプ（RFC 7233: suffix>size は全体を返す）。
-      const normalizedRange = normalizeSuffix(parsed.range, head.size);
+      const normalizedRange = normalizeSuffix(parsed.range, size);
       const obj = await r2.getObject(env, key, { range: normalizedRange });
+      // GC 済み等で object が消えていれば 404（size キャッシュより R2 が優先・安全側）。
       if (!obj) return notFound(fileName);
 
       const headers = baseHeaders(obj, fileName);
       // 206 は Workers Cache に保存されない（仕様）。意図を明文化して no-store にする。
       headers.set("cache-control", "no-store");
       // Content-Range は正規化済みの range から計算する（R2 obj.range に依存しない）。
-      const { offset, length } = resolveRangeOffsetLength(normalizedRange, head.size);
-      headers.set("content-range", `bytes ${offset}-${offset + length - 1}/${head.size}`);
+      const { offset, length } = resolveRangeOffsetLength(normalizedRange, size);
+      headers.set("content-range", `bytes ${offset}-${offset + length - 1}/${size}`);
       headers.set("content-length", String(length));
       return new Response(obj.body, { status: 206, headers });
     }
@@ -72,6 +82,7 @@ export async function handleNar(
     // options 指定なし（range オプションを渡さない）で取得する。
     const obj = await r2.getObject(env, key, {});
     if (!obj) return notFound(fileName);
+    rememberSize(fileName, obj.size);
 
     const headers = baseHeaders(obj, fileName);
     headers.set("content-length", String(obj.size));
@@ -80,10 +91,24 @@ export async function handleNar(
 
   const obj = await r2.getObject(env, key, {});
   if (!obj) return notFound(fileName);
+  rememberSize(fileName, obj.size);
 
   const headers = baseHeaders(obj, fileName);
   headers.set("content-length", String(obj.size));
   return new Response(obj.body, { status: 200, headers });
+}
+
+// ─── NAR size の L0 キャッシュ（Range の HeadObject 省略） ────────────────────
+
+function cachedSize(fileName: string): number | undefined {
+  const hit = memory.get(`narsize:${fileName}`);
+  if (hit === undefined) return undefined;
+  const size = Number(hit);
+  return Number.isSafeInteger(size) && size >= 0 ? size : undefined;
+}
+
+function rememberSize(fileName: string, size: number): void {
+  memory.set(`narsize:${fileName}`, String(size));
 }
 
 /**

@@ -31,6 +31,15 @@ export async function listBuilds(db: Db, host: string, limit?: number): Promise<
     .limit(limit ?? 50);
 }
 
+/** build の closure に含まれる store_hash 一覧を返す（finalize 後の edge purge 用）。 */
+export async function listClosureStoreHashes(db: Db, buildId: string): Promise<string[]> {
+  const rows = await db
+    .select({ storeHash: buildClosure.storeHash })
+    .from(buildClosure)
+    .where(eq(buildClosure.buildId, buildId));
+  return rows.map((r) => r.storeHash);
+}
+
 /** build_id から build_manifest を返す。存在しなければ null。 */
 export async function getManifest(db: Db, buildId: string): Promise<BuildManifest | null> {
   const rows = await db
