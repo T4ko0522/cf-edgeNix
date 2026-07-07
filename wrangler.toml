@@ -4,6 +4,18 @@ compatibility_date = "2026-07-01"
 compatibility_flags = ["nodejs_compat"]
 
 # ─────────────────────────────────────────────────────────────
+# Workers Cache（Worker の手前に置かれるレスポンスキャッシュ）
+#   - GET/HEAD の応答を Cache-Control に従って edge にキャッシュ
+#     （tiered cache + request collapsing 内蔵）
+#   - ヒット時は Worker 自体が起動しない（KV / R2 に一切到達しない）
+#   - /api/* は no-store を返すため対象外（src/api/app.ts）
+#   - killed 時の quota 503 も no-store（src/quota/guard.ts）
+#   - 無効化は Cache-Tag ベースの purge（GC / publish finalize）
+# ─────────────────────────────────────────────────────────────
+[cache]
+enabled = true
+
+# ─────────────────────────────────────────────────────────────
 # Static landing site (SvelteKit + adapter-static, web/build)
 #   - /, /favicon.svg, /_app/* 等のアセット一致時はそのまま配信
 #   - /nix-cache-info, /<hash>.narinfo, /nar/*, /api/* はアセット未マッチで
