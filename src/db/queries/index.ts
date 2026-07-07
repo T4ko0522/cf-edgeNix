@@ -13,6 +13,7 @@ export {
   getManifest,
   ingestStorePaths,
   listBuilds,
+  listClosurePurgeTargets,
   registerRollbackRoot,
   startBuild,
 } from "./builds";

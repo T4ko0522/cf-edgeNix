@@ -421,7 +421,7 @@ R2 GC対象判定
 
 これにより、binary cacheを単なる高速化基盤ではなく、復旧可能な環境配布基盤として扱える。
 
-なお、GC の **削除順序**（narinfo を先に unpublish → edge purge → grace period → NAR 削除）と rollback 復元用 manifest の設計は本 spec では未確定とし、`fixme.md` に課題として切り出す。
+GC の **削除順序** は `POST /api/gc/execute` の `phase` で実装済み: `phase=narinfo`（KV/R2 narinfo 削除 + edge の `narinfo:<storeHash>` タグ purge）→ grace period（運用で確保）→ `phase=nar`（NAR/D1 削除 + `nar:<fileName>` タグ purge）。edge purge は Workers Cache の Cache-Tag purge を使い best-effort とする（非対応プランでは negative/positive エントリが TTL で自然失効するのを待つ）。
 
 ---
 

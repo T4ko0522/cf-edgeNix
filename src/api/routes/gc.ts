@@ -12,6 +12,7 @@ import { computeLiveSet, deleteDeadStorePaths, listDeadStorePaths } from "../../
 import { narinfoKVKey } from "../../storage/keys";
 import { deleteText as deleteKvText } from "../../storage/kv";
 import { deleteObjects } from "../../storage/r2";
+import { purgeTags, purgerFrom } from "../../cache/purge";
 
 const gcApp = new OpenAPIHono<{ Bindings: Env }>();
 
@@ -103,6 +104,7 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
     d1_nar_files: 0,
     d1_build_closure: 0,
   };
+  let edgePurgeAttempted = 0;
 
   if (body.dry_run) {
     return c.json({
@@ -113,7 +115,17 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
       processed,
       dead_remaining: deadRemaining,
       deleted,
+      edge_purge_attempted: 0,
     }, 200);
+  }
+
+  // Workers Cache のタグ purge（best-effort）。executionCtx が無いランタイム
+  // （vitest で ctx 未指定の場合など）でも throw させない。
+  let purger: ReturnType<typeof purgerFrom> = null;
+  try {
+    purger = purgerFrom(c.executionCtx);
+  } catch {
+    // executionCtx 不在は purge 非対応として扱う
   }
 
   const storeHashes = dead.map((d) => d.storeHash);
@@ -132,6 +144,11 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
     await deleteObjects(c.env, uniqueNarinfoKeys);
     deleted.kv_narinfo_attempted = uniqueStoreHashes.length;
     deleted.r2_narinfo_attempted = uniqueNarinfoKeys.length;
+    // edge の narinfo（positive / negative 両エントリ）を無効化する。
+    edgePurgeAttempted += await purgeTags(
+      purger,
+      uniqueStoreHashes.map((h) => `narinfo:${h}`),
+    );
   }
 
   if (body.phase === "nar" || body.phase === "all") {
@@ -143,6 +160,11 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
     deleted.d1_store_paths = d1Deleted.storePathsDeleted;
     deleted.d1_nar_files = d1Deleted.narFilesDeleted;
     deleted.d1_build_closure = d1Deleted.buildClosureDeleted;
+    // edge の NAR エントリ（immutable long TTL）を無効化する。タグは nar:<fileName>。
+    edgePurgeAttempted += await purgeTags(
+      purger,
+      uniqueNarKeys.map((k) => `nar:${k.replace(/^nar\//, "")}`),
+    );
   }
 
   return c.json({
@@ -153,6 +175,7 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
     processed,
     dead_remaining: deadRemaining,
     deleted,
+    edge_purge_attempted: edgePurgeAttempted,
   }, 200);
 });
 

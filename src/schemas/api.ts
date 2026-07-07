@@ -76,6 +76,8 @@ export const GcExecuteResponseSchema = z.object({
   processed: z.number().int().nonnegative(),
   dead_remaining: z.number().int().nonnegative(),
   deleted: GcExecuteDeletedSchema,
+  // Workers Cache のタグ purge が成功したタグ数（best-effort・非対応ランタイムでは 0）。
+  edge_purge_attempted: z.number().int().nonnegative(),
 });
 
 export type GcExecuteRequest = z.infer<typeof GcExecuteRequestSchema>;

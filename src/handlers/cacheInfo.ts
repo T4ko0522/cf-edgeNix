@@ -9,7 +9,8 @@ import { CACHE_INFO_KV_KEY, CACHE_INFO_R2_KEY } from "../storage/keys";
  * read path: Workers Cache(edge) → KV → R2（D1 は挟まない・spec §6.1 / §10）。
  * R2 にも無ければ、binding の Priority から既定値を生成して返す。
  * edge 層は Workers Cache が担い、L0 メモリキャッシュは廃止（narinfo と同じ理由）。
- * 内容が可変（Priority 変更など）のため、再 publish 時は `cache-info` タグで purge できる。
+ * 内容の変更（Priority 変更など）は稀なため、自動 purge 経路は持たず最大 3600 秒の
+ * stale を受容する。即時反映したい場合は運用で `cache-info` タグを手動 purge する。
  */
 export async function handleCacheInfo(env: Env): Promise<Response> {
   const body = await resolveCacheInfo(env);

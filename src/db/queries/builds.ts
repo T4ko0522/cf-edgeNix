@@ -31,6 +31,22 @@ export async function listBuilds(db: Db, host: string, limit?: number): Promise<
     .limit(limit ?? 50);
 }
 
+/**
+ * build の closure に含まれる store_hash / nar_key の組を返す（finalize 後の edge purge 用）。
+ * narinfo の negative cache（narinfo:<storeHash>）と NAR の negative cache（nar:<fileName>）の
+ * 両方を purge 対象にするため、store_paths と join して narKey も引く。
+ */
+export async function listClosurePurgeTargets(
+  db: Db,
+  buildId: string,
+): Promise<Array<{ storeHash: string; narKey: string }>> {
+  return db
+    .select({ storeHash: buildClosure.storeHash, narKey: storePaths.narKey })
+    .from(buildClosure)
+    .innerJoin(storePaths, eq(storePaths.storeHash, buildClosure.storeHash))
+    .where(eq(buildClosure.buildId, buildId));
+}
+
 /** build_id から build_manifest を返す。存在しなければ null。 */
 export async function getManifest(db: Db, buildId: string): Promise<BuildManifest | null> {
   const rows = await db
