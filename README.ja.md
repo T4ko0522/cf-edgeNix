@@ -10,10 +10,10 @@
 Cloudflare、Cloudflare Workers、およびR2は、Cloudflare, Inc.の商標です。  
 
 cf-edgeNix は Cloudflare Workers を署名付き [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html) に変える。  
-R2 が NAR / narinfo の正本、KV と Workers Cache API が速度層、D1 が build 履歴・`latest`・rollback root・GC live-set を持つ control plane。read path は narinfo が `memory → KV → R2`、NAR は `Cache API → R2`、いずれも D1 を経由しない。
+R2 が NAR / narinfo の正本、Workers Cache と KV が速度層、D1 が build 履歴・`latest`・rollback root・GC live-set を持つ control plane。read path は narinfo が `Workers Cache → KV → R2`、NAR は `Workers Cache → R2`、いずれも D1 を経由しない。
 
 **Self-hosted、かつ Cloudflare 内で完結。** 自分の Cloudflare アカウントに自分の Worker を deploy する形なので、cache も署名鍵も完全に自分の手元にあり、サードパーティを経由しない。  
-さらに実体は Cloudflare のエッジ（Workers + R2 + KV + D1 + Cache API + Workers Builds）に閉じており、**VPS も origin server もコンテナも、GitHub Actions の deploy pipeline も不要**。  
+さらに実体は Cloudflare のエッジ（Workers + R2 + KV + D1 + Workers Cache + Workers Builds）に閉じており、**VPS も origin server もコンテナも、GitHub Actions の deploy pipeline も不要**。  
 Cloudflare の外で動くのは、自分の NixOS flake repo に置いた GitHub Actions job が cf-edgeNix を checkout してその `scripts/publish.sh` を回し、署名済み NAR を build & upload する部分だけ。  
 > flake repo 側に publish ロジックは持たず、[`.github/templates/publish-cache.yml`](.github/templates/publish-cache.yml) の workflow テンプレートをそのまま配置するだけで済む。
 
@@ -25,24 +25,24 @@ Cloudflare の外で動くのは、自分の NixOS flake repo に置いた GitHu
 
 ```mermaid
 flowchart LR
-    Client[Nix client] --> W[Worker]
-    W --> MEM[(memory<br/>L0 isolate)]
-    MEM -. miss .-> KV[(KV: META_KV)]
+    Client[Nix client] --> WC[(Workers Cache<br/>edge)]
+    WC -. miss .-> W[Worker]
+    W --> KV[(KV: META_KV)]
     KV -. miss .-> R2[(R2: NAR_BUCKET)]
 ```
 
-3 段ルックアップ。KV は結果整合、R2 が正本。R2 が `404` を返したらそのままクライアントに伝搬する。
+3 段ルックアップ。Workers Cache ヒット時は Worker 自体が起動しない（request collapsing 内蔵）。KV は結果整合、R2 が正本。R2 にも無ければ `404` を返し、これも 60 秒だけ edge にキャッシュする（negative cache — `nixos-rebuild` は存在しない path を大量に引くため）。
 
 ### Read path — NAR 本体
 
 ```mermaid
 flowchart LR
-    Client[Nix client] -->|GET/HEAD, Range| W[Worker]
-    W --> CACHE[(Cache API<br/>edge cache)]
-    CACHE -. miss .-> R2[(R2: NAR_BUCKET)]
+    Client[Nix client] -->|GET/HEAD, Range| WC[(Workers Cache<br/>edge)]
+    WC -. miss .-> W[Worker]
+    W --> R2[(R2: NAR_BUCKET)]
 ```
 
-`Range: bytes=...` をエッジまで通す。miss 時は R2 から buffer せず streaming で返す。
+`Range: bytes=...` をエッジまで通す（206 は edge に保存されず常に R2 から streaming）。full 200 は content-addressed かつ immutable として edge にキャッシュされる。miss 時は R2 から buffer せず streaming で返す。
 
 ### Publish path
 
@@ -87,7 +87,7 @@ Workers Builds が push のたびに `wrangler d1 migrations apply --remote && w
 
 ### Edge & cost
 
-- L0 isolate `memory` → L1 KV → L2 Cache API（NAR）→ R2（正本）の階層構造
+- Workers Cache（edge・Worker 手前）→ KV（narinfo）→ R2（正本）の階層構造。404 も短 TTL の negative cache
 - 5 分おきの Cron が Cloudflare GraphQL Analytics から R2 storage / Class A / Class B を読む
 - 月次無料枠 80% で `warn`、95% で `killed`。`killed` 中は read path が `503` を返して課金事故を防ぐ
 - `POST /api/quota/reset` で手動解除

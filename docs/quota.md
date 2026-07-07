@@ -2,6 +2,13 @@
 
 cf-edgeNix は R2 の月次無料枠を超えそうな場合に read path を自動停止する。停止対象は `/nix-cache-info`、`/<store-hash>.narinfo`、`/nar/<file-hash>.nar.zst` で、`/api/*` は状態確認と手動解除のため停止しない。
 
+## Workers Cache との関係
+
+read path の手前には Workers Cache（`wrangler.toml` の `[cache]`）があり、edge ヒット時は Worker 自体が起動しないため quota guard を通らない。これは意図した挙動である。
+
+- edge ヒットは R2 / KV に一切到達しないため、kill-switch の目的（R2 無料枠超過の防止）と矛盾しない。`killed` 中もキャッシュ済みコンテンツが配信され続けることがあるが、R2 消費はゼロ。
+- `killed` 時の 503 は `Cache-Control: no-store` を付けて返すため、エラー応答が edge にキャッシュされて解除後も 503 が返り続けることはない。
+
 ## 監視対象としきい値
 
 Cron Trigger（`*/5 * * * *`）が Cloudflare GraphQL Analytics API を読み、月初 UTC から現在までの使用量を `META_KV` の `quota:state` に保存する。
