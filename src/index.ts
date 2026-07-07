@@ -41,7 +41,7 @@ export default {
 
       case "nar":
         if (req.method !== "GET" && req.method !== "HEAD") return methodNotAllowed();
-        return handleNar(req, env, ctx, r.fileName);
+        return handleNar(req, env, r.fileName);
 
       case "not-found":
         return new Response("not found\n", { status: 404 });

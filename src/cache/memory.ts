@@ -1,13 +1,17 @@
 /**
- * L0: Worker isolate ローカルのメモリキャッシュ。
+ * isolate ローカルの汎用 LRU メモリキャッシュ。
  *
- * 直近アクセスされた narinfo / nix-cache-info を一時保持する速度層（spec §6.1）。
- * isolate ごとに独立し、再起動で消える揮発キャッシュ。正本ではない。
- * NAR 本体は巨大（isolate は 128MB 制限）なのでここには載せない。
+ * かつては narinfo / nix-cache-info の L0 層だったが、Workers Cache（edge）導入で
+ * メタデータの L0 は廃止した（edge ヒット時は Worker が起動せず参照されないため）。
+ * 現在の用途は NAR size のキャッシュ（Range リクエストの HEAD 省略）のみ。
+ * Range 応答（206）は Workers Cache に保存されないため、isolate メモリが唯一の節約手段。
+ *
+ * isolate ごとに独立し、再起動で消える揮発キャッシュ。content-addressed で不変な
+ * 値だけを載せること（TTL を持たないため、可変な値は stale になる）。
  */
 const MAX_ENTRIES = 512;
 
-/** 挿入順 Map を使った素朴な LRU。値は narinfo / cache-info のテキスト。 */
+/** 挿入順 Map を使った素朴な LRU。 */
 const store = new Map<string, string>();
 
 export function get(key: string): string | undefined {
@@ -27,9 +31,4 @@ export function set(key: string, value: string): void {
     if (oldest === undefined) break;
     store.delete(oldest);
   }
-}
-
-/** メモリキャッシュからキーを破棄する。GC unpublish 時に narinfo を即時 stale 化するために使う。他 isolate は不可侵なので best-effort。 */
-export function del(key: string): void {
-  store.delete(key);
 }

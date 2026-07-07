@@ -9,6 +9,14 @@ import { quotaApp } from "./routes/quota";
 
 export const apiApp = new OpenAPIHono<{ Bindings: Env }>();
 
+// Workers Cache（wrangler.toml [cache]）は Cache-Control のない 200 を
+// ヒューリスティックで最大 2 時間キャッシュする。/api/* は latest pointer など
+// 鮮度が意味を持つ control plane なので、全応答を no-store で edge キャッシュ対象外にする。
+apiApp.use("*", async (c, next) => {
+  await next();
+  c.res.headers.set("cache-control", "no-store");
+});
+
 apiApp.route("/", publishApp);
 apiApp.route("/", gcApp);
 apiApp.route("/", buildsApp);
@@ -30,6 +38,8 @@ apiApp.openAPIRegistry.registerComponent("securitySchemes", "bearerAuth", {
 });
 
 apiApp.onError((err, c) => {
+  // onError は middleware の post 処理（no-store 付与）を通らないため、ここでも明示する。
+  c.header("cache-control", "no-store");
   if (err instanceof HTTPException) {
     return c.json({ error: err.message }, err.status);
   }

@@ -33,14 +33,6 @@ async function putNar(content: Uint8Array = NAR_CONTENT, key?: string) {
   await (env as unknown as Env).NAR_BUCKET.put(narKey, content);
 }
 
-/** handleNar 呼び出し用の ExecutionContext スタブ */
-function makeCtx(): ExecutionContext {
-  return {
-    waitUntil: (_p: Promise<unknown>) => {},
-    passThroughOnException: () => {},
-  } as unknown as ExecutionContext;
-}
-
 beforeEach(async () => {
   // R2 の isolatedStorage により各テストで独立しているが、
   // 念のため既存のテスト用オブジェクトを削除
@@ -57,28 +49,28 @@ describe("full body GET 200（C1/C5/C6）", () => {
   test("存在する NAR を GET すると 200 を返す", async () => {
     await putNar();
     const req = new Request(`https://example.com/nar/${FILE_NAME}`);
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.status).toBe(200);
   });
 
   test("Content-Type が application/x-nix-nar", async () => {
     await putNar();
     const req = new Request(`https://example.com/nar/${FILE_NAME}`);
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.headers.get("content-type")).toBe("application/x-nix-nar");
   });
 
   test("Content-Length が nar ファイルのバイト数", async () => {
     await putNar();
     const req = new Request(`https://example.com/nar/${FILE_NAME}`);
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.headers.get("content-length")).toBe(String(NAR_CONTENT.length));
   });
 
   test("Content-Encoding を付けない（C6: .nar.zst は bytes そのまま）", async () => {
     await putNar();
     const req = new Request(`https://example.com/nar/${FILE_NAME}`);
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     // Content-Encoding ヘッダが存在しないことを確認
     expect(res.headers.get("content-encoding")).toBeNull();
   });
@@ -86,20 +78,20 @@ describe("full body GET 200（C1/C5/C6）", () => {
   test("Accept-Ranges: bytes が設定されている", async () => {
     await putNar();
     const req = new Request(`https://example.com/nar/${FILE_NAME}`);
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.headers.get("accept-ranges")).toBe("bytes");
   });
 
   test("存在しない NAR を GET すると 404", async () => {
     const req = new Request("https://example.com/nar/nonexistent.nar.zst");
-    const res = await handleNar(req, getEnv(), makeCtx(), "nonexistent.nar.zst");
+    const res = await handleNar(req, getEnv(),"nonexistent.nar.zst");
     expect(res.status).toBe(404);
   });
 
   test("200 レスポンスの body を読み切れる（C1: streaming 確認）", async () => {
     await putNar();
     const req = new Request(`https://example.com/nar/${FILE_NAME}`);
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     const buf = await res.arrayBuffer();
     expect(new Uint8Array(buf)).toEqual(NAR_CONTENT);
   });
@@ -113,7 +105,7 @@ describe("Range GET 206（C2/C3/G7）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       headers: { range: "bytes=0-4" },
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.status).toBe(206);
     expect(res.headers.get("content-range")).toBe("bytes 0-4/10");
     expect(res.headers.get("content-length")).toBe("5");
@@ -124,7 +116,7 @@ describe("Range GET 206（C2/C3/G7）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       headers: { range: "bytes=5-9" },
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.status).toBe(206);
     expect(res.headers.get("content-range")).toBe("bytes 5-9/10");
     expect(res.headers.get("content-length")).toBe("5");
@@ -135,7 +127,7 @@ describe("Range GET 206（C2/C3/G7）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       headers: { range: "bytes=0-" },
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.status).toBe(206);
   });
 
@@ -144,7 +136,7 @@ describe("Range GET 206（C2/C3/G7）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       headers: { range: "bytes=-5" },
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.status).toBe(206);
     expect(res.headers.get("content-range")).toBe("bytes 5-9/10");
     expect(res.headers.get("content-length")).toBe("5");
@@ -155,7 +147,7 @@ describe("Range GET 206（C2/C3/G7）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       headers: { range: "bytes=0-4" },
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.headers.get("content-encoding")).toBeNull();
   });
 });
@@ -168,7 +160,7 @@ describe("416 範囲外（C3）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       headers: { range: "bytes=10-19" },
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.status).toBe(416);
     expect(res.headers.get("content-range")).toBe("bytes */10");
   });
@@ -178,7 +170,7 @@ describe("416 範囲外（C3）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       headers: { range: "bytes=0-99" },
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.status).toBe(416);
   });
 });
@@ -191,7 +183,7 @@ describe("HEAD /nar/:file（C4）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       method: "HEAD",
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.status).toBe(200);
     // HEAD は body を持たない
     const text = await res.text();
@@ -203,7 +195,7 @@ describe("HEAD /nar/:file（C4）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       method: "HEAD",
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.headers.get("content-length")).toBe(String(NAR_CONTENT.length));
   });
 
@@ -212,7 +204,7 @@ describe("HEAD /nar/:file（C4）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       method: "HEAD",
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.headers.get("etag")).not.toBeNull();
   });
 
@@ -221,7 +213,7 @@ describe("HEAD /nar/:file（C4）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       method: "HEAD",
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.headers.get("accept-ranges")).toBe("bytes");
   });
 
@@ -229,48 +221,44 @@ describe("HEAD /nar/:file（C4）", () => {
     const req = new Request("https://example.com/nar/missing.nar.zst", {
       method: "HEAD",
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), "missing.nar.zst");
+    const res = await handleNar(req, getEnv(),"missing.nar.zst");
     expect(res.status).toBe(404);
   });
 });
 
-// ─── 206 はキャッシュに載らない（C5/G7） ────────────────────────────────────
+// ─── Range と full の独立性（C5/G7） ─────────────────────────────────────────
+// edge キャッシュは Workers Cache（Worker 手前）に移行したため、Worker 内の
+// キャッシュ格納は存在しない。Range / full が互いの結果に影響しないことを確認する。
 
-describe("206 はキャッシュに格納されない（C5/G7）", () => {
-  test("Range GET (206) の後に同じ URL に full GET → R2 から読む（cache に吸われない）", async () => {
+describe("Range と full GET が互いに影響しない（C5/G7）", () => {
+  test("Range GET (206) の後に同じ URL に full GET → 完全な body の 200", async () => {
     await putNar();
     const url = `https://example.com/nar/${FILE_NAME}`;
-    const ctx = makeCtx();
 
     // 1 回目: Range GET → 206
     const rangeReq = new Request(url, { headers: { range: "bytes=0-4" } });
-    const rangeRes = await handleNar(rangeReq, getEnv(), ctx, FILE_NAME);
+    const rangeRes = await handleNar(rangeReq, getEnv(), FILE_NAME);
     expect(rangeRes.status).toBe(206);
 
-    // 2 回目: full GET → 200（206 が cache に入っていれば body が壊れる可能性があるが、
-    // 正しい実装では cache.match は Range リクエストを回避するため full 200 が返る）
+    // 2 回目: full GET → 200 で完全な body
     const fullReq = new Request(url);
-    const fullRes = await handleNar(fullReq, getEnv(), ctx, FILE_NAME);
+    const fullRes = await handleNar(fullReq, getEnv(), FILE_NAME);
     expect(fullRes.status).toBe(200);
     const body = await fullRes.arrayBuffer();
     expect(new Uint8Array(body)).toEqual(NAR_CONTENT);
   });
 
-  test("Range GET は cache.match を経由しない（Cache-Control は full 200 のみ）", async () => {
+  test("full GET (200) の後の Range GET → 206 が返る", async () => {
     await putNar();
-
-    // full GET を先に実行して cache を満たす
     const url = `https://example.com/nar/${FILE_NAME}`;
-    const ctx = makeCtx();
 
     const fullReq1 = new Request(url);
-    const fullRes1 = await handleNar(fullReq1, getEnv(), ctx, FILE_NAME);
+    const fullRes1 = await handleNar(fullReq1, getEnv(), FILE_NAME);
     expect(fullRes1.status).toBe(200);
 
-    // その後 Range GET → 206 が返る（full cache ヒットで 200 になることなく 206）
+    // その後 Range GET → 206 が返る（full の結果に吸われない）
     const rangeReq = new Request(url, { headers: { range: "bytes=0-4" } });
-    const rangeRes = await handleNar(rangeReq, getEnv(), ctx, FILE_NAME);
-    // G7: Range GET は cache.match を回避するため 206 になる
+    const rangeRes = await handleNar(rangeReq, getEnv(), FILE_NAME);
     expect(rangeRes.status).toBe(206);
   });
 });
@@ -283,7 +271,7 @@ describe("ignore range → full 200 フォールバック（C3）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       headers: { range: "bytes=-" },
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     // ignore → full body
     expect(res.status).toBe(200);
   });
@@ -293,7 +281,7 @@ describe("ignore range → full 200 フォールバック（C3）", () => {
     const req = new Request(`https://example.com/nar/${FILE_NAME}`, {
       headers: { range: "items=0-9" },
     });
-    const res = await handleNar(req, getEnv(), makeCtx(), FILE_NAME);
+    const res = await handleNar(req, getEnv(),FILE_NAME);
     expect(res.status).toBe(200);
   });
 });

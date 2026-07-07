@@ -10,7 +10,6 @@ import {
 import { getDb } from "../../db/client";
 import { computeLiveSet, deleteDeadStorePaths, listDeadStorePaths } from "../../db/queries";
 import { narinfoKVKey } from "../../storage/keys";
-import * as memory from "../../cache/memory";
 import { deleteText as deleteKvText } from "../../storage/kv";
 import { deleteObjects } from "../../storage/r2";
 
@@ -127,10 +126,7 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
       uniqueStoreHashes,
       50,
       async (storeHash) => {
-        const key = narinfoKVKey(storeHash);
-        // 同 isolate の L0 メモリも破棄して即時 stale 化する。他 isolate は不可侵 (best-effort)。
-        memory.del(key);
-        await deleteKvText(c.env, key);
+        await deleteKvText(c.env, narinfoKVKey(storeHash));
       },
     );
     await deleteObjects(c.env, uniqueNarinfoKeys);

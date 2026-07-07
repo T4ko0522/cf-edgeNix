@@ -6,7 +6,13 @@ import { narR2Key } from "../storage/keys";
  * GET|HEAD /nar/<file-hash>.nar.zst
  *
  * 配信は Worker 経由（spec §6.2 で決定）:
- *   Cache API → R2 binding(ReadableStream) → Nix client
+ *   Workers Cache(edge) → R2 binding(ReadableStream) → Nix client
+ *
+ * edge 層は Workers Cache（wrangler.toml [cache]）が担う。full 200 は
+ * `immutable` ヘッダに従って edge にキャッシュされ、ヒット時は Worker が起動しない。
+ * request collapsing も Workers Cache 側で効くため、手書きの Cache API
+ * (caches.default) は廃止した。206 は Workers Cache の仕様上保存されないため
+ * `no-store` を明示し、Range リクエストは常に R2 から返す。
  *
  * `.nar.zst` は HTTP の Content-Encoding ではなく、Nix binary cache 上の
  * 圧縮済みファイルとして bytes をそのまま返す（HTTP decompression を効かせない）。
@@ -14,42 +20,34 @@ import { narR2Key } from "../storage/keys";
 export async function handleNar(
   req: Request,
   env: Env,
-  ctx: ExecutionContext,
   fileName: string,
 ): Promise<Response> {
   const key = narR2Key(fileName);
-  const cache = caches.default;
 
-  // HEAD 判定を cache.match より前に出す（C4: HEAD + Cache API 順序）。
   if (req.method === "HEAD") {
     const head = await r2.headObject(env, key);
-    if (!head) return new Response("not found\n", { status: 404 });
-    const headers = baseHeaders(head);
+    if (!head) return notFound(fileName);
+    const headers = baseHeaders(head, fileName);
     headers.set("content-length", String(head.size));
     return new Response(null, { status: 200, headers });
   }
 
   const rangeHeader = req.headers.get("range");
 
-  // G7: Range リクエストは cache.match を完全にスキップする。
-  // full 200 が cache に入った後も Range GET は 206 で返す必要がある。
-  if (!rangeHeader) {
-    // Range なし: edge cache ヒット（immutable・content-addressed なので long TTL）。
-    const cached = await cache.match(req);
-    if (cached) return cached;
-  }
-
   if (rangeHeader) {
     // size を先取得して satisfiable 判定。
     const head = await r2.headObject(env, key);
-    if (!head) return new Response("not found\n", { status: 404 });
+    if (!head) return notFound(fileName);
 
     const parsed = parseSingleRange(rangeHeader, head.size);
 
     if (parsed.kind === "unsatisfiable") {
       return new Response(null, {
         status: 416,
-        headers: { "content-range": `bytes */${head.size}` },
+        headers: {
+          "content-range": `bytes */${head.size}`,
+          "cache-control": "no-store",
+        },
       });
     }
 
@@ -57,14 +55,15 @@ export async function handleNar(
       // suffix が size を超える場合はクランプ（RFC 7233: suffix>size は全体を返す）。
       const normalizedRange = normalizeSuffix(parsed.range, head.size);
       const obj = await r2.getObject(env, key, { range: normalizedRange });
-      if (!obj) return new Response("not found\n", { status: 404 });
+      if (!obj) return notFound(fileName);
 
-      const headers = baseHeaders(obj);
+      const headers = baseHeaders(obj, fileName);
+      // 206 は Workers Cache に保存されない（仕様）。意図を明文化して no-store にする。
+      headers.set("cache-control", "no-store");
       // Content-Range は正規化済みの range から計算する（R2 obj.range に依存しない）。
       const { offset, length } = resolveRangeOffsetLength(normalizedRange, head.size);
       headers.set("content-range", `bytes ${offset}-${offset + length - 1}/${head.size}`);
       headers.set("content-length", String(length));
-      // 206 はキャッシュに載せない。
       return new Response(obj.body, { status: 206, headers });
     }
 
@@ -72,35 +71,43 @@ export async function handleNar(
     // miniflare 対策: getObject 呼び出し時に R2 binding が Range ヘッダを透過させないよう
     // options 指定なし（range オプションを渡さない）で取得する。
     const obj = await r2.getObject(env, key, {});
-    if (!obj) return new Response("not found\n", { status: 404 });
+    if (!obj) return notFound(fileName);
 
-    const headers = baseHeaders(obj);
+    const headers = baseHeaders(obj, fileName);
     headers.set("content-length", String(obj.size));
-
-    const res = new Response(obj.body, { status: 200, headers });
-    // ignore の full body は cache に格納（200 なので C5 準拠）。
-    ctx.waitUntil(cache.put(new Request(req.url), res.clone()));
-    return res;
+    return new Response(obj.body, { status: 200, headers });
   }
 
   const obj = await r2.getObject(env, key, {});
-  if (!obj) return new Response("not found\n", { status: 404 });
+  if (!obj) return notFound(fileName);
 
-  const headers = baseHeaders(obj);
+  const headers = baseHeaders(obj, fileName);
   headers.set("content-length", String(obj.size));
-
-  const res = new Response(obj.body, { status: 200, headers });
-
-  // full body のみ immutable cache へ（C5）。Range なしリクエストの URL をキーにする。
-  ctx.waitUntil(cache.put(new Request(req.url), res.clone()));
-  return res;
+  return new Response(obj.body, { status: 200, headers });
 }
 
-function baseHeaders(obj: R2Object): Headers {
+/**
+ * 404 も短 TTL で edge にキャッシュする（negative cache・narinfo と同方針）。
+ * Cache-Tag `nar:<fileName>` を positive 側と共有し、publish / GC の purge で
+ * negative エントリも同時に消せるようにする。
+ */
+function notFound(fileName: string): Response {
+  return new Response("not found\n", {
+    status: 404,
+    headers: {
+      "cache-control": "public, max-age=60",
+      "cache-tag": `nar-miss,nar:${fileName}`,
+    },
+  });
+}
+
+function baseHeaders(obj: R2Object, fileName: string): Headers {
   const headers = new Headers();
   // .nar.zst をそのまま bytes 配信する（compression は内容の一部・C6）。
   headers.set("content-type", "application/x-nix-nar");
+  // content-addressed なので immutable（Workers Cache が edge で保持する）。
   headers.set("cache-control", "public, max-age=31536000, immutable");
+  headers.set("cache-tag", `nar,nar:${fileName}`);
   headers.set("etag", obj.httpEtag);
   headers.set("accept-ranges", "bytes");
   return headers;

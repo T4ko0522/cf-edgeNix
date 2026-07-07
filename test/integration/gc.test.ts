@@ -737,13 +737,13 @@ describe("POST /api/gc/execute", () => {
     expect(await countRows(db1, "nar_files", "nar_key", deadNarKey)).toBe(1);
   });
 
-  test("phase=narinfo: 同一 isolate のメモリキャッシュも破棄する", async () => {
+  test("phase=narinfo: 削除後は read path が即座に 404 を返す（isolate stale なし）", async () => {
     const eenv = authedEnv();
     const db1 = (env as unknown as Env).CONTROL_DB;
     await insertDeadStorePath(db1);
     await putDeadObjects(eenv);
 
-    // L0 にロードさせる
+    // 一度 read path に載せる（L0 は廃止済みなので warm しても isolate に残らない）
     const warm = await handleNarinfo(eenv, deadHash);
     expect(warm.status).toBe(200);
 
@@ -753,7 +753,7 @@ describe("POST /api/gc/execute", () => {
     );
 
     expect(res.status).toBe(200);
-    // KV / R2 / メモリすべて消えているはず → 404
+    // KV / R2 が消えていれば即 404（メタデータ L0 が無いため stale hit しない）
     const stale = await handleNarinfo(eenv, deadHash);
     expect(stale.status).toBe(404);
   });
