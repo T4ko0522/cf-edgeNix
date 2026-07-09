@@ -14,7 +14,7 @@ import {
 import { getDb } from "../../db/client";
 import { finalizeBuild, ingestStorePaths, listClosurePurgeTargets, startBuild } from "../../db/queries";
 import { purgeTags, purgerFrom } from "../../cache/purge";
-import { errorMessage, errorStatus } from "../helpers";
+import { errorBody, errorMessage, errorStatus } from "../helpers";
 
 const publishApp = new OpenAPIHono<{ Bindings: Env }>();
 
@@ -153,7 +153,7 @@ publishApp.openapi(publishIngestRoute, async (c) => {
     return c.json({ ok: true as const, ingested: body.storePaths.length }, 200);
   } catch (err) {
     const status = errorStatus(err);
-    return c.json({ error: errorMessage(err) }, status as 404 | 409);
+    return c.json(errorBody(err), status as 404 | 409);
   }
 });
 

@@ -16,3 +16,17 @@ export function errorMessage(err: unknown): string {
   if (err instanceof BuildNotFoundError) return err.message;
   return "internal server error";
 }
+
+/**
+ * PublishConflictError に conflictingStoreHash が付いている場合のみ、その値を含む
+ * 構造化 body を返す。それ以外は { error } のみ。
+ * ApiErrorSchema の conflictingStoreHash は optional なので他エンドポイントの
+ * レスポンスに影響しない。
+ */
+export function errorBody(err: unknown): { error: string; conflictingStoreHash?: string } {
+  const base = { error: errorMessage(err) };
+  if (err instanceof PublishConflictError && err.conflictingStoreHash) {
+    return { ...base, conflictingStoreHash: err.conflictingStoreHash };
+  }
+  return base;
+}

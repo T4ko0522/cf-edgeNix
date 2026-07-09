@@ -277,3 +277,82 @@ describe("既存 store_path を別 build に ingest: build_closure が作られ�
     expect(spRows).toHaveLength(1);
   });
 });
+
+// ─── 差分 payload → 409 と conflictingStoreHash 構造化 body（運用診断用）────
+
+describe("ingest 差分 payload → 409 レスポンスに conflictingStoreHash が入る", () => {
+  const HASH = makeHash(700);
+  const BUILD_A_ID = "conflict-payload-build-A";
+  const BUILD_B_ID = "conflict-payload-build-B";
+  const HOST = "conflict-payload-host";
+
+  const basePath = {
+    storeHash: HASH,
+    storePath: `/nix/store/${HASH}-thing`,
+    narinfoKey: `${HASH}.narinfo`,
+    narKey: `nar/${HASH}.nar.zst`,
+    narHash: "sha256:" + "c".repeat(64),
+    narSize: 4096,
+    fileHash: "sha256:" + "d".repeat(64),
+    fileSize: 2048,
+    compression: "zstd",
+  };
+
+  test("build B が同一 storeHash で別 payload を送ると 409 + conflictingStoreHash が返る", async () => {
+    const eenv = authedEnv();
+
+    // Build A: 正常に ingest
+    const startBodyA = {
+      build: {
+        id: BUILD_A_ID,
+        host: HOST,
+        system: "x86_64-linux",
+        gitRev: "revA",
+        flakeLockHash: "sha256:lockA",
+        toplevelStorePath: `/nix/store/${HASH}-thing`,
+        createdAt: 1700005000000,
+      },
+    };
+    const startResA = await apiApp.fetch(makeWriteReq("/api/publish/start", startBodyA), eenv);
+    expect(startResA.status).toBe(200);
+    const ingestResA = await apiApp.fetch(
+      makeWriteReq(`/api/publish/${BUILD_A_ID}/ingest`, { storePaths: [basePath] }),
+      eenv,
+    );
+    expect(ingestResA.status).toBe(200);
+
+    // Build B: 同一 storeHash / narKey だが narHash / fileHash などが異なる
+    const startBodyB = {
+      build: {
+        id: BUILD_B_ID,
+        host: HOST,
+        system: "x86_64-linux",
+        gitRev: "revB",
+        flakeLockHash: "sha256:lockB",
+        toplevelStorePath: `/nix/store/${HASH}-thing`,
+        createdAt: 1700006000000,
+      },
+    };
+    const startResB = await apiApp.fetch(makeWriteReq("/api/publish/start", startBodyB), eenv);
+    expect(startResB.status).toBe(200);
+
+    const conflictingPath = {
+      ...basePath,
+      narHash: "sha256:" + "e".repeat(64),
+      fileHash: "sha256:" + "f".repeat(64),
+      fileSize: 9999,
+    };
+    const ingestResB = await apiApp.fetch(
+      makeWriteReq(`/api/publish/${BUILD_B_ID}/ingest`, { storePaths: [conflictingPath] }),
+      eenv,
+    );
+    expect(ingestResB.status).toBe(409);
+
+    const body = (await ingestResB.json()) as {
+      error: string;
+      conflictingStoreHash?: string;
+    };
+    expect(body.conflictingStoreHash).toBe(HASH);
+    expect(body.error).toContain(HASH);
+  });
+});

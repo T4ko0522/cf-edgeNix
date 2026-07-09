@@ -164,6 +164,7 @@ export async function ingestStorePaths(
       ) {
         throw new PublishConflictError(
           `store_path ${row.storeHash} already exists with different payload`,
+          { conflictingStoreHash: row.storeHash },
         );
       }
       // 一致する場合: 冪等 no-op（build_closure は後で全行挿入するためここではスキップ）。
