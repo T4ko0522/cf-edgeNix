@@ -411,7 +411,11 @@ export function makeFetchAdapter(opts: FetchAdapterOpts): ExecAdapter {
         },
       }));
       if (!res.ok) {
-        throw new Error(`API POST failed: ${res.status}`);
+        // レスポンス body は Worker 自身が返す構造化エラー ({ error, conflictingStoreHash? })
+        // であり、CI 側で衝突原因を特定するために必要。stderr/スタック等は含まない。
+        const raw = await res.text().catch(() => "");
+        const detail = raw ? ` — ${raw.slice(0, 2048)}` : "";
+        throw new Error(`API POST failed: ${res.status}${detail}`);
       }
       return res.json();
     },
