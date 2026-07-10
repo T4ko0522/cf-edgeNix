@@ -86,7 +86,7 @@ const publishIngestRoute = createRoute({
     },
     409: {
       content: { "application/json": { schema: ApiErrorSchema } },
-      description: "finalize 済みまたは差分 payload",
+      description: "build が staging ではない",
     },
   },
 });

@@ -109,7 +109,8 @@ export async function startBuild(db: Db, build: BuildMeta): Promise<{ buildId: s
  * store_paths / nar_files / build_closure を chunk 単位で冪等に挿入する。
  * 対象 build が staging 以外なら PublishConflictError (409)。
  * staging build が存在しなければ BuildNotFoundError (404)。
- * 既存行と差分比較し、不一致は PublishConflictError(409)、一致は冪等 no-op（G6）。
+ * 既存 store_hash の payload が変わっている場合は、最新 narinfo のメタデータへ更新する。
+ * Nix store path は同一でも、非再現な derivation では runner 差などで NAR が変わり得る。
  * 1 chunk = 1 db.batch() で atomic。
  */
 export async function ingestStorePaths(
@@ -135,7 +136,8 @@ export async function ingestStorePaths(
 
   if (rows.length === 0) return;
 
-  // G6: 既存行との差分比較。storeHash が衝突する既存行を取得して全フィールド比較。
+  // 既存行の取得。storeHash が衝突する行は、同一なら closure のみ追加し、
+  // payload が変わっていれば最新 narinfo に合わせて store_paths を更新する。
   // inArray は SQLite 変数上限(999)を超えないよう 999 件ごとに分割する（修正2）。
   const incomingHashes = rows.map((r) => r.storeHash);
   const existingPaths: (typeof storePaths.$inferSelect)[] = [];
@@ -150,36 +152,25 @@ export async function ingestStorePaths(
 
   const existingMap = new Map(existingPaths.map((p) => [p.storeHash, p]));
 
-  for (const row of rows) {
-    const ex = existingMap.get(row.storeHash);
-    if (ex) {
-      // 全フィールドが一致するか確認（冪等再送として許容）。
-      if (
-        ex.narKey !== row.narKey ||
-        ex.narHash !== row.narHash ||
-        ex.narSize !== row.narSize ||
-        ex.fileHash !== row.fileHash ||
-        ex.fileSize !== row.fileSize ||
-        ex.compression !== row.compression
-      ) {
-        throw new PublishConflictError(
-          `store_path ${row.storeHash} already exists with different payload`,
-          { conflictingStoreHash: row.storeHash },
-        );
-      }
-      // 一致する場合: 冪等 no-op（build_closure は後で全行挿入するためここではスキップ）。
-    }
-  }
-
   const now = Date.now();
 
-  // 新規行のみ store_paths / nar_files に挿入（既存行はスキップ）。
+  // 新規行は store_paths / nar_files に挿入。既存行は差分の有無で分ける。
   const newRows = rows.filter((r) => !existingMap.has(r.storeHash));
+  const existingRows = rows.filter((r) => existingMap.has(r.storeHash));
+  const changedExistingRows = existingRows.filter((row) => {
+    const ex = existingMap.get(row.storeHash);
+    return ex !== undefined && !storePathPayloadMatches(ex, row);
+  });
+  const unchangedExistingRows = existingRows.filter((row) => {
+    const ex = existingMap.get(row.storeHash);
+    return ex !== undefined && storePathPayloadMatches(ex, row);
+  });
 
   // build_closure はこの build について全入力行に対して挿入する（修正7）。
   // 既存 store_path でも当該 build の closure 行を作ることで GC/liveset が正しくなる。
   // CHUNK_SIZE: 1 行あたり最大 3 statements (store_paths + nar_files + build_closure)。
   // 新規行 chunk: 3 × 25 = 75 statements ≤ 90（実 D1 上限 100 の安全余裕を持たせる）（修正1）。
+  // 差分既存行 chunk: 3 × 25 = 75 statements（nar_files + store_paths update + build_closure）。
   // build_closure のみ chunk: 1 × 90 = 90 statements（既存行のみの場合）。
   const STORE_CHUNK = 25;
   const CLOSURE_CHUNK = 90;
@@ -222,10 +213,44 @@ export async function ingestStorePaths(
     await db.batch(stmts as unknown as Parameters<Db["batch"]>[0]);
   }
 
-  // Step B: 既存 store_path に対しても build_closure を挿入する（修正7）。
-  const existingRows = rows.filter((r) => existingMap.has(r.storeHash));
-  for (let i = 0; i < existingRows.length; i += CLOSURE_CHUNK) {
-    const chunk = existingRows.slice(i, i + CLOSURE_CHUNK);
+  // Step B: 既存 store_path の payload が変わっていれば、D1 の現行メタデータを更新する。
+  for (let i = 0; i < changedExistingRows.length; i += STORE_CHUNK) {
+    const chunk = changedExistingRows.slice(i, i + STORE_CHUNK);
+    const stmts = chunk.flatMap((row) => [
+      db
+        .insert(narFiles)
+        .values({
+          fileHash: row.fileHash,
+          narKey: row.narKey,
+          fileSize: row.fileSize,
+          compression: row.compression,
+          createdAt: now,
+        })
+        .onConflictDoNothing(),
+      db
+        .update(storePaths)
+        .set({
+          storePath: row.storePath,
+          narinfoKey: row.narinfoKey,
+          narKey: row.narKey,
+          narHash: row.narHash,
+          narSize: row.narSize,
+          fileHash: row.fileHash,
+          fileSize: row.fileSize,
+          compression: row.compression,
+        })
+        .where(eq(storePaths.storeHash, row.storeHash)),
+      db
+        .insert(buildClosure)
+        .values({ buildId, storeHash: row.storeHash })
+        .onConflictDoNothing(),
+    ]);
+    await db.batch(stmts as unknown as Parameters<Db["batch"]>[0]);
+  }
+
+  // Step C: 既存 store_path に対しても build_closure を挿入する（修正7）。
+  for (let i = 0; i < unchangedExistingRows.length; i += CLOSURE_CHUNK) {
+    const chunk = unchangedExistingRows.slice(i, i + CLOSURE_CHUNK);
     const stmts = chunk.map((row) =>
       db
         .insert(buildClosure)
@@ -234,6 +259,22 @@ export async function ingestStorePaths(
     );
     await db.batch(stmts as unknown as Parameters<Db["batch"]>[0]);
   }
+}
+
+function storePathPayloadMatches(
+  existing: typeof storePaths.$inferSelect,
+  incoming: NarinfoMeta,
+): boolean {
+  return (
+    existing.storePath === incoming.storePath &&
+    existing.narinfoKey === incoming.narinfoKey &&
+    existing.narKey === incoming.narKey &&
+    existing.narHash === incoming.narHash &&
+    existing.narSize === incoming.narSize &&
+    existing.fileHash === incoming.fileHash &&
+    existing.fileSize === incoming.fileSize &&
+    existing.compression === incoming.compression
+  );
 }
 
 /**

@@ -90,7 +90,8 @@ POST /api/publish/start
   → latest は変わらない（read path に影響なし）
 
 POST /api/publish/:build_id/ingest  （chunk を分けて複数回呼べる）
-  → store_paths / nar_files / build_closure を冪等 upsert
+  → store_paths / nar_files / build_closure を upsert
+  → 同一 store_hash の NAR メタデータが変わった場合は最新 narinfo に更新
   → staging 状態の build にのみ適用可能
 
 POST /api/publish/:build_id/finalize
@@ -105,7 +106,7 @@ POST /api/publish/:build_id/finalize
 ### 冪等性
 
 - 同一 `build_id` で `start` を再実行 → staging のままなら冪等に 200 を返す。
-- 同一 `build_id` で `ingest` を再実行 → `INSERT ... ON CONFLICT DO NOTHING` で冪等。
+- 同一 `build_id` で `ingest` を再実行 → 同一 payload は冪等、同一 `store_hash` の NAR メタデータ差分は最新 narinfo に更新。
 - 同一 `build_id` で `finalize` を再実行 → 既に published の場合は 409 を返す。
 - NAR upload は `narKey`（`nar/<file-hash>.nar.zst`）が content-addressed なので、存在する場合は上書きしても安全（同一内容）。重複 `narKey` を持つ narinfo は Set でまとめてから upload する。
 
@@ -182,7 +183,7 @@ bash scripts/publish.sh
 
 これにより:
 - `start` は冪等に 200 を返す（既に staging 行が存在する場合も安全）。
-- `ingest` は `INSERT OR IGNORE` で冪等に通過する。
+- `ingest` は同一 payload なら冪等に通過し、同一 `store_hash` の NAR メタデータ差分は最新 narinfo に更新する。
 - `finalize` は既に published の場合 409 を返して安全に終了する。
 
 つまり、中断後に同じ条件で再実行すれば、完了済みのステップは冪等に通過し、途中から続行できる。環境変数 `BUILD_ID` を手動指定する仕組みは不要である。
@@ -207,6 +208,8 @@ curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/dry-run \
 ```
 
 `dead_candidates` は `rollback_roots` から到達できない NAR の一覧。実 R2 物理削除は現時点では未実装（`fixme.md` §1 参照）。
+
+`ingest` upsert で `store_paths.narKey` が最新 NAR に置き換わった場合、古い `nar_files` 行と R2 の `nar/<old-fileHash>.nar.zst` は `store_paths` からは辿れなくなる。GC は `store_paths.narKey` に加えて `nar_files.narKey` も dead 判定源として走査するため、これらの orphan も `dead_candidates` に載って `phase=nar` で回収される。orphan は `narinfo` を持たないため `phase=narinfo` の対象にはならない。
 
 ---
 

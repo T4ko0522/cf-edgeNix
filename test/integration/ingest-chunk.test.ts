@@ -278,9 +278,9 @@ describe("既存 store_path を別 build に ingest: build_closure が作られ�
   });
 });
 
-// ─── 差分 payload → 409 と conflictingStoreHash 構造化 body（運用診断用）────
+// ─── 同一 storeHash の差分 payload は最新 narinfo に追従 ────────────────
 
-describe("ingest 差分 payload → 409 レスポンスに conflictingStoreHash が入る", () => {
+describe("ingest 差分 payload → store_paths を更新して closure を張る", () => {
   const HASH = makeHash(700);
   const BUILD_A_ID = "conflict-payload-build-A";
   const BUILD_B_ID = "conflict-payload-build-B";
@@ -298,7 +298,7 @@ describe("ingest 差分 payload → 409 レスポンスに conflictingStoreHash 
     compression: "zstd",
   };
 
-  test("build B が同一 storeHash で別 payload を送ると 409 + conflictingStoreHash が返る", async () => {
+  test("build B が同一 storeHash で別 payload を送ると 200 で最新 payload に更新する", async () => {
     const eenv = authedEnv();
 
     // Build A: 正常に ingest
@@ -336,23 +336,40 @@ describe("ingest 差分 payload → 409 レスポンスに conflictingStoreHash 
     const startResB = await apiApp.fetch(makeWriteReq("/api/publish/start", startBodyB), eenv);
     expect(startResB.status).toBe(200);
 
-    const conflictingPath = {
+    const updatedPath = {
       ...basePath,
+      narKey: `nar/${HASH}1.nar.zst`,
       narHash: "sha256:" + "e".repeat(64),
       fileHash: "sha256:" + "f".repeat(64),
       fileSize: 9999,
     };
     const ingestResB = await apiApp.fetch(
-      makeWriteReq(`/api/publish/${BUILD_B_ID}/ingest`, { storePaths: [conflictingPath] }),
+      makeWriteReq(`/api/publish/${BUILD_B_ID}/ingest`, { storePaths: [updatedPath] }),
       eenv,
     );
-    expect(ingestResB.status).toBe(409);
+    expect(ingestResB.status).toBe(200);
 
-    const body = (await ingestResB.json()) as {
-      error: string;
-      conflictingStoreHash?: string;
-    };
-    expect(body.conflictingStoreHash).toBe(HASH);
-    expect(body.error).toContain(HASH);
+    const db = getDb();
+    const storeRows = await db.select()
+      .from(schema.storePaths)
+      .where(eq(schema.storePaths.storeHash, HASH));
+    expect(storeRows).toHaveLength(1);
+    expect(storeRows[0]?.narKey).toBe(`nar/${HASH}1.nar.zst`);
+    expect(storeRows[0]?.narHash).toBe("sha256:" + "e".repeat(64));
+    expect(storeRows[0]?.fileHash).toBe("sha256:" + "f".repeat(64));
+    expect(storeRows[0]?.fileSize).toBe(9999);
+
+    const closureB = await db.select()
+      .from(schema.buildClosure)
+      .where(and(
+        eq(schema.buildClosure.buildId, BUILD_B_ID),
+        eq(schema.buildClosure.storeHash, HASH),
+      ));
+    expect(closureB).toHaveLength(1);
+
+    const narRows = await db.select()
+      .from(schema.narFiles)
+      .where(eq(schema.narFiles.fileHash, "sha256:" + "f".repeat(64)));
+    expect(narRows).toHaveLength(1);
   });
 });

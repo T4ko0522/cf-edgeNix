@@ -423,6 +423,8 @@ R2 GC対象判定
 
 GC の **削除順序** は `POST /api/gc/execute` の `phase` で実装済み: `phase=narinfo`（KV/R2 narinfo 削除 + edge の `narinfo:<storeHash>` タグ purge）→ grace period（運用で確保）→ `phase=nar`（NAR/D1 削除 + `nar:<fileName>` タグ purge）。edge purge は Workers Cache の Cache-Tag purge を使い best-effort とする（非対応プランでは negative/positive エントリが TTL で自然失効するのを待つ）。
 
+live/dead 判定は `store_paths.narKey` に加えて `nar_files.narKey` も走査する。`ingest` upsert で `store_paths.narKey` が最新 NAR に置き換わった結果、`store_paths` からは参照されなくなった古い `nar_files` 行と R2 の `nar/<old-fileHash>.nar.zst` を orphan として dead 候補に含めるためである。orphan には対応する `store_paths`（したがって `storeHash` / `narinfoKey`）が無いため、`phase=narinfo` は空振りし、`phase=nar` で R2 NAR と `nar_files` 行のみが回収される。
+
 ---
 
 ## 9. Publish手順
@@ -462,7 +464,7 @@ nix copy --to "file://${CACHE_DIR}?compression=zstd&compression-level=${ZSTD_LEV
 6. .narinfo を R2 へ upload
 7. D1 確定（3 段状態遷移）:
      POST /api/publish/start          → staging build 作成（latest 不変）
-     POST /api/publish/:id/ingest × N → store_paths を chunk 分割で冪等投入
+     POST /api/publish/:id/ingest × N → store_paths を chunk 分割で upsert
      POST /api/publish/:id/finalize   → build_manifests insert + published + latest 更新（1 batch）
 8. KV を warming（最後・失敗は警告のみ）
 ```
@@ -559,7 +561,7 @@ GET  /api/builds/:id/manifest.json        read  復元用 manifest
 GET  /api/openapi.json                    read  OpenAPI 3.0 スキーマ（hono/zod-openapi 自動生成・認証不要）
 
 POST /api/publish/start                   write  staging build 作成（latest 不変）
-POST /api/publish/:build_id/ingest        write  store_paths を chunk 分割で冪等投入
+POST /api/publish/:build_id/ingest        write  store_paths を chunk 分割で upsert
 POST /api/publish/:build_id/finalize      write  D1 published 確定 + latest 更新（1 batch）
 POST /api/hosts/:host/rollback            write  rollback root 登録
 POST /api/gc/dry-run                      write  GC live-set 計算（実削除はしない）

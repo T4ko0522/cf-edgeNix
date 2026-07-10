@@ -22,6 +22,7 @@ export {
   computeLiveSet,
   deleteDeadStorePaths,
   listDeadStorePaths,
+  listOrphanedNarFiles,
   pinBuild,
   unpinBuild,
 } from "./gc";

@@ -279,6 +279,67 @@ async function insertFailedBuildWithClosure(
   return { narKey };
 }
 
+// ingest upsert 後の orphan 状態を D1/R2 に直接組み上げるヘルパ。
+// store_paths(narKey=live) は published build から参照される live 状態、
+// nar_files には live + orphan の 2 行、R2 には narinfo と両方の NAR を置く。
+async function insertOrphanState(
+  db1: D1Database,
+  eenv: Env,
+  input: {
+    storeHash: string;
+    liveNarKey: string;
+    liveFileHash: string;
+    orphanNarKey: string;
+    orphanFileHash: string;
+    buildId: string;
+  },
+) {
+  const now = Date.now();
+  await db1.prepare(
+    `INSERT INTO builds (id, host, system, git_rev, flake_lock_hash, toplevel_store_path, status, created_at, published_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(
+    input.buildId,
+    HOST,
+    "x86_64-linux",
+    `rev-${input.buildId}`,
+    `sha256:lock-${input.buildId}`,
+    `/nix/store/${input.storeHash}-pkg`,
+    "published",
+    now,
+    now,
+  ).run();
+  await db1.prepare(
+    `INSERT INTO build_closure (build_id, store_hash) VALUES (?, ?)`,
+  ).bind(input.buildId, input.storeHash).run();
+  await db1.prepare(
+    `INSERT INTO store_paths (store_hash, store_path, narinfo_key, nar_key, nar_hash, nar_size, file_hash, file_size, compression, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(
+    input.storeHash,
+    `/nix/store/${input.storeHash}-pkg`,
+    `${input.storeHash}.narinfo`,
+    input.liveNarKey,
+    "sha256:" + "a".repeat(64),
+    5000,
+    input.liveFileHash,
+    2500,
+    "zstd",
+    now,
+  ).run();
+  await db1.prepare(
+    `INSERT INTO nar_files (file_hash, nar_key, file_size, compression, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).bind(input.liveFileHash, input.liveNarKey, 2500, "zstd", now).run();
+  await db1.prepare(
+    `INSERT INTO nar_files (file_hash, nar_key, file_size, compression, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).bind(input.orphanFileHash, input.orphanNarKey, 2200, "zstd", now).run();
+  await eenv.NAR_BUCKET.put(`${input.storeHash}.narinfo`, "narinfo");
+  await eenv.NAR_BUCKET.put(input.liveNarKey, "live nar");
+  await eenv.NAR_BUCKET.put(input.orphanNarKey, "orphan nar");
+}
+
 beforeEach(async () => {
   const db1 = (env as unknown as Env).CONTROL_DB;
   await applyMigrations(db1);
@@ -627,6 +688,34 @@ describe("POST /api/gc/dry-run（G8）", () => {
       newest.narKey,
     ]);
   });
+
+  test("ingest upsert 後の orphan narKey が dead_candidates に入る", async () => {
+    const eenv = authedEnv();
+    const db1 = (env as unknown as Env).CONTROL_DB;
+
+    const orphanStoreHash = "orph0001orph0001orph0001orph0001";
+    const orphanLiveNarKey = `nar/orph-live-1.nar.zst`;
+    const orphanOldNarKey = `nar/orph-old-1.nar.zst`;
+
+    await insertOrphanState(db1, eenv, {
+      storeHash: orphanStoreHash,
+      liveNarKey: orphanLiveNarKey,
+      liveFileHash: "sha256:" + "a".repeat(64),
+      orphanNarKey: orphanOldNarKey,
+      orphanFileHash: "sha256:" + "b".repeat(64),
+      buildId: "gc-orphan-dry-run-build",
+    });
+
+    const res = await apiApp.fetch(makeWriteReq("/api/gc/dry-run", {}), eenv);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    const liveKeys = body["live_nar_keys"] as string[];
+    const deadCandidates = body["dead_candidates"] as string[];
+
+    expect(liveKeys).toContain(orphanLiveNarKey);
+    expect(deadCandidates).toContain(orphanOldNarKey);
+    expect(deadCandidates).not.toContain(orphanLiveNarKey);
+  });
 });
 
 // ─── PATCH /api/builds/:id ───────────────────────────────────────────────────
@@ -845,6 +934,54 @@ describe("POST /api/gc/execute", () => {
       e as unknown as Env,
     );
     expect(res.status).toBe(403);
+  });
+
+  test("phase=all: ingest upsert で残った orphan nar_files/R2 も掃く", async () => {
+    const eenv = authedEnv();
+    const db1 = (env as unknown as Env).CONTROL_DB;
+
+    const orphanStoreHash = "orph0002orph0002orph0002orph0002";
+    const orphanLiveNarKey = `nar/orph-live-2.nar.zst`;
+    const orphanOldNarKey = `nar/orph-old-2.nar.zst`;
+    const orphanLiveFileHash = "sha256:" + "c".repeat(64);
+    const orphanOldFileHash = "sha256:" + "d".repeat(64);
+
+    await insertOrphanState(db1, eenv, {
+      storeHash: orphanStoreHash,
+      liveNarKey: orphanLiveNarKey,
+      liveFileHash: orphanLiveFileHash,
+      orphanNarKey: orphanOldNarKey,
+      orphanFileHash: orphanOldFileHash,
+      buildId: "gc-orphan-execute-build",
+    });
+
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/execute", { phase: "all" }),
+      eenv,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    // orphan は store_paths を持たないため narinfo フェーズの対象は 0 件。
+    // NAR フェーズで R2 の古い .nar.zst と nar_files 行が消える。
+    expect(body["dead_total"]).toBe(1);
+    expect(body["processed"]).toBe(1);
+    expect(body["deleted"]).toEqual({
+      kv_narinfo_attempted: 0,
+      r2_narinfo_attempted: 0,
+      r2_nar_attempted: 1,
+      d1_store_paths: 0,
+      d1_nar_files: 1,
+      d1_build_closure: 0,
+    });
+    // live 側は温存される。
+    expect(await eenv.NAR_BUCKET.get(orphanLiveNarKey)).not.toBeNull();
+    expect(await eenv.NAR_BUCKET.get(`${orphanStoreHash}.narinfo`)).not.toBeNull();
+    expect(await countRows(db1, "store_paths", "store_hash", orphanStoreHash)).toBe(1);
+    expect(await countRows(db1, "nar_files", "nar_key", orphanLiveNarKey)).toBe(1);
+    // orphan 側は R2/D1 とも消える。
+    expect(await eenv.NAR_BUCKET.get(orphanOldNarKey)).toBeNull();
+    expect(await countRows(db1, "nar_files", "nar_key", orphanOldNarKey)).toBe(0);
+    expect(await countRows(db1, "nar_files", "file_hash", orphanOldFileHash)).toBe(0);
   });
 
   test("dead が 0 件でも 200 と削除 0 件を返す", async () => {

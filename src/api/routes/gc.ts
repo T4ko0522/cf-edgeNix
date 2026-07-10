@@ -8,7 +8,12 @@ import {
   GcExecuteResponseSchema,
 } from "../../schemas/api";
 import { getDb } from "../../db/client";
-import { computeLiveSet, deleteDeadStorePaths, listDeadStorePaths } from "../../db/queries";
+import {
+  computeLiveSet,
+  deleteDeadStorePaths,
+  listDeadStorePaths,
+  listOrphanedNarFiles,
+} from "../../db/queries";
 import { narinfoKVKey } from "../../storage/keys";
 import { deleteText as deleteKvText } from "../../storage/kv";
 import { deleteObjects } from "../../storage/r2";
@@ -93,8 +98,13 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
   const liveSet = await computeLiveSet(db);
   const deadTotal = liveSet.deadCandidates.length;
   const targetNarKeys = liveSet.deadCandidates.slice(0, body.max_deletes);
-  const dead = await listDeadStorePaths(db, targetNarKeys);
-  const processed = dead.length;
+  // dead = store_paths が指す dead な narKey / orphan = ingest upsert で
+  // 置き換わり store_paths から見えなくなった nar_files 側の残骸。
+  const [dead, orphan] = await Promise.all([
+    listDeadStorePaths(db, targetNarKeys),
+    listOrphanedNarFiles(db, targetNarKeys),
+  ]);
+  const processed = dead.length + orphan.length;
   const deadRemaining = Math.max(deadTotal - processed, 0);
   const deleted = {
     kv_narinfo_attempted: 0,
@@ -152,8 +162,13 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
   }
 
   if (body.phase === "nar" || body.phase === "all") {
-    const uniqueNarKeys = [...new Set(dead.map((d) => d.narKey))];
-    const uniqueFileHashes = [...new Set(dead.map((d) => d.fileHash))];
+    // orphan は store_paths を持たないため storeHash は dead 由来のみ。
+    const uniqueNarKeys = [
+      ...new Set([...dead.map((d) => d.narKey), ...orphan.map((o) => o.narKey)]),
+    ];
+    const uniqueFileHashes = [
+      ...new Set([...dead.map((d) => d.fileHash), ...orphan.map((o) => o.fileHash)]),
+    ];
     await deleteObjects(c.env, uniqueNarKeys);
     const d1Deleted = await deleteDeadStorePaths(db, storeHashes, uniqueFileHashes);
     deleted.r2_nar_attempted = uniqueNarKeys.length;
