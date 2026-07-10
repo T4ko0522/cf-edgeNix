@@ -1,12 +1,6 @@
 name: ci
 
 # CI ゲート: unit + integration 両 project を Ubuntu で実行する。
-# NixOS では integration は steam-run 経由が必要だが、
-# Ubuntu（GitHub Actions runner）では steam-run 不要で直接 vitest を実行できる。
-#
-# ローカル NixOS 環境では以下のコマンドを使うこと:
-#   unit:        npx vitest run --project unit
-#   integration: steam-run npx vitest run --project integration
 
 on:
   push:
@@ -37,7 +31,7 @@ jobs:
         run: npx tsc --noEmit
 
       - name: Run tests (unit + integration)
-        # Ubuntu では steam-run 不要。vitest run がデフォルトで両 project を実行する。
+        # vitest run がデフォルトで両 project を実行する。
         run: npx vitest run
 
       - name: Wrangler dry-run deploy

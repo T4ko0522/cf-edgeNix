@@ -6,8 +6,6 @@
  * 到達不能 NAR が dead 候補になることを確認する。
  *
  * 受入条件: G8 / POST /api/gc/dry-run
- *
- * NixOS 環境: steam-run npx vitest run --project integration
  */
 import { beforeEach, describe, expect, test } from "vitest";
 import { env } from "cloudflare:test";

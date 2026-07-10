@@ -10,8 +10,6 @@
  *   - startBuild 同一 meta 再送 → 200（冪等）
  *
  * 受入条件: G6/A5
- *
- * NixOS 環境: steam-run npx vitest run --project integration
  */
 import { beforeEach, describe, expect, test } from "vitest";
 import { env } from "cloudflare:test";

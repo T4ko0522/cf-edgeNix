@@ -10,8 +10,6 @@
  *     build B の build_closure 行が存在すること（G7 回帰 / BLOCKER-3 対応）。
  *
  * 受入条件: G6/G7/A3/A5/E1
- *
- * NixOS 環境: steam-run npx vitest run --project integration
  */
 import { beforeEach, describe, expect, test } from "vitest";
 import { env } from "cloudflare:test";

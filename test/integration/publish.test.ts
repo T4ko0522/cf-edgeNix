@@ -5,8 +5,6 @@
  * start → ingest → finalize の通しシナリオで実際のデータが D1 に書かれることを SQL SELECT で確認。
  *
  * 受入条件: A2/A3/A5/E1/E4 / G1/G2/G6
- *
- * NixOS 環境: steam-run npx vitest run --project integration
  */
 import { beforeEach, describe, expect, test } from "vitest";
 import { env } from "cloudflare:test";

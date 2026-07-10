@@ -17,10 +17,7 @@ bun run typecheck
 bun run test          # = vitest run --project unit
 
 # integration テスト（@cloudflare/vitest-pool-workers / workerd 使用）
-# CI (Ubuntu) では:
-npx vitest run --project integration
-# NixOS では workerd バイナリの動的リンクのため steam-run が必須:
-steam-run npx vitest run --project integration
+bun run test:integration
 ```
 
 ## D1 schema 変更
