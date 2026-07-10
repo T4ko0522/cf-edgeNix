@@ -423,6 +423,8 @@ R2 GC対象判定
 
 GC の **削除順序** は `POST /api/gc/execute` の `phase` で実装済み: `phase=narinfo`（KV/R2 narinfo 削除 + edge の `narinfo:<storeHash>` タグ purge）→ grace period（運用で確保）→ `phase=nar`（NAR/D1 削除 + `nar:<fileName>` タグ purge）。edge purge は Workers Cache の Cache-Tag purge を使い best-effort とする（非対応プランでは negative/positive エントリが TTL で自然失効するのを待つ）。
 
+live/dead 判定は `store_paths.narKey` に加えて `nar_files.narKey` も走査する。`ingest` upsert で `store_paths.narKey` が最新 NAR に置き換わった結果、`store_paths` からは参照されなくなった古い `nar_files` 行と R2 の `nar/<old-fileHash>.nar.zst` を orphan として dead 候補に含めるためである。orphan には対応する `store_paths`（したがって `storeHash` / `narinfoKey`）が無いため、`phase=narinfo` は空振りし、`phase=nar` で R2 NAR と `nar_files` 行のみが回収される。
+
 ---
 
 ## 9. Publish手順

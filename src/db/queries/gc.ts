@@ -56,6 +56,43 @@ export async function unpinBuild(db: Db, buildId: string): Promise<void> {
 }
 
 /**
+ * dead 判定済み NAR key のうち、store_paths からは参照されなくなった orphan
+ * nar_files 行を返す。ingest upsert で store_paths.narKey が上書きされたあと
+ * 残る古い nar_files/R2 オブジェクトを GC が回収するために使う。
+ * store_paths に対応行がある narKey は含めない（そちらは listDeadStorePaths で処理する）。
+ */
+export async function listOrphanedNarFiles(
+  db: Db,
+  targetNarKeys: string[],
+): Promise<{ narKey: string; fileHash: string }[]> {
+  if (targetNarKeys.length === 0) return [];
+
+  const seen = new Set<string>();
+  const rows: { narKey: string; fileHash: string }[] = [];
+  for (let i = 0; i < targetNarKeys.length; i += 999) {
+    const chunk = targetNarKeys.slice(i, i + 999);
+    const [narRows, storeRows] = await Promise.all([
+      db
+        .select({ narKey: narFiles.narKey, fileHash: narFiles.fileHash })
+        .from(narFiles)
+        .where(inArray(narFiles.narKey, chunk)),
+      db
+        .select({ narKey: storePaths.narKey })
+        .from(storePaths)
+        .where(inArray(storePaths.narKey, chunk)),
+    ]);
+    const referenced = new Set(storeRows.map((s) => s.narKey));
+    for (const row of narRows) {
+      if (referenced.has(row.narKey)) continue;
+      if (seen.has(row.narKey)) continue;
+      seen.add(row.narKey);
+      rows.push(row);
+    }
+  }
+  return rows;
+}
+
+/**
  * dead 判定済み NAR key から削除対象 store_path を引く。
  * inArray は SQLite 変数上限(999)を超えないよう 999 件ごとに分割する。
  */
@@ -238,15 +275,23 @@ export async function computeLiveSet(db: Db, keepGenerations = 3): Promise<LiveS
 
   const liveNarKeySet = new Set(livePathRows.map((p) => p.narKey));
 
-  // 4. dead candidates: live でない narKey を持つ store_paths。
-  // notInArray も 999 件制限があるため、全件取得して JS 側でフィルタする。
-  const allPaths = await db
-    .select({ storeHash: storePaths.storeHash, narKey: storePaths.narKey })
-    .from(storePaths);
+  // 4. dead candidates: live でない narKey。
+  // 候補源は store_paths.narKey に加えて nar_files.narKey も走査する。
+  // ingest upsert で store_paths.narKey が最新 NAR に置き換わったあとに残る
+  // orphan な nar_files 行（および対応する R2 オブジェクト）を GC の到達範囲に
+  // 含めるため。notInArray も 999 件制限があるので、全件取得して JS 側でフィルタする。
+  const [allPaths, allNarFileRows] = await Promise.all([
+    db.select({ storeHash: storePaths.storeHash, narKey: storePaths.narKey }).from(storePaths),
+    db.select({ narKey: narFiles.narKey }).from(narFiles),
+  ]);
   const storeHashToNarKey = new Map(allPaths.map((p) => [p.storeHash, p.narKey]));
-  const candidateNarKeys = new Set(
-    allPaths.map((p) => p.narKey).filter((narKey) => !liveNarKeySet.has(narKey)),
-  );
+  const candidateNarKeys = new Set<string>();
+  for (const path of allPaths) {
+    if (!liveNarKeySet.has(path.narKey)) candidateNarKeys.add(path.narKey);
+  }
+  for (const row of allNarFileRows) {
+    if (!liveNarKeySet.has(row.narKey)) candidateNarKeys.add(row.narKey);
+  }
 
   // 5. staleness: 候補を参照する dead build の MAX(published_at)。
   const deadBuildIdList = deadBuildRows.map((build) => build.id);

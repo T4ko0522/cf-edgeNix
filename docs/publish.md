@@ -209,6 +209,8 @@ curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/dry-run \
 
 `dead_candidates` は `rollback_roots` から到達できない NAR の一覧。実 R2 物理削除は現時点では未実装（`fixme.md` §1 参照）。
 
+`ingest` upsert で `store_paths.narKey` が最新 NAR に置き換わった場合、古い `nar_files` 行と R2 の `nar/<old-fileHash>.nar.zst` は `store_paths` からは辿れなくなる。GC は `store_paths.narKey` に加えて `nar_files.narKey` も dead 判定源として走査するため、これらの orphan も `dead_candidates` に載って `phase=nar` で回収される。orphan は `narinfo` を持たないため `phase=narinfo` の対象にはならない。
+
 ---
 
 ## トラブルシューティング
