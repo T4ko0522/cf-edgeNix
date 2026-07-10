@@ -462,7 +462,7 @@ nix copy --to "file://${CACHE_DIR}?compression=zstd&compression-level=${ZSTD_LEV
 6. .narinfo を R2 へ upload
 7. D1 確定（3 段状態遷移）:
      POST /api/publish/start          → staging build 作成（latest 不変）
-     POST /api/publish/:id/ingest × N → store_paths を chunk 分割で冪等投入
+     POST /api/publish/:id/ingest × N → store_paths を chunk 分割で upsert
      POST /api/publish/:id/finalize   → build_manifests insert + published + latest 更新（1 batch）
 8. KV を warming（最後・失敗は警告のみ）
 ```
@@ -559,7 +559,7 @@ GET  /api/builds/:id/manifest.json        read  復元用 manifest
 GET  /api/openapi.json                    read  OpenAPI 3.0 スキーマ（hono/zod-openapi 自動生成・認証不要）
 
 POST /api/publish/start                   write  staging build 作成（latest 不変）
-POST /api/publish/:build_id/ingest        write  store_paths を chunk 分割で冪等投入
+POST /api/publish/:build_id/ingest        write  store_paths を chunk 分割で upsert
 POST /api/publish/:build_id/finalize      write  D1 published 確定 + latest 更新（1 batch）
 POST /api/hosts/:host/rollback            write  rollback root 登録
 POST /api/gc/dry-run                      write  GC live-set 計算（実削除はしない）

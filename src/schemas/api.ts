@@ -130,11 +130,6 @@ export type ManifestJsonResponse = z.infer<typeof ManifestJsonResponseSchema>;
 
 export const ApiErrorSchema = z.object({
   error: z.string(),
-  /**
-   * ingest 経路で store_paths の payload 衝突が起きた時のみ設定される。
-   * CI / 運用側が衝突原因の store_hash を直接読めるようにするための構造化フィールド。
-   */
-  conflictingStoreHash: z.string().optional(),
 });
 
 export type ApiError = z.infer<typeof ApiErrorSchema>;

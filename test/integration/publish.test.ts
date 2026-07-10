@@ -508,7 +508,7 @@ describe("冪等性（G6）", () => {
     expect(rows).toHaveLength(1);
   });
 
-  test("ingest 差分 payload（narSize 違い）は 409（G6）", async () => {
+  test("ingest 差分 payload は既存 store_path を最新 narinfo に更新する", async () => {
     const eenv = authedEnv();
 
     await apiApp.fetch(
@@ -521,17 +521,36 @@ describe("冪等性（G6）", () => {
       eenv,
     );
 
-    // 2 回目: 既存 storeHash で narSize が異なる → 409
+    // 2 回目: 既存 storeHash で NAR メタデータが異なる。
+    // Nix store path は同一でも runner 差などで NAR が非再現になることがあるため、
+    // cache の read path と同じく D1 も最新 narinfo に追従させる。
     const diffPayload = {
       storePaths: [
-        { ...storePath1, narSize: 99999 }, // narSize が違う
+        {
+          ...storePath1,
+          narKey: "nar/updated.nar.zst",
+          narHash: "sha256:" + "9".repeat(64),
+          narSize: 99999,
+          fileHash: "sha256:" + "8".repeat(64),
+          fileSize: 77777,
+        },
       ],
     };
     const res = await apiApp.fetch(
       makeReq(`/api/publish/${BUILD_ID}/ingest`, { body: diffPayload }),
       eenv,
     );
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(200);
+
+    const db = getDb();
+    const rows = await db
+      .select()
+      .from(schema.storePaths)
+      .where(eq(schema.storePaths.storeHash, storePath1.storeHash));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.narKey).toBe("nar/updated.nar.zst");
+    expect(rows[0]?.narSize).toBe(99999);
+    expect(rows[0]?.fileHash).toBe("sha256:" + "8".repeat(64));
   });
 
   test("finalize 再送は冪等（200）", async () => {
