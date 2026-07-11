@@ -251,6 +251,27 @@ function errMessage(e: unknown): string {
   return String(e);
 }
 
+/** Cloudflare API の構造化エラーから、秘密値を含まない診断要約を作る。 */
+async function cloudflareErrorSummary(res: Response): Promise<string> {
+  const raw = await res.text().catch(() => "");
+  if (!raw) return "";
+  try {
+    const payload = JSON.parse(raw) as {
+      errors?: Array<{ code?: unknown; message?: unknown }>;
+    };
+    const errors = payload.errors
+      ?.slice(0, 3)
+      .map((error) => {
+        const code = typeof error.code === "number" ? `${error.code}: ` : "";
+        return typeof error.message === "string" ? `${code}${error.message}` : "";
+      })
+      .filter(Boolean);
+    return errors?.length ? ` (${errors.join("; ")})` : "";
+  } catch {
+    return "";
+  }
+}
+
 /**
  * fetch の指数バックオフ付きリトライ。
  *
@@ -393,7 +414,8 @@ export function makeFetchAdapter(opts: FetchAdapterOpts): ExecAdapter {
           },
         }));
         if (!res.ok) {
-          throw new Error(`KV bulk PUT failed (status ${res.status})`);
+          const detail = await cloudflareErrorSummary(res);
+          throw new Error(`KV bulk PUT failed: ${res.status}${detail}`);
         }
       }
     },

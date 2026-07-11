@@ -10,7 +10,7 @@
  *   A2: 公開順序保証（closure/manifest → NAR → narinfo → D1 → KV）
  *   A5: 再 publish 冪等（NAR スキップ）
  */
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 // vi.mock はトップレベルに置く必要がある（vitest がホイストするため）
 vi.mock("fs/promises", () => ({
@@ -35,10 +35,15 @@ import {
   type ExecAdapter,
   type NarinfoMeta,
   buildManifestJson,
+  makeFetchAdapter,
   parseNarinfo,
   publish,
   sha256Hex,
 } from "../../scripts/publish";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 // ─── フィクスチャ ─────────────────────────────────────────────────────────────
 
@@ -85,6 +90,34 @@ describe("parseNarinfo (scripts/publish.ts)", () => {
   test("必須フィールド欠落は Error", () => {
     const noStorePath = SAMPLE_NARINFO_TEXT.replace(/^StorePath:.*\n/m, "");
     expect(() => parseNarinfo(noStorePath)).toThrow();
+  });
+});
+
+describe("makeFetchAdapter — KV Bulk API", () => {
+  test("Cloudflare の構造化エラーを status とともに返す", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            errors: [{ code: 10013, message: "invalid request body" }],
+          }),
+          { status: 400 },
+        ),
+      ),
+    );
+    const adapter = makeFetchAdapter({
+      accountId: "account-001",
+      cfApiToken: "test-token",
+      r2AccessKeyId: "r2-key",
+      r2SecretAccessKey: "r2-secret",
+    });
+
+    await expect(
+      adapter.kvPutBulk("namespace-001", [
+        { key: "narinfo:abcdef", value: "StorePath: /nix/store/example\n" },
+      ]),
+    ).rejects.toThrow("KV bulk PUT failed: 400 (10013: invalid request body)");
   });
 });
 
