@@ -48,16 +48,17 @@ nix copy --to file://$CACHE_DIR       ← 署名済み .narinfo と nar/*.nar.zs
   ↓
 scripts/prune-upstream.sh             ← cache.nixos.org に既にある path を除外
   ↓
-scripts/publish.ts                    ← R2/D1/KV への反映（以下の 5 段）
+scripts/publish.ts                    ← R2/D1/KV への反映（以下の 6 段）
   │
-  ├── Step 0: closure.json / manifest.json を R2 の manifests/<buildId>/ に put
-  ├── Step 1: NAR upload (R2)
-  ├── Step 2: narinfo upload (R2)
-  ├── Step 3: D1 確定 (start → ingest × N → finalize)
-  └── Step 4: KV warming（失敗は警告のみ）
+  ├── Step 0: D1 start → ingest（staging closure を先に GC 保護）
+  ├── Step 1: closure.json / manifest.json を R2 の manifests/<buildId>/ に put
+  ├── Step 2: NAR upload (R2)
+  ├── Step 3: narinfo upload (R2)
+  ├── Step 4: D1 finalize（latest 更新）
+  └── Step 5: KV warming（失敗は警告のみ）
 ```
 
-`scripts/publish.sh` が nix build / copy / upstream prune を行い、続けて `scripts/publish.ts`（bun）に委譲して Step 0–4 を実行する。
+`scripts/publish.sh` が nix build / copy / upstream prune を行い、続けて `scripts/publish.ts`（bun）に委譲して Step 0–5 を実行する。staging closure を R2 の HEAD/PUT より先に登録することで、publish と GC が並行しても既存 NAR を誤って回収しない。
 
 ### upstream prune（R2 容量節約）
 
@@ -89,7 +90,7 @@ POST /api/publish/start
   → builds テーブルに status='staging' 行を作成
   → latest は変わらない（read path に影響なし）
 
-POST /api/publish/:build_id/ingest  （chunk を分けて複数回呼べる）
+POST /api/publish/:build_id/ingest  （最大15件、chunk を分けて複数回呼べる）
   → store_paths / nar_files / build_closure を upsert
   → 同一 store_hash の NAR メタデータが変わった場合は最新 narinfo に更新
   → staging 状態の build にのみ適用可能
@@ -107,7 +108,7 @@ POST /api/publish/:build_id/finalize
 
 - 同一 `build_id` で `start` を再実行 → staging のままなら冪等に 200 を返す。
 - 同一 `build_id` で `ingest` を再実行 → 同一 payload は冪等、同一 `store_hash` の NAR メタデータ差分は最新 narinfo に更新。
-- 同一 `build_id` で `finalize` を再実行 → 既に published の場合は 409 を返す。
+- 同一 `build_id` で `finalize` を再実行 → manifest が同一なら冪等に 200、差分があれば 409 を返す。
 - NAR upload は `narKey`（`nar/<file-hash>.nar.zst`）が content-addressed なので、存在する場合は上書きしても安全（同一内容）。重複 `narKey` を持つ narinfo は Set でまとめてから upload する。
 
 ---
@@ -115,6 +116,8 @@ POST /api/publish/:build_id/finalize
 ## 公開順序の保証と理由
 
 ```
+D1 start / ingest（staging closure を GC 保護）
+  ↓
 NAR 本体 (R2)
   ↓  ← narinfo が先だと Nix client が存在しない NAR へ 404 を起こす
 .narinfo (R2)
@@ -128,7 +131,7 @@ KV warming
 - `.narinfo` が先に見えると Nix client が NAR を取りに行って 404 になる。
 - KV を D1 より先に更新すると、R2 には NAR がないのに KV には narinfo が載る中間状態が生まれる。
 
-`scripts/publish.ts` はこの順序をコードで保証し、テスト（`test/publish/order.test.ts`）でスパイにより `nar→narinfo→d1→kv` の順を assert している。
+`scripts/publish.ts` はこの順序をコードで保証し、`test/publish/publish-script.test.ts` で staging closure が R2 より先、finalize が R2 より後になることを検証している。
 
 ---
 
@@ -138,7 +141,7 @@ KV warming は `try/catch` で包まれており、失敗しても publish 全�
 
 理由: `finalize` で D1 の `published` 確定が済んでいるため、KV にデータがなくても read path は KV miss → R2 へフォールバックして正しく応答できる。KV warming は速度層の充填であり、正本（R2/D1）が生きていれば機能上問題ない。
 
-KV warming に失敗した場合: ログに `[KV] warming failed (non-fatal):` と警告が出る。必要なら同じ `CACHE_DIR` で `scripts/publish.sh` を再実行すれば `build_id` は同一入力（`host:system:gitRev:flakeLockHash:toplevelStorePath`）から決定的に再現され、`start` と `ingest` は冪等に通過し、`finalize` が 409 を返した後 KV warming のみ再実行する形になる（現時点では KV warming だけを再実行する専用コマンドはないため、publish 全体を再実行する）。
+KV warming に失敗した場合はログに `[KV] warming failed (non-fatal):` と警告が出る。read path は R2 fallback で動作するため復旧操作は必須ではない。現時点では KV warming だけを再実行する専用コマンドはない。
 
 ---
 
@@ -181,16 +184,31 @@ bash scripts/publish.sh
 
 `build_id` は `host:system:gitRev:flakeLockHash:toplevelStorePath` を SHA256 でハッシュした先頭 36 字から**決定的に生成**される。同一 commit・同一 host の再実行では必ず同一 `build_id` になる。
 
-これにより:
-- `start` は冪等に 200 を返す（既に staging 行が存在する場合も安全）。
+これにより、中断した staging publish は同じ条件で再開できる:
+- `start` は既に staging なら冪等に 200 を返して保護期限を更新する。published / failed / pruned なら 409。
 - `ingest` は同一 payload なら冪等に通過し、同一 `store_hash` の NAR メタデータ差分は最新 narinfo に更新する。
-- `finalize` は既に published の場合 409 を返して安全に終了する。
+- `finalize` は既に published でも manifest が同一なら冪等に 200、差分があれば 409 を返す。
 
-つまり、中断後に同じ条件で再実行すれば、完了済みのステップは冪等に通過し、途中から続行できる。環境変数 `BUILD_ID` を手動指定する仕組みは不要である。
+staging で中断した場合は、同じ条件で再実行すれば途中から続行できる。完了済み published build の再実行は `start` で 409 になる。環境変数 `BUILD_ID` を手動指定する仕組みは不要である。
 
 ---
 
-## GC dry-run で dead_candidates を確認する
+## 過去世代を GC する
+
+GC は host ごとの最新 3 published 世代、pin、rollback root、作成から 24 時間以内の staging build を保持する。世代ごとの `build_closure.nar_key` を live-set の正本とし、同じ store hash の NAR が世代間で変化しても個別に判定する。
+
+migration `0003_safe_generational_gc.sql` の適用直後は、旧 closure の `nar_key` が未解決である間、GC は fail-closed で全 NAR を live として扱う。`0004_gc_review_fixes.sql` は既存 build を `restorable=0` から開始して復元可否を永続化し、`build_closure.nar_key` の index を追加する。backfill が closure 全体の整合性を確認できた build だけを `restorable=1` にする。R2 manifest から参照を復元し、`closure_rows_remaining` が 0 になるまで backfill を繰り返す。
+
+```bash
+curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/backfill \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"max_rows":20}'
+```
+
+published build の manifest が欠落・破損している場合、D1 の `manifest_hash` と一致しない場合、または manifest 未作成の staging が24時間の保護期間内にある場合は `errors` に残る。manifest を持たない failed / pruned / 期限切れ staging は `closure_rows_pruned` として安全に整理される。`next_cursor` が返った場合は、次回リクエストの `cursor` に指定すると失敗行を飛ばして後続を処理できる。最終的には cursor なしで再実行し、`closure_rows_remaining` が 0 になることを確認する。
+
+### dry-run
 
 ```bash
 curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/dry-run \
@@ -207,9 +225,33 @@ curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/dry-run \
 }
 ```
 
-`dead_candidates` は `rollback_roots` から到達できない NAR の一覧。実 R2 物理削除は現時点では未実装（`fixme.md` §1 参照）。
+`dead_candidates` は保持対象 build から到達できない NAR の一覧。内容を確認してから二段階の削除を開始する。
 
-`ingest` upsert で `store_paths.narKey` が最新 NAR に置き換わった場合、古い `nar_files` 行と R2 の `nar/<old-fileHash>.nar.zst` は `store_paths` からは辿れなくなる。GC は `store_paths.narKey` に加えて `nar_files.narKey` も dead 判定源として走査するため、これらの orphan も `dead_candidates` に載って `phase=nar` で回収される。orphan は `narinfo` を持たないため `phase=narinfo` の対象にはならない。
+`ingest` upsert で `store_paths.narKey` が最新 NAR に置き換わった場合、古い `nar_files` 行と R2 の `nar/<old-fileHash>.nar.zst` は `store_paths` からは辿れなくなる。GC は `store_paths.narKey` に加えて `nar_files.narKey` と `build_closure.narKey` も dead 判定源として走査する。orphan の grace を開始する前に、関連する R2 narinfo の `URL` が対象 NAR を指していないことを確認する。publish 途中で古い narinfo がまだ公開されている場合は tombstone を pending のまま残し、次回 batch で再確認する。
+
+### Phase 1: narinfo を非公開化
+
+```bash
+curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/execute \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"phase":"narinfo","max_deletes":10}'
+```
+
+`dead_remaining` が 0 になるまで繰り返す。処理済み NAR は `gc_marks` に記録されるため、次の呼び出しは未処理候補へ進む。
+
+### Phase 2: 1時間後に NAR を物理削除
+
+最後の Phase 1 実行から 1 時間以上待って実行する。API 自体も tombstone の時刻を検証するため、早く実行しても NAR は削除されない。
+
+```bash
+curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/execute \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"phase":"nar","max_deletes":10}'
+```
+
+物理削除直前に live-set を再計算する。GC tombstone が付いた build への pin、rollback、ingest、finalize は 409 になるため、GC バッチ完了後に publish を再実行する。手動操作等で再び live になった NAR は削除対象から外れ、tombstone も破棄される。NAR が1件でも削除対象になった build は履歴上 `pruned` になり、manifest API の `restorable` が `false` になる。
 
 ---
 

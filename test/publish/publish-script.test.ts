@@ -179,14 +179,17 @@ describe("publish — exec アダプタ注入によるテスト", () => {
     r2Calls: R2Call[];
     apiCalls: ApiCall[];
     kvCalls: KvCall[];
+    sequence: string[];
   } {
     const r2Calls: R2Call[] = [];
     const apiCalls: ApiCall[] = [];
     const kvCalls: KvCall[] = [];
+    const sequence: string[] = [];
     const kvReject = opts?.kvReject ?? false;
 
     const adapter: ExecAdapter = {
       r2Put: vi.fn(async (_bucket: string, key: string, _file: string) => {
+        sequence.push(`r2:${key}`);
         r2Calls.push({ op: "put", key });
       }),
       r2PutContent: vi.fn(async (_bucket: string, key: string, _content: string) => {
@@ -208,6 +211,7 @@ describe("publish — exec アダプタ注入によるテスト", () => {
         },
       ),
       apiPost: vi.fn(async (url: string, _token: string, body: unknown) => {
+        sequence.push(`api:${url}`);
         apiCalls.push({ url, body });
         if (url.endsWith("/start")) {
           return { ok: true, build_id: "test-build-001" };
@@ -222,8 +226,22 @@ describe("publish — exec アダプタ注入によるテスト", () => {
       }),
     };
 
-    return { adapter, r2Calls, apiCalls, kvCalls };
+    return { adapter, r2Calls, apiCalls, kvCalls, sequence };
   }
+
+  test("staging closure を R2 操作より先に登録し finalize は R2 完了後に行う", async () => {
+    const { adapter, sequence } = makeSpyAdapter();
+    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
+
+    const firstR2 = sequence.findIndex((item) => item.startsWith("r2:"));
+    const start = sequence.findIndex((item) => item.endsWith("/api/publish/start"));
+    const ingest = sequence.findIndex((item) => item.includes("/ingest"));
+    const finalize = sequence.findIndex((item) => item.includes("/finalize"));
+    const lastR2 = sequence.map((item) => item.startsWith("r2:")).lastIndexOf(true);
+    expect(start).toBeLessThan(firstR2);
+    expect(ingest).toBeLessThan(firstR2);
+    expect(finalize).toBeGreaterThan(lastR2);
+  });
 
   test("closure.json の R2 put が最初の r2Put 呼び出しになる", async () => {
     const { adapter, r2Calls } = makeSpyAdapter();

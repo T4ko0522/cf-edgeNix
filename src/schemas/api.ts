@@ -43,18 +43,29 @@ export const GcDryRunResponseSchema = z.object({
 
 export type GcDryRunResponse = z.infer<typeof GcDryRunResponseSchema>;
 
+export const GcBackfillRequestSchema = z.object({
+  max_rows: z.number().int().positive().max(20).default(20),
+  cursor: z.string().optional(),
+});
+
+export const GcBackfillResponseSchema = z.object({
+  ok: z.literal(true),
+  builds_processed: z.number().int().nonnegative(),
+  closure_rows_updated: z.number().int().nonnegative(),
+  closure_rows_pruned: z.number().int().nonnegative(),
+  closure_rows_remaining: z.number().int().nonnegative(),
+  next_cursor: z.string().nullable(),
+  errors: z.array(z.object({ build_id: z.string(), error: z.string() })),
+});
+
 // ─── POST /api/gc/execute ───────────────────────────────────────────────────
 
 export const GcExecuteRequestSchema = z.object({
   // phase デフォルトは narinfo (= grace period を挟む前提で narinfo を先に unpublish する)。
   // NAR の物理削除は grace 経過後に明示的に `phase: "nar"` で呼び直すこと。
-  // `phase: "all"` は grace を無視した即時削除であり edge / Nix client が古い narinfo を
-  // 持つ間 404 を撒くリスクがあるため、開発・テスト用途以外では使わない。
-  phase: z.enum(["narinfo", "nar", "all"]).default("narinfo"),
-  // Free プラン subrequest 上限 50/invocation に収めるため KV narinfo delete (=1 subreq/件) の本数を絞る。
-  // computeLiveSet + listDeadStorePaths + R2 bulk delete×2 + D1 COUNT×3 + D1 batch×3 で固定 ~14 subreq 消費するため KV に使える残予算は ~36 件。
-  // デフォルトは余裕を見て 40、上限も 50 にハードキャップ。
-  max_deletes: z.number().int().positive().max(50).default(40),
+  phase: z.enum(["narinfo", "nar"]).default("narinfo"),
+  // D1 Free の invocation あたり query 数と KV subrequest に余裕を残す。
+  max_deletes: z.number().int().positive().max(10).default(10),
   dry_run: z.boolean().default(false),
 });
 
@@ -66,11 +77,12 @@ export const GcExecuteDeletedSchema = z.object({
   d1_store_paths: z.number().int().nonnegative(),
   d1_nar_files: z.number().int().nonnegative(),
   d1_build_closure: z.number().int().nonnegative(),
+  d1_builds_pruned: z.number().int().nonnegative(),
 });
 
 export const GcExecuteResponseSchema = z.object({
   ok: z.literal(true),
-  phase: z.enum(["narinfo", "nar", "all"]),
+  phase: z.enum(["narinfo", "nar"]),
   dry_run: z.boolean(),
   dead_total: z.number().int().nonnegative(),
   processed: z.number().int().nonnegative(),
@@ -92,7 +104,7 @@ export const LatestBuildResponseSchema = z.object({
   gitRev: z.string(),
   flakeLockHash: z.string(),
   toplevelStorePath: z.string(),
-  status: z.enum(["staging", "published", "failed"]),
+  status: z.enum(["staging", "published", "failed", "pruned"]),
   retentionClass: z.string().nullable(),
   createdAt: z.number().int(),
   publishedAt: z.number().int().nullable(),
@@ -122,6 +134,7 @@ export const ManifestJsonResponseSchema = z.object({
   manifestKey: z.string(),
   manifestHash: z.string(),
   createdAt: z.number().int(),
+  restorable: z.boolean(),
 });
 
 export type ManifestJsonResponse = z.infer<typeof ManifestJsonResponseSchema>;

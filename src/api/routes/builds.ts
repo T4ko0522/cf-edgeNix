@@ -60,6 +60,14 @@ const rollbackRoute = createRoute({
       content: { "application/json": { schema: ApiErrorSchema } },
       description: "build_id 不在",
     },
+    409: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "build が GC 処理中",
+    },
+    500: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "サーバ内部エラー",
+    },
   },
 });
 
@@ -94,6 +102,10 @@ const patchBuildRoute = createRoute({
     404: {
       content: { "application/json": { schema: ApiErrorSchema } },
       description: "build_id 不在",
+    },
+    409: {
+      content: { "application/json": { schema: ApiErrorSchema } },
+      description: "build が GC 処理中",
     },
     500: {
       content: { "application/json": { schema: ApiErrorSchema } },
@@ -175,7 +187,7 @@ buildsApp.openapi(rollbackRoute, async (c) => {
     return c.json({ ok: true as const, rollback_root_id: rollbackRootId }, 200);
   } catch (err) {
     const status = errorStatus(err);
-    return c.json({ error: errorMessage(err) }, status as 404);
+    return c.json({ error: errorMessage(err) }, status as 404 | 409 | 500);
   }
 });
 
@@ -192,7 +204,7 @@ buildsApp.openapi(patchBuildRoute, async (c) => {
     return c.json({ ok: true as const, build_id: buildId, pinned: body.pinned }, 200);
   } catch (err) {
     const status = errorStatus(err);
-    return c.json({ error: errorMessage(err) }, status as 404 | 500);
+    return c.json({ error: errorMessage(err) }, status as 404 | 409 | 500);
   }
 });
 
@@ -256,6 +268,7 @@ buildsApp.openapi(manifestRoute, async (c) => {
     manifestKey: manifest.manifestKey,
     manifestHash: manifest.manifestHash,
     createdAt: manifest.createdAt,
+    restorable: manifest.restorable,
   }, 200);
 });
 

@@ -42,13 +42,14 @@ function makeWriteReq(path: string, body: unknown) {
 
 async function applyMigrations(db1: D1Database) {
   const stmts = [
-    `CREATE TABLE IF NOT EXISTS \`build_closure\` (\`build_id\` text NOT NULL, \`store_hash\` text NOT NULL, PRIMARY KEY(\`build_id\`, \`store_hash\`))`,
+    `CREATE TABLE IF NOT EXISTS \`build_closure\` (\`build_id\` text NOT NULL, \`store_hash\` text NOT NULL, \`nar_key\` text, PRIMARY KEY(\`build_id\`, \`store_hash\`))`,
     `CREATE INDEX IF NOT EXISTS \`idx_build_closure_store\` ON \`build_closure\` (\`store_hash\`)`,
     `CREATE TABLE IF NOT EXISTS \`build_manifests\` (\`build_id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`system\` text NOT NULL, \`git_rev\` text NOT NULL, \`flake_lock_hash\` text NOT NULL, \`toplevel_store_path\` text NOT NULL, \`closure_json_key\` text NOT NULL, \`manifest_key\` text NOT NULL, \`manifest_hash\` text NOT NULL, \`created_at\` integer NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS \`idx_build_manifests_host\` ON \`build_manifests\` (\`host\`, \`created_at\`)`,
-    `CREATE TABLE IF NOT EXISTS \`builds\` (\`id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`system\` text NOT NULL, \`git_rev\` text NOT NULL, \`flake_lock_hash\` text NOT NULL, \`toplevel_store_path\` text NOT NULL, \`status\` text DEFAULT 'staging' NOT NULL, \`retention_class\` text, \`created_at\` integer NOT NULL, \`published_at\` integer)`,
+    `CREATE TABLE IF NOT EXISTS \`builds\` (\`id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`system\` text NOT NULL, \`git_rev\` text NOT NULL, \`flake_lock_hash\` text NOT NULL, \`toplevel_store_path\` text NOT NULL, \`status\` text DEFAULT 'staging' NOT NULL, \`retention_class\` text, \`restorable\` integer DEFAULT 0 NOT NULL, \`created_at\` integer NOT NULL, \`published_at\` integer)`,
     `CREATE INDEX IF NOT EXISTS \`idx_builds_host_published\` ON \`builds\` (\`host\`, \`published_at\`)`,
     `CREATE TABLE IF NOT EXISTS \`nar_files\` (\`file_hash\` text PRIMARY KEY NOT NULL, \`nar_key\` text NOT NULL, \`file_size\` integer NOT NULL, \`compression\` text NOT NULL, \`created_at\` integer NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS \`gc_marks\` (\`nar_key\` text PRIMARY KEY NOT NULL, \`marked_at\` integer NOT NULL, \`narinfo_deleted_at\` integer)`,
     `CREATE TABLE IF NOT EXISTS \`rollback_roots\` (\`id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`build_id\` text NOT NULL, \`reason\` text, \`pinned\` integer DEFAULT 0 NOT NULL, \`keep_until\` integer, \`created_at\` integer NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS \`store_paths\` (\`store_hash\` text PRIMARY KEY NOT NULL, \`store_path\` text NOT NULL, \`narinfo_key\` text NOT NULL, \`nar_key\` text NOT NULL, \`nar_hash\` text NOT NULL, \`nar_size\` integer NOT NULL, \`file_hash\` text NOT NULL, \`file_size\` integer NOT NULL, \`compression\` text NOT NULL, \`first_seen_build_id\` text, \`created_at\` integer NOT NULL)`,
   ];
@@ -109,7 +110,7 @@ function makeStorePath(idx: number) {
   };
 }
 
-describe("ingest chunk 境界（STORE_CHUNK=25 を跨ぐ 60 件）", () => {
+describe("ingest API を15件ずつ呼び出して60件を登録", () => {
   const CHUNK_BUILD_ID = "chunk-test-build-001";
   const CHUNK_HOST = "chunk-test-host";
   const CHUNK_TOP_HASH = makeHash(1);
@@ -130,25 +131,29 @@ describe("ingest chunk 境界（STORE_CHUNK=25 を跨ぐ 60 件）", () => {
     const eenv = authedEnv();
     const db = getDb();
 
-    // 60 件のストアパスを生成（STORE_CHUNK=25 を 2 回超える）
+    // D1 Free の query 上限に収めるため、API contract 上限の15件ずつ送る。
     const N = 60;
     const paths = Array.from({ length: N }, (_, i) => makeStorePath(i));
 
     await apiApp.fetch(makeWriteReq("/api/publish/start", chunkStartBody), eenv);
 
-    const ingestRes = await apiApp.fetch(
-      makeWriteReq(`/api/publish/${CHUNK_BUILD_ID}/ingest`, { storePaths: paths }),
-      eenv,
-    );
-    expect(ingestRes.status).toBe(200);
+    for (let i = 0; i < paths.length; i += 15) {
+      const ingestRes = await apiApp.fetch(
+        makeWriteReq(`/api/publish/${CHUNK_BUILD_ID}/ingest`, {
+          storePaths: paths.slice(i, i + 15),
+        }),
+        eenv,
+      );
+      expect(ingestRes.status).toBe(200);
+    }
 
     // SELECT で全件が INSERT されたことを確認
     const allRows = await db.select({ storeHash: schema.storePaths.storeHash })
       .from(schema.storePaths);
     expect(allRows.length).toBe(N);
 
-    // 各ハッシュが実際に存在することを確認（境界値: 先頭・24番目・25番目・49番目・59番目）
-    for (const boundary of [0, 24, 25, 49, 59]) {
+    // 各ハッシュが実際に存在することを確認。
+    for (const boundary of [0, 14, 15, 44, 59]) {
       const expectedHash = paths[boundary]?.storeHash ?? "";
       const row = await db.select()
         .from(schema.storePaths)
@@ -165,10 +170,14 @@ describe("ingest chunk 境界（STORE_CHUNK=25 を跨ぐ 60 件）", () => {
     const paths = Array.from({ length: N }, (_, i) => makeStorePath(i));
 
     await apiApp.fetch(makeWriteReq("/api/publish/start", chunkStartBody), eenv);
-    await apiApp.fetch(
-      makeWriteReq(`/api/publish/${CHUNK_BUILD_ID}/ingest`, { storePaths: paths }),
-      eenv,
-    );
+    for (let i = 0; i < paths.length; i += 15) {
+      await apiApp.fetch(
+        makeWriteReq(`/api/publish/${CHUNK_BUILD_ID}/ingest`, {
+          storePaths: paths.slice(i, i + 15),
+        }),
+        eenv,
+      );
+    }
 
     // build_closure の全件を SELECT
     const closureRows = await db.select()
@@ -356,6 +365,11 @@ describe("ingest 差分 payload → store_paths を更新して closure を張�
     expect(storeRows[0]?.narHash).toBe("sha256:" + "e".repeat(64));
     expect(storeRows[0]?.fileHash).toBe("sha256:" + "f".repeat(64));
     expect(storeRows[0]?.fileSize).toBe(9999);
+
+    const buildA = await db.select({ restorable: schema.builds.restorable })
+      .from(schema.builds)
+      .where(eq(schema.builds.id, BUILD_A_ID));
+    expect(buildA[0]?.restorable).toBe(0);
 
     const closureB = await db.select()
       .from(schema.buildClosure)

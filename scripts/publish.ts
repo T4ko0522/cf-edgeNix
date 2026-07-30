@@ -544,7 +544,7 @@ async function runPool<T>(
 
 // ─── メインロジック ───────────────────────────────────────────────────────────
 
-const D1_INGEST_CHUNK = 50;
+const D1_INGEST_CHUNK = 15;
 const HEAD_CONCURRENCY = 32;
 const R2_PUT_CONCURRENCY = 24;
 
@@ -570,8 +570,30 @@ export async function publish(
   }
 
   const buildId = buildMeta.id;
+  const apiBase = env.apiBaseUrl.replace(/\/$/, "");
+  const token = env.adminToken;
 
-  // Step 0: closure.json / manifest.json を R2 に put（G5）
+  // GC より先に staging closure を登録する。以降の R2 HEAD/PUT と GC が競合しても、
+  // 24 時間以内の staging build は live root なので必要な NAR は回収されない。
+  const startRes = (await exec.apiPost(
+    `${apiBase}/api/publish/start`,
+    token,
+    { build: buildMeta },
+  )) as { build_id: string };
+  const confirmedBuildId = startRes.build_id;
+  console.log(`[D1] build started: ${confirmedBuildId}`);
+
+  for (let i = 0; i < narinfos.length; i += D1_INGEST_CHUNK) {
+    const chunk = narinfos.slice(i, i + D1_INGEST_CHUNK);
+    await exec.apiPost(
+      `${apiBase}/api/publish/${confirmedBuildId}/ingest`,
+      token,
+      { storePaths: chunk },
+    );
+  }
+  console.log(`[D1] ingested ${narinfos.length} store paths`);
+
+  // Step 1: closure.json / manifest.json を R2 に put（G5）
   const closureJsonPath = resolve(process.cwd(), "closure.json");
   const closureJsonKey = `manifests/${buildId}/closure.json`;
   const manifestKey = `manifests/${buildId}/manifest.json`;
@@ -597,7 +619,7 @@ export async function publish(
   await exec.r2Put(env.r2BucketName, manifestKey, manifestTmpPath);
   console.log(`[R2] uploaded: ${manifestKey} (hash: ${manifestHash})`);
 
-  // Step 1: NAR upload — HEAD で R2 上の既存を検出してスキップ→不足ぶんを並列 PUT。
+  // Step 2: NAR upload — HEAD で R2 上の既存を検出してスキップ→不足ぶんを並列 PUT。
   //   NAR は content-addressed (narKey に file hash が入る) なので既存ヒット時の
   //   コンテンツ同一性は保証される。
   const uniqueNarKeys = Array.from(new Set(narinfos.map((ni) => ni.narKey)));
@@ -621,7 +643,7 @@ export async function publish(
     }
   });
 
-  // Step 2: narinfo upload — 並列 PUT。narinfo は署名等で内容が変わり得るので常に上書き。
+  // Step 3: narinfo upload — 並列 PUT。narinfo は署名等で内容が変わり得るので常に上書き。
   let narinfoUploaded = 0;
   await runPool(narinfos, R2_PUT_CONCURRENCY, async (ni) => {
     const filePath = resolve(cacheDir, `${ni.storeHash}.narinfo`);
@@ -632,28 +654,7 @@ export async function publish(
     }
   });
 
-  const apiBase = env.apiBaseUrl.replace(/\/$/, "");
-  const token = env.adminToken;
-
-  // Step 3: D1 確定（start → ingest chunks → finalize）
-  const startRes = (await exec.apiPost(
-    `${apiBase}/api/publish/start`,
-    token,
-    { build: buildMeta },
-  )) as { build_id: string };
-  const confirmedBuildId = startRes.build_id;
-  console.log(`[D1] build started: ${confirmedBuildId}`);
-
-  for (let i = 0; i < narinfos.length; i += D1_INGEST_CHUNK) {
-    const chunk = narinfos.slice(i, i + D1_INGEST_CHUNK);
-    await exec.apiPost(
-      `${apiBase}/api/publish/${confirmedBuildId}/ingest`,
-      token,
-      { storePaths: chunk },
-    );
-  }
-  console.log(`[D1] ingested ${narinfos.length} store paths`);
-
+  // Step 4: D1 published 確定。R2 object が揃うまで latest は動かさない。
   const manifestMeta: ManifestMeta = {
     closureJsonKey,
     manifestKey,
@@ -672,7 +673,7 @@ export async function publish(
   );
   console.log(`[D1] finalized: ${confirmedBuildId}`);
 
-  // Step 4: KV warming — 全件を bulk API で 1〜数リクエストにまとめる。失敗は警告のみ。
+  // Step 5: KV warming — 全件を bulk API で 1〜数リクエストにまとめる。失敗は警告のみ。
   try {
     const items: Array<{ key: string; value: string }> = [];
     for (const ni of narinfos) {

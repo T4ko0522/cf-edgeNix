@@ -54,8 +54,8 @@ flowchart LR
     W -. warm .-> KV[(KV)]
 ```
 
-`start → ingest × N → finalize` is the only path that moves `latest`.  
-NAR uploads precede narinfo; D1 commit precedes KV warming. Order is enforced in `scripts/publish.ts` and asserted in `test/publish/order.test.ts`.
+`start → ingest × N → R2 upload → finalize` is the only path that moves `latest`.
+The staging closure is registered before R2 operations so GC cannot race a publish. NAR uploads precede narinfo, and finalization precedes KV warming.
 
 ### Deploy path
 
@@ -83,7 +83,7 @@ Workers Builds runs `wrangler d1 migrations apply --remote && wrangler deploy` o
 - `staging → ingest → finalize` three-phase publish, finalize moves `latest` in a single `db.batch()`
 - Deterministic `build_id` = `sha256(host:system:gitRev:flakeLockHash:toplevelStorePath)[:36]` — re-runs are idempotent
 - Per-host build history with rollback root registration
-- GC dry-run that returns `dead_candidates` (NARs unreachable from any rollback root)
+- Safe generational GC: keep the latest 3 builds per host plus pins/rollback roots, then enforce a one-hour narinfo-to-NAR deletion grace period
 
 ### Edge & cost
 

@@ -1,6 +1,14 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "../client";
-import { buildClosure, buildManifests, builds, narFiles, rollbackRoots, storePaths } from "../schema";
+import {
+  buildClosure,
+  buildManifests,
+  builds,
+  gcMarks,
+  narFiles,
+  rollbackRoots,
+  storePaths,
+} from "../schema";
 import type { Build, BuildManifest } from "../schema";
 import { BuildNotFoundError, PublishConflictError } from "./errors";
 import type { BuildMeta, ManifestMeta, NarinfoMeta, RollbackRootInput } from "./types";
@@ -41,20 +49,66 @@ export async function listClosurePurgeTargets(
   buildId: string,
 ): Promise<Array<{ storeHash: string; narKey: string }>> {
   return db
-    .select({ storeHash: buildClosure.storeHash, narKey: storePaths.narKey })
+    .select({
+      storeHash: buildClosure.storeHash,
+      narKey: buildClosure.narKey,
+      currentNarKey: storePaths.narKey,
+    })
     .from(buildClosure)
     .innerJoin(storePaths, eq(storePaths.storeHash, buildClosure.storeHash))
-    .where(eq(buildClosure.buildId, buildId));
+    .where(eq(buildClosure.buildId, buildId))
+    .then((rows) => rows.map((row) => ({
+      storeHash: row.storeHash,
+      narKey: row.narKey ?? row.currentNarKey,
+    })));
 }
 
 /** build_id から build_manifest を返す。存在しなければ null。 */
-export async function getManifest(db: Db, buildId: string): Promise<BuildManifest | null> {
+export async function getManifest(
+  db: Db,
+  buildId: string,
+): Promise<(BuildManifest & { restorable: boolean }) | null> {
   const rows = await db
-    .select()
+    .select({
+      manifest: buildManifests,
+      status: builds.status,
+      restorable: builds.restorable,
+    })
     .from(buildManifests)
+    .innerJoin(builds, eq(builds.id, buildManifests.buildId))
     .where(eq(buildManifests.buildId, buildId))
     .limit(1);
-  return rows[0] ?? null;
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    ...row.manifest,
+    restorable: row.status !== "pruned" && row.restorable === 1,
+  };
+}
+
+export async function isBuildRestorable(db: Db, buildId: string): Promise<boolean> {
+  const rows = await db
+    .select({ restorable: builds.restorable })
+    .from(builds)
+    .where(eq(builds.id, buildId))
+    .limit(1);
+  return rows[0]?.restorable === 1;
+}
+
+export async function refreshBuildRestorable(db: Db, buildId: string): Promise<boolean> {
+  await db
+    .update(builds)
+    .set({
+      restorable: sql<number>`CASE WHEN EXISTS (
+        SELECT 1
+        FROM build_closure bc
+        LEFT JOIN store_paths sp ON sp.store_hash = bc.store_hash
+        WHERE bc.build_id = ${builds.id}
+          AND (bc.nar_key IS NULL OR sp.nar_key IS NULL OR bc.nar_key != sp.nar_key)
+      ) THEN 0 ELSE 1 END`,
+    })
+    .where(and(eq(builds.id, buildId), ne(builds.status, "pruned")));
+  return isBuildRestorable(db, buildId);
 }
 
 /**
@@ -74,6 +128,9 @@ export async function startBuild(db: Db, build: BuildMeta): Promise<{ buildId: s
     if (row.status === "published") {
       throw new PublishConflictError(`build ${build.id} is already published`);
     }
+    if (row.status !== "staging") {
+      throw new PublishConflictError(`build ${build.id} is not in staging status (${row.status})`);
+    }
     // staging 済み: meta の immutable フィールドを比較し差分なら 409。
     if (
       row.host !== build.host ||
@@ -86,6 +143,14 @@ export async function startBuild(db: Db, build: BuildMeta): Promise<{ buildId: s
         `build ${build.id} already exists as staging with different meta`,
       );
     }
+    const marked = await db
+      .select({ narKey: gcMarks.narKey })
+      .from(buildClosure)
+      .innerJoin(gcMarks, eq(gcMarks.narKey, buildClosure.narKey))
+      .where(eq(buildClosure.buildId, build.id))
+      .limit(1);
+    if (marked[0]) throw new PublishConflictError(`build ${build.id} is pending GC`);
+    await db.update(builds).set({ createdAt: Date.now() }).where(eq(builds.id, build.id));
     return { buildId: build.id };
   }
 
@@ -98,7 +163,8 @@ export async function startBuild(db: Db, build: BuildMeta): Promise<{ buildId: s
       flakeLockHash: build.flakeLockHash,
       toplevelStorePath: build.toplevelStorePath,
       status: "staging",
-      createdAt: build.createdAt,
+      restorable: 1,
+      createdAt: Date.now(),
     }),
   ]);
 
@@ -136,13 +202,22 @@ export async function ingestStorePaths(
 
   if (rows.length === 0) return;
 
+  const markedNarKeys = await db
+    .select({ narKey: gcMarks.narKey })
+    .from(gcMarks)
+    .where(inArray(gcMarks.narKey, [...new Set(rows.map((row) => row.narKey))]))
+    .limit(1);
+  if (markedNarKeys[0]) {
+    throw new PublishConflictError(`build ${buildId} references a NAR pending GC`);
+  }
+
   // 既存行の取得。storeHash が衝突する行は、同一なら closure のみ追加し、
   // payload が変わっていれば最新 narinfo に合わせて store_paths を更新する。
-  // inArray は SQLite 変数上限(999)を超えないよう 999 件ごとに分割する（修正2）。
+  // D1 の bind parameter 上限に余裕を持たせ、90件ごとに分割する。
   const incomingHashes = rows.map((r) => r.storeHash);
   const existingPaths: (typeof storePaths.$inferSelect)[] = [];
-  for (let i = 0; i < incomingHashes.length; i += 999) {
-    const chunk = incomingHashes.slice(i, i + 999);
+  for (let i = 0; i < incomingHashes.length; i += 90) {
+    const chunk = incomingHashes.slice(i, i + 90);
     const rows_ = await db
       .select()
       .from(storePaths)
@@ -169,11 +244,9 @@ export async function ingestStorePaths(
   // build_closure はこの build について全入力行に対して挿入する（修正7）。
   // 既存 store_path でも当該 build の closure 行を作ることで GC/liveset が正しくなる。
   // CHUNK_SIZE: 1 行あたり最大 3 statements (store_paths + nar_files + build_closure)。
-  // 新規行 chunk: 3 × 25 = 75 statements ≤ 90（実 D1 上限 100 の安全余裕を持たせる）（修正1）。
-  // 差分既存行 chunk: 3 × 25 = 75 statements（nar_files + store_paths update + build_closure）。
-  // build_closure のみ chunk: 1 × 90 = 90 statements（既存行のみの場合）。
-  const STORE_CHUNK = 25;
-  const CLOSURE_CHUNK = 90;
+  // API が最大15行に制限するため、1 invocation は最大45 write statements。
+  const STORE_CHUNK = 15;
+  const CLOSURE_CHUNK = 15;
 
   // Step A: 新規 store_paths / nar_files / build_closure を chunk 単位で挿入。
   for (let i = 0; i < newRows.length; i += STORE_CHUNK) {
@@ -207,8 +280,11 @@ export async function ingestStorePaths(
         .onConflictDoNothing(),
       db
         .insert(buildClosure)
-        .values({ buildId, storeHash: row.storeHash })
-        .onConflictDoNothing(),
+        .values({ buildId, storeHash: row.storeHash, narKey: row.narKey })
+        .onConflictDoUpdate({
+          target: [buildClosure.buildId, buildClosure.storeHash],
+          set: { narKey: row.narKey },
+        }),
     ]);
     await db.batch(stmts as unknown as Parameters<Db["batch"]>[0]);
   }
@@ -216,7 +292,13 @@ export async function ingestStorePaths(
   // Step B: 既存 store_path の payload が変わっていれば、D1 の現行メタデータを更新する。
   for (let i = 0; i < changedExistingRows.length; i += STORE_CHUNK) {
     const chunk = changedExistingRows.slice(i, i + STORE_CHUNK);
-    const stmts = chunk.flatMap((row) => [
+    const affectedBuilds = db
+      .selectDistinct({ id: buildClosure.buildId })
+      .from(buildClosure)
+      .where(inArray(buildClosure.storeHash, chunk.map((row) => row.storeHash)));
+    const stmts = [
+      db.update(builds).set({ restorable: 0 }).where(inArray(builds.id, affectedBuilds)),
+      ...chunk.flatMap((row) => [
       db
         .insert(narFiles)
         .values({
@@ -242,9 +324,13 @@ export async function ingestStorePaths(
         .where(eq(storePaths.storeHash, row.storeHash)),
       db
         .insert(buildClosure)
-        .values({ buildId, storeHash: row.storeHash })
-        .onConflictDoNothing(),
-    ]);
+        .values({ buildId, storeHash: row.storeHash, narKey: row.narKey })
+        .onConflictDoUpdate({
+          target: [buildClosure.buildId, buildClosure.storeHash],
+          set: { narKey: row.narKey },
+        }),
+      ]),
+    ];
     await db.batch(stmts as unknown as Parameters<Db["batch"]>[0]);
   }
 
@@ -254,11 +340,15 @@ export async function ingestStorePaths(
     const stmts = chunk.map((row) =>
       db
         .insert(buildClosure)
-        .values({ buildId, storeHash: row.storeHash })
-        .onConflictDoNothing(),
+        .values({ buildId, storeHash: row.storeHash, narKey: row.narKey })
+        .onConflictDoUpdate({
+          target: [buildClosure.buildId, buildClosure.storeHash],
+          set: { narKey: row.narKey },
+        }),
     );
     await db.batch(stmts as unknown as Parameters<Db["batch"]>[0]);
   }
+  await refreshBuildRestorable(db, buildId);
 }
 
 function storePathPayloadMatches(
@@ -340,6 +430,16 @@ export async function finalizeBuild(
     );
   }
 
+  const markedClosure = await db
+    .select({ narKey: gcMarks.narKey })
+    .from(buildClosure)
+    .innerJoin(gcMarks, eq(gcMarks.narKey, buildClosure.narKey))
+    .where(eq(buildClosure.buildId, buildId))
+    .limit(1);
+  if (markedClosure[0]) {
+    throw new PublishConflictError(`build ${buildId} is pending GC`);
+  }
+
   const publishedAt = Date.now();
 
   await db.batch([
@@ -375,9 +475,19 @@ export async function registerRollbackRoot(db: Db, input: RollbackRootInput): Pr
     .where(eq(builds.id, input.buildId))
     .limit(1);
 
-  if (!existing[0]) {
+  if (!existing[0] || existing[0].status === "pruned") {
     throw new BuildNotFoundError(`build ${input.buildId} not found`);
   }
+  if (!await isBuildRestorable(db, input.buildId)) {
+    throw new PublishConflictError(`build ${input.buildId} is not restorable`);
+  }
+  const marked = await db
+    .select({ narKey: gcMarks.narKey })
+    .from(buildClosure)
+    .innerJoin(gcMarks, eq(gcMarks.narKey, buildClosure.narKey))
+    .where(eq(buildClosure.buildId, input.buildId))
+    .limit(1);
+  if (marked[0]) throw new PublishConflictError(`build ${input.buildId} is pending GC`);
 
   await db.batch([
     db.insert(rollbackRoots).values({

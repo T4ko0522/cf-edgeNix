@@ -121,7 +121,7 @@ export type PublishStartResponse = z.infer<typeof PublishStartResponseSchema>;
 // ─── POST /api/publish/:build_id/ingest ─────────────────────────────────────
 
 export const PublishIngestRequestSchema = z.object({
-  storePaths: z.array(NarinfoMetaSchema),
+  storePaths: z.array(NarinfoMetaSchema).max(15),
 });
 
 export const PublishIngestResponseSchema = z.object({
