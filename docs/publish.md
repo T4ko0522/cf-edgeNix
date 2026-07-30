@@ -197,7 +197,7 @@ staging で中断した場合は、同じ条件で再実行すれば途中から
 
 GC は host ごとの最新 3 published 世代、pin、rollback root、作成から 24 時間以内の staging build を保持する。世代ごとの `build_closure.nar_key` を live-set の正本とし、同じ store hash の NAR が世代間で変化しても個別に判定する。
 
-migration `0003_safe_generational_gc.sql` の適用直後は、旧 closure の `nar_key` が未解決である間、GC は fail-closed で全 NAR を live として扱う。R2 manifest から参照を復元し、`closure_rows_remaining` が 0 になるまで backfill を繰り返す。
+migration `0003_safe_generational_gc.sql` の適用直後は、旧 closure の `nar_key` が未解決である間、GC は fail-closed で全 NAR を live として扱う。`0004_gc_review_fixes.sql` は既存 build を `restorable=0` から開始して復元可否を永続化し、`build_closure.nar_key` の index を追加する。backfill が closure 全体の整合性を確認できた build だけを `restorable=1` にする。R2 manifest から参照を復元し、`closure_rows_remaining` が 0 になるまで backfill を繰り返す。
 
 ```bash
 curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/backfill \
@@ -206,7 +206,7 @@ curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/backfill \
   -d '{"max_rows":20}'
 ```
 
-manifest が欠落・破損している build、または D1 の `manifest_hash` と一致しない build は `errors` に残る。この状態で削除は開始されないため、対象 manifest を復旧してから再実行する。`next_cursor` が返った場合は、次回リクエストの `cursor` に指定すると失敗行を飛ばして後続を処理できる。最終的には cursor なしで再実行し、`closure_rows_remaining` が 0 になることを確認する。
+published build の manifest が欠落・破損している場合、D1 の `manifest_hash` と一致しない場合、または manifest 未作成の staging が24時間の保護期間内にある場合は `errors` に残る。manifest を持たない failed / pruned / 期限切れ staging は `closure_rows_pruned` として安全に整理される。`next_cursor` が返った場合は、次回リクエストの `cursor` に指定すると失敗行を飛ばして後続を処理できる。最終的には cursor なしで再実行し、`closure_rows_remaining` が 0 になることを確認する。
 
 ### dry-run
 
@@ -227,7 +227,7 @@ curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/dry-run \
 
 `dead_candidates` は保持対象 build から到達できない NAR の一覧。内容を確認してから二段階の削除を開始する。
 
-`ingest` upsert で `store_paths.narKey` が最新 NAR に置き換わった場合、古い `nar_files` 行と R2 の `nar/<old-fileHash>.nar.zst` は `store_paths` からは辿れなくなる。GC は `store_paths.narKey` に加えて `nar_files.narKey` も dead 判定源として走査するため、これらの orphan も `dead_candidates` に載って `phase=nar` で回収される。orphan は `narinfo` を持たないため `phase=narinfo` の対象にはならない。
+`ingest` upsert で `store_paths.narKey` が最新 NAR に置き換わった場合、古い `nar_files` 行と R2 の `nar/<old-fileHash>.nar.zst` は `store_paths` からは辿れなくなる。GC は `store_paths.narKey` に加えて `nar_files.narKey` と `build_closure.narKey` も dead 判定源として走査する。orphan の grace を開始する前に、関連する R2 narinfo の `URL` が対象 NAR を指していないことを確認する。publish 途中で古い narinfo がまだ公開されている場合は tombstone を pending のまま残し、次回 batch で再確認する。
 
 ### Phase 1: narinfo を非公開化
 

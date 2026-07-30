@@ -1,4 +1,4 @@
-import { and, asc, count, eq, gt, inArray, isNull, lte, or } from "drizzle-orm";
+import { and, asc, count, eq, gt, inArray, isNull, lt, lte, notExists, or } from "drizzle-orm";
 import type { Db } from "../client";
 import {
   buildClosure,
@@ -11,7 +11,7 @@ import {
   storePaths,
 } from "../schema";
 import { BuildNotFoundError, PublishConflictError } from "./errors";
-import { isBuildRestorable } from "./builds";
+import { isBuildRestorable, refreshBuildRestorable } from "./builds";
 import type { DeadStorePath, LiveSet } from "./types";
 
 /**
@@ -84,6 +84,8 @@ export async function listPendingClosureBackfills(
   storeHash: string;
   manifestKey: string | null;
   manifestHash: string | null;
+  status: "staging" | "published" | "failed" | "pruned";
+  createdAt: number;
 }>> {
   return db
     .select({
@@ -91,8 +93,11 @@ export async function listPendingClosureBackfills(
       storeHash: buildClosure.storeHash,
       manifestKey: buildManifests.manifestKey,
       manifestHash: buildManifests.manifestHash,
+      status: builds.status,
+      createdAt: builds.createdAt,
     })
     .from(buildClosure)
+    .innerJoin(builds, eq(builds.id, buildClosure.buildId))
     .leftJoin(buildManifests, eq(buildManifests.buildId, buildClosure.buildId))
     .where(and(
       isNull(buildClosure.narKey),
@@ -128,7 +133,50 @@ export async function backfillClosureNarKeys(
     const results = await db.batch(statements as unknown as Parameters<Db["batch"]>[0]);
     updated += results.reduce((sum, result) => sum + result.meta.changes, 0);
   }
+  await refreshBuildRestorable(db, buildId);
   return updated;
+}
+
+export async function claimUnresolvedBuildForPrune(
+  db: Db,
+  buildId: string,
+  stagingCutoff: number,
+): Promise<boolean> {
+  const result = await db
+    .update(builds)
+    .set({ status: "pruned", restorable: 0 })
+    .where(and(
+      eq(builds.id, buildId),
+      or(
+        inArray(builds.status, ["failed", "pruned"]),
+        and(eq(builds.status, "staging"), lt(builds.createdAt, stagingCutoff)),
+      ),
+      notExists(
+        db.select({ buildId: pinnedBuilds.buildId })
+          .from(pinnedBuilds)
+          .where(eq(pinnedBuilds.buildId, builds.id)),
+      ),
+      notExists(
+        db.select({ buildId: rollbackRoots.buildId })
+          .from(rollbackRoots)
+          .where(eq(rollbackRoots.buildId, builds.id)),
+      ),
+    ));
+  return result.meta.changes > 0;
+}
+
+export async function deleteUnresolvedBuildClosure(
+  db: Db,
+  buildId: string,
+  storeHashes: string[],
+): Promise<number> {
+  if (storeHashes.length === 0) return 0;
+  const result = await db.delete(buildClosure).where(and(
+    eq(buildClosure.buildId, buildId),
+    inArray(buildClosure.storeHash, storeHashes),
+    isNull(buildClosure.narKey),
+  ));
+  return result.meta.changes;
 }
 
 export async function countPendingClosureBackfills(db: Db): Promise<number> {
@@ -203,6 +251,29 @@ export async function listDeadStorePaths(
   return rows;
 }
 
+export async function listNarinfoReferences(
+  db: Db,
+  narKeys: string[],
+): Promise<Array<{
+  narKey: string;
+  storeHash: string;
+  narinfoKey: string;
+  currentNarKey: string;
+}>> {
+  if (narKeys.length === 0) return [];
+  return db
+    .select({
+      narKey: buildClosure.narKey,
+      storeHash: buildClosure.storeHash,
+      narinfoKey: storePaths.narinfoKey,
+      currentNarKey: storePaths.narKey,
+    })
+    .from(buildClosure)
+    .innerJoin(storePaths, eq(storePaths.storeHash, buildClosure.storeHash))
+    .where(inArray(buildClosure.narKey, narKeys))
+    .then((rows) => rows.flatMap((row) => row.narKey ? [{ ...row, narKey: row.narKey }] : []));
+}
+
 /**
  * NAR 削除により復元不能になる build を先に pruned として記録する。
  */
@@ -217,7 +288,7 @@ export async function markBuildsPrunedForNarKeys(
     .where(inArray(buildClosure.narKey, [...new Set(narKeys)]));
   const result = await db
     .update(builds)
-    .set({ status: "pruned" })
+    .set({ status: "pruned", restorable: 0 })
     .where(inArray(builds.id, affectedBuilds));
   return result.meta.changes;
 }

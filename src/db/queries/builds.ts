@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "../client";
 import {
   buildClosure,
@@ -69,29 +69,46 @@ export async function getManifest(
   buildId: string,
 ): Promise<(BuildManifest & { restorable: boolean }) | null> {
   const rows = await db
-    .select({ manifest: buildManifests, status: builds.status })
+    .select({
+      manifest: buildManifests,
+      status: builds.status,
+      restorable: builds.restorable,
+    })
     .from(buildManifests)
     .innerJoin(builds, eq(builds.id, buildManifests.buildId))
     .where(eq(buildManifests.buildId, buildId))
     .limit(1);
   const row = rows[0];
   if (!row) return null;
-  const closureMatchesPublishedNarinfo = await isBuildRestorable(db, buildId);
   return {
     ...row.manifest,
-    restorable: row.status !== "pruned" && closureMatchesPublishedNarinfo,
+    restorable: row.status !== "pruned" && row.restorable === 1,
   };
 }
 
 export async function isBuildRestorable(db: Db, buildId: string): Promise<boolean> {
-  const closure = await db
-    .select({ narKey: buildClosure.narKey, currentNarKey: storePaths.narKey })
-    .from(buildClosure)
-    .leftJoin(storePaths, eq(storePaths.storeHash, buildClosure.storeHash))
-    .where(eq(buildClosure.buildId, buildId));
-  return closure.every((item) =>
-    item.narKey !== null && item.currentNarKey === item.narKey
-  );
+  const rows = await db
+    .select({ restorable: builds.restorable })
+    .from(builds)
+    .where(eq(builds.id, buildId))
+    .limit(1);
+  return rows[0]?.restorable === 1;
+}
+
+export async function refreshBuildRestorable(db: Db, buildId: string): Promise<boolean> {
+  await db
+    .update(builds)
+    .set({
+      restorable: sql<number>`CASE WHEN EXISTS (
+        SELECT 1
+        FROM build_closure bc
+        LEFT JOIN store_paths sp ON sp.store_hash = bc.store_hash
+        WHERE bc.build_id = ${builds.id}
+          AND (bc.nar_key IS NULL OR sp.nar_key IS NULL OR bc.nar_key != sp.nar_key)
+      ) THEN 0 ELSE 1 END`,
+    })
+    .where(and(eq(builds.id, buildId), ne(builds.status, "pruned")));
+  return isBuildRestorable(db, buildId);
 }
 
 /**
@@ -146,6 +163,7 @@ export async function startBuild(db: Db, build: BuildMeta): Promise<{ buildId: s
       flakeLockHash: build.flakeLockHash,
       toplevelStorePath: build.toplevelStorePath,
       status: "staging",
+      restorable: 1,
       createdAt: Date.now(),
     }),
   ]);
@@ -274,7 +292,13 @@ export async function ingestStorePaths(
   // Step B: 既存 store_path の payload が変わっていれば、D1 の現行メタデータを更新する。
   for (let i = 0; i < changedExistingRows.length; i += STORE_CHUNK) {
     const chunk = changedExistingRows.slice(i, i + STORE_CHUNK);
-    const stmts = chunk.flatMap((row) => [
+    const affectedBuilds = db
+      .selectDistinct({ id: buildClosure.buildId })
+      .from(buildClosure)
+      .where(inArray(buildClosure.storeHash, chunk.map((row) => row.storeHash)));
+    const stmts = [
+      db.update(builds).set({ restorable: 0 }).where(inArray(builds.id, affectedBuilds)),
+      ...chunk.flatMap((row) => [
       db
         .insert(narFiles)
         .values({
@@ -305,7 +329,8 @@ export async function ingestStorePaths(
           target: [buildClosure.buildId, buildClosure.storeHash],
           set: { narKey: row.narKey },
         }),
-    ]);
+      ]),
+    ];
     await db.batch(stmts as unknown as Parameters<Db["batch"]>[0]);
   }
 
@@ -323,6 +348,7 @@ export async function ingestStorePaths(
     );
     await db.batch(stmts as unknown as Parameters<Db["batch"]>[0]);
   }
+  await refreshBuildRestorable(db, buildId);
 }
 
 function storePathPayloadMatches(

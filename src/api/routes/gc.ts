@@ -13,14 +13,17 @@ import {
 import { getDb } from "../../db/client";
 import {
   backfillClosureNarKeys,
+  claimUnresolvedBuildForPrune,
   computeLiveSet,
   countPendingClosureBackfills,
   confirmNarinfoDeleted,
   deleteGcMarks,
+  deleteUnresolvedBuildClosure,
   deleteLiveGcMarks,
   deleteDeadStorePaths,
   listGraceElapsedNarKeys,
   listDeadStorePaths,
+  listNarinfoReferences,
   listPendingNarinfoKeys,
   listPendingClosureBackfills,
   markBuildsPrunedForNarKeys,
@@ -152,6 +155,7 @@ gcApp.openapi(gcBackfillRoute, async (c) => {
   const pending = await listPendingClosureBackfills(db, maxRows, after);
   const errors: Array<{ build_id: string; error: string }> = [];
   let updated = 0;
+  let pruned = 0;
   const byBuild = new Map<string, typeof pending>();
   for (const row of pending) {
     const rows = byBuild.get(row.buildId) ?? [];
@@ -162,8 +166,36 @@ gcApp.openapi(gcBackfillRoute, async (c) => {
   for (const [buildId, rows] of byBuild) {
     try {
       const metadata = rows[0];
-      if (!metadata?.manifestKey || !metadata.manifestHash) {
-        throw new Error("build manifest metadata not found");
+      if (!metadata) continue;
+      if (!metadata.manifestKey || !metadata.manifestHash) {
+        const stagingStillProtected = metadata.status === "staging" &&
+          metadata.createdAt >= Date.now() - 24 * 60 * 60 * 1000;
+        if (metadata.status === "published" || stagingStillProtected) {
+          throw new Error(stagingStillProtected
+            ? "staging build has no manifest and is still protected"
+            : "published build manifest metadata not found");
+        }
+        const claimed = await claimUnresolvedBuildForPrune(
+          db,
+          buildId,
+          Date.now() - 24 * 60 * 60 * 1000,
+        );
+        if (!claimed) throw new Error("build state changed during backfill");
+
+        const recovered: Array<{ storeHash: string; narKey: string }> = [];
+        const unresolvedStoreHashes: string[] = [];
+        for (const row of rows) {
+          const narinfo = await getText(c.env, `${row.storeHash}.narinfo`);
+          const narKey = narinfo ? /^URL:\s*(\S+)\s*$/m.exec(narinfo)?.[1] : undefined;
+          if (narKey && /^nar\/[0-9a-z]+\.nar(\.(xz|zst|gz|br))?$/.test(narKey)) {
+            recovered.push({ storeHash: row.storeHash, narKey });
+          } else {
+            unresolvedStoreHashes.push(row.storeHash);
+          }
+        }
+        updated += await backfillClosureNarKeys(db, buildId, recovered);
+        pruned += await deleteUnresolvedBuildClosure(db, buildId, unresolvedStoreHashes);
+        continue;
       }
       const text = await getText(c.env, metadata.manifestKey);
       if (text === null) throw new Error("manifest object not found");
@@ -192,6 +224,7 @@ gcApp.openapi(gcBackfillRoute, async (c) => {
     ok: true as const,
     builds_processed: byBuild.size,
     closure_rows_updated: updated,
+    closure_rows_pruned: pruned,
     closure_rows_remaining: await countPendingClosureBackfills(db),
     next_cursor: pending.length === maxRows && pending.length > 0
       ? `${pending.at(-1)?.buildId}:${pending.at(-1)?.storeHash}`
@@ -221,8 +254,8 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
   const targetNarKeys = phaseCandidates.slice(0, body.max_deletes);
   // dead = store_paths が指す dead な narKey / orphan = ingest upsert で
   // 置き換わり store_paths から見えなくなった nar_files 側の残骸。
-  const processed = targetNarKeys.length;
-  const deadRemaining = Math.max(deadTotal - processed, 0);
+  let processed = targetNarKeys.length;
+  let deadRemaining = Math.max(deadTotal - processed, 0);
   const deleted = {
     kv_narinfo_attempted: 0,
     r2_narinfo_attempted: 0,
@@ -266,8 +299,49 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
     const safeNarKeys = targetNarKeys.filter((key) => stillDead.has(key));
     await deleteGcMarks(db, targetNarKeys.filter((key) => !stillDead.has(key)));
     const safeDead = await listDeadStorePaths(db, safeNarKeys);
-    const uniqueStoreHashes = [...new Set(safeDead.map((row) => row.storeHash))];
-    const uniqueNarinfoKeys = [...new Set(safeDead.map((row) => row.narinfoKey))];
+    const references = await listNarinfoReferences(db, safeNarKeys);
+    const deadStoreHashesByNarKey = new Map<string, Set<string>>();
+    for (const row of safeDead) {
+      const hashes = deadStoreHashesByNarKey.get(row.narKey) ?? new Set<string>();
+      hashes.add(row.storeHash);
+      deadStoreHashesByNarKey.set(row.narKey, hashes);
+    }
+    const referencesByNarKey = new Map<string, typeof references>();
+    for (const reference of references) {
+      const refs = referencesByNarKey.get(reference.narKey) ?? [];
+      refs.push(reference);
+      referencesByNarKey.set(reference.narKey, refs);
+    }
+    const confirmedNarKeys: string[] = [];
+    let verificationBudget = 20;
+    for (const narKey of safeNarKeys) {
+      const deadStoreHashes = deadStoreHashesByNarKey.get(narKey) ?? new Set<string>();
+      const refs = [...new Map(
+        (referencesByNarKey.get(narKey) ?? []).map((ref) => [ref.narinfoKey, ref]),
+      ).values()];
+      if (deadStoreHashes.size === 0 && refs.length === 0) continue;
+
+      let verifiedUnpublished = true;
+      for (const ref of refs) {
+        if (deadStoreHashes.has(ref.storeHash) && ref.currentNarKey === narKey) continue;
+        if (verificationBudget-- <= 0) {
+          verifiedUnpublished = false;
+          break;
+        }
+        const narinfo = await getText(c.env, ref.narinfoKey);
+        if (narinfo === null) continue;
+        const publishedNarKey = /^URL:\s*(\S+)\s*$/m.exec(narinfo)?.[1];
+        if (!publishedNarKey || publishedNarKey === narKey) {
+          verifiedUnpublished = false;
+          break;
+        }
+      }
+      if (verifiedUnpublished) confirmedNarKeys.push(narKey);
+    }
+    const confirmedSet = new Set(confirmedNarKeys);
+    const confirmedDead = safeDead.filter((row) => confirmedSet.has(row.narKey));
+    const uniqueStoreHashes = [...new Set(confirmedDead.map((row) => row.storeHash))];
+    const uniqueNarinfoKeys = [...new Set(confirmedDead.map((row) => row.narinfoKey))];
     await runWithConcurrency(
       uniqueStoreHashes,
       50,
@@ -276,7 +350,9 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
       },
     );
     await deleteObjects(c.env, uniqueNarinfoKeys);
-    await confirmNarinfoDeleted(db, safeNarKeys);
+    await confirmNarinfoDeleted(db, confirmedNarKeys);
+    processed = confirmedNarKeys.length;
+    deadRemaining = Math.max(deadTotal - processed, 0);
     deleted.kv_narinfo_attempted = uniqueStoreHashes.length;
     deleted.r2_narinfo_attempted = uniqueNarinfoKeys.length;
     // edge の narinfo（positive / negative 両エントリ）を無効化する。

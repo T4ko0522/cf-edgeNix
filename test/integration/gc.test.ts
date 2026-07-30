@@ -23,7 +23,7 @@ async function applyMigrations(db1: D1Database) {
     `CREATE INDEX IF NOT EXISTS \`idx_build_closure_store\` ON \`build_closure\` (\`store_hash\`)`,
     `CREATE TABLE IF NOT EXISTS \`build_manifests\` (\`build_id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`system\` text NOT NULL, \`git_rev\` text NOT NULL, \`flake_lock_hash\` text NOT NULL, \`toplevel_store_path\` text NOT NULL, \`closure_json_key\` text NOT NULL, \`manifest_key\` text NOT NULL, \`manifest_hash\` text NOT NULL, \`created_at\` integer NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS \`idx_build_manifests_host\` ON \`build_manifests\` (\`host\`, \`created_at\`)`,
-    `CREATE TABLE IF NOT EXISTS \`builds\` (\`id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`system\` text NOT NULL, \`git_rev\` text NOT NULL, \`flake_lock_hash\` text NOT NULL, \`toplevel_store_path\` text NOT NULL, \`status\` text DEFAULT 'staging' NOT NULL, \`retention_class\` text, \`created_at\` integer NOT NULL, \`published_at\` integer)`,
+    `CREATE TABLE IF NOT EXISTS \`builds\` (\`id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`system\` text NOT NULL, \`git_rev\` text NOT NULL, \`flake_lock_hash\` text NOT NULL, \`toplevel_store_path\` text NOT NULL, \`status\` text DEFAULT 'staging' NOT NULL, \`retention_class\` text, \`restorable\` integer DEFAULT 0 NOT NULL, \`created_at\` integer NOT NULL, \`published_at\` integer)`,
     `CREATE INDEX IF NOT EXISTS \`idx_builds_host_published\` ON \`builds\` (\`host\`, \`published_at\`)`,
     `CREATE TABLE IF NOT EXISTS \`nar_files\` (\`file_hash\` text PRIMARY KEY NOT NULL, \`nar_key\` text NOT NULL, \`file_size\` integer NOT NULL, \`compression\` text NOT NULL, \`created_at\` integer NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS \`pinned_builds\` (\`build_id\` text PRIMARY KEY NOT NULL, \`pinned_at\` integer NOT NULL, \`reason\` text)`,
@@ -329,6 +329,22 @@ async function insertOrphanState(
     `INSERT INTO build_closure (build_id, store_hash, nar_key) VALUES (?, ?, ?)`,
   ).bind(input.buildId, input.storeHash, input.liveNarKey).run();
   await db1.prepare(
+    `INSERT INTO builds (id, host, system, git_rev, flake_lock_hash, toplevel_store_path, status, created_at, published_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'failed', ?, ?)`,
+  ).bind(
+    `${input.buildId}-old`,
+    HOST,
+    "x86_64-linux",
+    `rev-${input.buildId}-old`,
+    `sha256:lock-${input.buildId}-old`,
+    `/nix/store/${input.storeHash}-pkg`,
+    now - 1,
+    now - 1,
+  ).run();
+  await db1.prepare(
+    `INSERT INTO build_closure (build_id, store_hash, nar_key) VALUES (?, ?, ?)`,
+  ).bind(`${input.buildId}-old`, input.storeHash, input.orphanNarKey).run();
+  await db1.prepare(
     `INSERT INTO store_paths (store_hash, store_path, narinfo_key, nar_key, nar_hash, nar_size, file_hash, file_size, compression, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).bind(
@@ -351,7 +367,7 @@ async function insertOrphanState(
     `INSERT INTO nar_files (file_hash, nar_key, file_size, compression, created_at)
      VALUES (?, ?, ?, ?, ?)`,
   ).bind(input.orphanFileHash, input.orphanNarKey, 2200, "zstd", now).run();
-  await eenv.NAR_BUCKET.put(`${input.storeHash}.narinfo`, "narinfo");
+  await eenv.NAR_BUCKET.put(`${input.storeHash}.narinfo`, `URL: ${input.liveNarKey}\n`);
   await eenv.NAR_BUCKET.put(input.liveNarKey, "live nar");
   await eenv.NAR_BUCKET.put(input.orphanNarKey, "orphan nar");
 }
@@ -852,6 +868,9 @@ describe("POST /api/gc/dry-run（G8）", () => {
     await db1.prepare(
       `INSERT INTO pinned_builds (build_id, pinned_at, reason) VALUES ('same-hash-old', 2000, 'keep')`,
     ).run();
+    await db1.prepare(
+      `UPDATE builds SET restorable = 0 WHERE id = 'same-hash-old'`,
+    ).run();
 
     const liveSet = await computeLiveSet(getDb(eenv), 0);
     expect(liveSet.liveNarKeys).toEqual(expect.arrayContaining([oldNarKey, newNarKey]));
@@ -931,6 +950,7 @@ describe("POST /api/gc/dry-run（G8）", () => {
       ok: true,
       builds_processed: 1,
       closure_rows_updated: 1,
+      closure_rows_pruned: 0,
       closure_rows_remaining: 0,
       next_cursor: null,
       errors: [],
@@ -939,6 +959,153 @@ describe("POST /api/gc/dry-run（G8）", () => {
       "SELECT nar_key FROM build_closure WHERE build_id = ? AND store_hash = ?",
     ).bind(buildId, deadHash).first<{ nar_key: string | null }>();
     expect(closure?.nar_key).toBe(deadNarKey);
+  });
+
+  test("manifest のない期限切れ staging closure を pruned 化して fail-closed を解除する", async () => {
+    const eenv = authedEnv();
+    const db1 = eenv.CONTROL_DB;
+    const buildId = "legacy-abandoned-staging";
+    await insertDeadStorePath(db1);
+    await db1.prepare(
+      `INSERT INTO builds (id, host, system, git_rev, flake_lock_hash, toplevel_store_path, status, restorable, created_at)
+       VALUES (?, ?, 'x86_64-linux', 'rev', 'lock', ?, 'staging', 0, ?)`,
+    ).bind(buildId, HOST, `/nix/store/${deadHash}-dead`, Date.now() - 24 * 60 * 60 * 1000 - 1).run();
+    await db1.prepare(
+      `INSERT INTO build_closure (build_id, store_hash, nar_key) VALUES (?, ?, NULL)`,
+    ).bind(buildId, deadHash).run();
+
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/backfill", { max_rows: 20 }),
+      eenv,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      builds_processed: 1,
+      closure_rows_updated: 0,
+      closure_rows_pruned: 1,
+      closure_rows_remaining: 0,
+      next_cursor: null,
+      errors: [],
+    });
+    const build = await db1.prepare("SELECT status, restorable FROM builds WHERE id = ?")
+      .bind(buildId).first<{ status: string; restorable: number }>();
+    expect(build).toEqual({ status: "pruned", restorable: 0 });
+    expect((await computeLiveSet(getDb(eenv))).deadCandidates).toContain(deadNarKey);
+  });
+
+  test("manifest のない期限切れ staging は R2 narinfo から NAR provenance を回復する", async () => {
+    const eenv = authedEnv();
+    const db1 = eenv.CONTROL_DB;
+    const buildId = "legacy-staging-with-narinfo";
+    const storeHash = "legacy01legacy01legacy01legacy01";
+    const publishedNarKey = "nar/legacyold.nar.zst";
+    const currentNarKey = "nar/legacynew.nar.zst";
+    await insertDeadStorePath(db1, {
+      storeHash,
+      narKey: currentNarKey,
+      fileHash: "sha256:" + "a".repeat(64),
+    });
+    await db1.prepare(
+      `INSERT INTO nar_files (file_hash, nar_key, file_size, compression, created_at)
+       VALUES (?, ?, 100, 'zstd', 1)`,
+    ).bind("sha256:" + "b".repeat(64), publishedNarKey).run();
+    await db1.prepare(
+      `INSERT INTO builds (id, host, system, git_rev, flake_lock_hash, toplevel_store_path, status, restorable, created_at)
+       VALUES (?, ?, 'x86_64-linux', 'rev', 'lock', ?, 'staging', 0, ?)`,
+    ).bind(buildId, HOST, `/nix/store/${storeHash}-pkg`, Date.now() - 24 * 60 * 60 * 1000 - 1).run();
+    await db1.prepare(
+      `INSERT INTO build_closure (build_id, store_hash, nar_key) VALUES (?, ?, NULL)`,
+    ).bind(buildId, storeHash).run();
+    await eenv.NAR_BUCKET.put(`${storeHash}.narinfo`, `URL: ${publishedNarKey}\n`);
+
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/backfill", { max_rows: 20 }),
+      eenv,
+    );
+    const body = await res.json() as {
+      closure_rows_updated: number;
+      closure_rows_pruned: number;
+      closure_rows_remaining: number;
+    };
+    expect(body).toEqual(expect.objectContaining({
+      closure_rows_updated: 1,
+      closure_rows_pruned: 0,
+      closure_rows_remaining: 0,
+    }));
+    const closure = await db1.prepare(
+      "SELECT nar_key FROM build_closure WHERE build_id = ? AND store_hash = ?",
+    ).bind(buildId, storeHash).first<{ nar_key: string | null }>();
+    expect(closure?.nar_key).toBe(publishedNarKey);
+    const build = await db1.prepare("SELECT status, restorable FROM builds WHERE id = ?")
+      .bind(buildId).first<{ status: string; restorable: number }>();
+    expect(build).toEqual({ status: "pruned", restorable: 0 });
+  });
+
+  test("manifest のない24時間以内の staging closure は backfill で削除しない", async () => {
+    const eenv = authedEnv();
+    const db1 = eenv.CONTROL_DB;
+    const buildId = "legacy-active-staging";
+    await insertDeadStorePath(db1);
+    await db1.prepare(
+      `INSERT INTO builds (id, host, system, git_rev, flake_lock_hash, toplevel_store_path, status, restorable, created_at)
+       VALUES (?, ?, 'x86_64-linux', 'rev', 'lock', ?, 'staging', 0, ?)`,
+    ).bind(buildId, HOST, `/nix/store/${deadHash}-dead`, Date.now()).run();
+    await db1.prepare(
+      `INSERT INTO build_closure (build_id, store_hash, nar_key) VALUES (?, ?, NULL)`,
+    ).bind(buildId, deadHash).run();
+
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/backfill", { max_rows: 20 }),
+      eenv,
+    );
+    const body = await res.json() as {
+      closure_rows_pruned: number;
+      closure_rows_remaining: number;
+      errors: Array<{ build_id: string }>;
+    };
+    expect(body.closure_rows_pruned).toBe(0);
+    expect(body.closure_rows_remaining).toBe(1);
+    expect(body.errors).toContainEqual(expect.objectContaining({ build_id: buildId }));
+    const pin = await apiApp.fetch(
+      makePatchReq(`/api/builds/${buildId}`, { pinned: true }),
+      eenv,
+    );
+    expect(pin.status).toBe(409);
+  });
+
+  test("manifest のない期限切れ staging でも既存 pin があれば prune しない", async () => {
+    const eenv = authedEnv();
+    const db1 = eenv.CONTROL_DB;
+    const buildId = "legacy-pinned-staging";
+    const storeHash = "legacypinlegacypinlegacypin0001";
+    await insertDeadStorePath(db1, { storeHash, narKey: `nar/${storeHash}.nar.zst` });
+    await db1.prepare(
+      `INSERT INTO builds (id, host, system, git_rev, flake_lock_hash, toplevel_store_path, status, restorable, created_at)
+       VALUES (?, ?, 'x86_64-linux', 'rev', 'lock', ?, 'staging', 0, ?)`,
+    ).bind(buildId, HOST, `/nix/store/${storeHash}-pkg`, Date.now() - 24 * 60 * 60 * 1000 - 1).run();
+    await db1.prepare(
+      `INSERT INTO build_closure (build_id, store_hash, nar_key) VALUES (?, ?, NULL)`,
+    ).bind(buildId, storeHash).run();
+    await db1.prepare(
+      `INSERT INTO pinned_builds (build_id, pinned_at, reason) VALUES (?, ?, 'legacy pin')`,
+    ).bind(buildId, Date.now()).run();
+
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/backfill", { max_rows: 20 }),
+      eenv,
+    );
+    const body = await res.json() as {
+      closure_rows_pruned: number;
+      closure_rows_remaining: number;
+      errors: Array<{ build_id: string }>;
+    };
+    expect(body.closure_rows_pruned).toBe(0);
+    expect(body.closure_rows_remaining).toBe(1);
+    expect(body.errors).toContainEqual(expect.objectContaining({ build_id: buildId }));
+    const build = await db1.prepare("SELECT status FROM builds WHERE id = ?")
+      .bind(buildId).first<{ status: string }>();
+    expect(build?.status).toBe("staging");
   });
 });
 
@@ -1324,8 +1491,8 @@ describe("POST /api/gc/execute", () => {
       r2_nar_attempted: 1,
       d1_store_paths: 0,
       d1_nar_files: 1,
-      d1_build_closure: 0,
-      d1_builds_pruned: 0,
+      d1_build_closure: 1,
+      d1_builds_pruned: 1,
     });
     // live 側は温存される。
     expect(await eenv.NAR_BUCKET.get(orphanLiveNarKey)).not.toBeNull();
@@ -1336,6 +1503,56 @@ describe("POST /api/gc/execute", () => {
     expect(await eenv.NAR_BUCKET.get(orphanOldNarKey)).toBeNull();
     expect(await countRows(db1, "nar_files", "nar_key", orphanOldNarKey)).toBe(0);
     expect(await countRows(db1, "nar_files", "file_hash", orphanOldFileHash)).toBe(0);
+  });
+
+  test("orphan NAR を R2 narinfo が参照中なら grace を開始しない", async () => {
+    const eenv = authedEnv();
+    const db1 = eenv.CONTROL_DB;
+    const storeHash = "orph0003orph0003orph0003orph0003";
+    const currentNarKey = "nar/orph-live-3.nar.zst";
+    const orphanNarKey = "nar/orph-old-3.nar.zst";
+    await insertOrphanState(db1, eenv, {
+      storeHash,
+      liveNarKey: currentNarKey,
+      liveFileHash: "sha256:" + "e".repeat(64),
+      orphanNarKey,
+      orphanFileHash: "sha256:" + "f".repeat(64),
+      buildId: "gc-orphan-public-reference",
+    });
+    await eenv.NAR_BUCKET.put(`${storeHash}.narinfo`, `URL: ${orphanNarKey}\n`);
+
+    const res = await apiApp.fetch(
+      makeWriteReq("/api/gc/execute", { phase: "narinfo" }),
+      eenv,
+    );
+    expect(res.status).toBe(200);
+    const mark = await db1.prepare(
+      "SELECT narinfo_deleted_at FROM gc_marks WHERE nar_key = ?",
+    ).bind(orphanNarKey).first<{ narinfo_deleted_at: number | null }>();
+    expect(mark?.narinfo_deleted_at).toBeNull();
+    expect(await eenv.NAR_BUCKET.get(orphanNarKey)).not.toBeNull();
+    expect(await eenv.NAR_BUCKET.get(`${storeHash}.narinfo`)).not.toBeNull();
+
+    await eenv.NAR_BUCKET.put(`${storeHash}.narinfo`, `URL: ${currentNarKey}\n`);
+    const retry = await apiApp.fetch(
+      makeWriteReq("/api/gc/execute", { phase: "narinfo" }),
+      eenv,
+    );
+    expect(retry.status).toBe(200);
+    const confirmedMark = await db1.prepare(
+      "SELECT narinfo_deleted_at FROM gc_marks WHERE nar_key = ?",
+    ).bind(orphanNarKey).first<{ narinfo_deleted_at: number | null }>();
+    expect(confirmedMark?.narinfo_deleted_at).not.toBeNull();
+
+    await db1.prepare("UPDATE gc_marks SET narinfo_deleted_at = ? WHERE nar_key = ?")
+      .bind(Date.now() - 60 * 60 * 1000 - 1, orphanNarKey).run();
+    const sweep = await apiApp.fetch(
+      makeWriteReq("/api/gc/execute", { phase: "nar" }),
+      eenv,
+    );
+    expect(sweep.status).toBe(200);
+    expect(await eenv.NAR_BUCKET.get(orphanNarKey)).toBeNull();
+    expect(await eenv.NAR_BUCKET.get(`${storeHash}.narinfo`)).not.toBeNull();
   });
 
   test("dead が 0 件でも 200 と削除 0 件を返す", async () => {

@@ -81,6 +81,7 @@ async function applyMigrations(db1: D1Database) {
     \`toplevel_store_path\` text NOT NULL,
     \`status\` text DEFAULT 'staging' NOT NULL,
     \`retention_class\` text,
+    \`restorable\` integer DEFAULT 0 NOT NULL,
     \`created_at\` integer NOT NULL,
     \`published_at\` integer
   );

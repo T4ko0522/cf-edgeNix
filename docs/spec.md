@@ -423,7 +423,7 @@ R2 GC対象判定
 
 GC の **削除順序** は `POST /api/gc/execute` の `phase` で実装済み: `phase=narinfo`（KV/R2 narinfo 削除、tombstone 記録、edge の `narinfo:<storeHash>` タグ purge）→ 1 時間の grace period → `phase=nar`（live-set 再検証、NAR/D1 削除、`nar:<fileName>` タグ purge）。grace は API が `gc_marks.narinfo_deleted_at` で強制する。edge purge は Workers Cache の Cache-Tag purge を使い best-effort とする（非対応プランでは negative/positive エントリが TTL で自然失効するのを待つ）。
 
-migration 前の `build_closure` は世代固有 `nar_key` を持たない。`POST /api/gc/backfill` が R2 の `manifests/<buildId>/manifest.json` から参照を復元し、未解決行が残る間は全 NAR を live とする fail-closed 動作で誤削除を防ぐ。
+migration 前の `build_closure` は世代固有 `nar_key` を持たない。`POST /api/gc/backfill` が R2 の `manifests/<buildId>/manifest.json` から参照を復元し、未解決行が残る間は全 NAR を live とする fail-closed 動作で誤削除を防ぐ。manifest が存在しない旧 staging は24時間保護し、期限切れ後に pruned 化する。build の復元可否は `builds.restorable` に永続化し、公開 manifest API で closure 全体を走査しない。
 
 live/dead 判定は `store_paths.narKey` に加えて `nar_files.narKey` も走査する。`ingest` upsert で `store_paths.narKey` が最新 NAR に置き換わった結果、`store_paths` からは参照されなくなった古い `nar_files` 行と R2 の `nar/<old-fileHash>.nar.zst` を orphan として dead 候補に含めるためである。orphan には対応する `store_paths`（したがって `storeHash` / `narinfoKey`）が無いため、`phase=narinfo` は空振りし、`phase=nar` で R2 NAR と `nar_files` 行のみが回収される。
 

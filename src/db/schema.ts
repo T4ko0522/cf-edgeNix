@@ -13,6 +13,7 @@ export const builds = sqliteTable(
       .notNull()
       .default("staging"),
     retentionClass: text("retention_class"),
+    restorable: integer("restorable").notNull().default(0),
     createdAt: integer("created_at").notNull(),
     publishedAt: integer("published_at"),
   },
@@ -52,6 +53,7 @@ export const buildClosure = sqliteTable(
   (t) => [
     primaryKey({ columns: [t.buildId, t.storeHash] }),
     index("idx_build_closure_store").on(t.storeHash),
+    index("idx_build_closure_nar").on(t.narKey),
   ],
 );
 

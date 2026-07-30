@@ -52,6 +52,7 @@ export const GcBackfillResponseSchema = z.object({
   ok: z.literal(true),
   builds_processed: z.number().int().nonnegative(),
   closure_rows_updated: z.number().int().nonnegative(),
+  closure_rows_pruned: z.number().int().nonnegative(),
   closure_rows_remaining: z.number().int().nonnegative(),
   next_cursor: z.string().nullable(),
   errors: z.array(z.object({ build_id: z.string(), error: z.string() })),
