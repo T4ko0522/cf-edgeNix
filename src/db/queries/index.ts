@@ -12,6 +12,7 @@ export {
   getLatestBuild,
   getManifest,
   ingestStorePaths,
+  isBuildRestorable,
   listBuilds,
   listClosurePurgeTargets,
   registerRollbackRoot,
@@ -19,10 +20,20 @@ export {
 } from "./builds";
 export type { Build, BuildManifest } from "./builds";
 export {
+  backfillClosureNarKeys,
   computeLiveSet,
+  confirmNarinfoDeleted,
+  countPendingClosureBackfills,
+  deleteGcMarks,
+  deleteLiveGcMarks,
   deleteDeadStorePaths,
+  listGraceElapsedNarKeys,
   listDeadStorePaths,
   listOrphanedNarFiles,
+  listPendingClosureBackfills,
+  listPendingNarinfoKeys,
+  markBuildsPrunedForNarKeys,
+  markGcCandidates,
   pinBuild,
   unpinBuild,
 } from "./gc";

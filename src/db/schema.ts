@@ -9,7 +9,7 @@ export const builds = sqliteTable(
     gitRev: text("git_rev").notNull(),
     flakeLockHash: text("flake_lock_hash").notNull(),
     toplevelStorePath: text("toplevel_store_path").notNull(),
-    status: text("status", { enum: ["staging", "published", "failed"] })
+    status: text("status", { enum: ["staging", "published", "failed", "pruned"] })
       .notNull()
       .default("staging"),
     retentionClass: text("retention_class"),
@@ -46,6 +46,8 @@ export const buildClosure = sqliteTable(
   {
     buildId: text("build_id").notNull(),
     storeHash: text("store_hash").notNull(),
+    // Nullable only for rows created before migration 0003. GC fails closed until backfilled.
+    narKey: text("nar_key"),
   },
   (t) => [
     primaryKey({ columns: [t.buildId, t.storeHash] }),
@@ -67,6 +69,12 @@ export const pinnedBuilds = sqliteTable("pinned_builds", {
   buildId: text("build_id").primaryKey(),
   pinnedAt: integer("pinned_at").notNull(),
   reason: text("reason"),
+});
+
+export const gcMarks = sqliteTable("gc_marks", {
+  narKey: text("nar_key").primaryKey(),
+  markedAt: integer("marked_at").notNull(),
+  narinfoDeletedAt: integer("narinfo_deleted_at"),
 });
 
 export const buildManifests = sqliteTable(

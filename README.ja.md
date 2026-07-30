@@ -54,7 +54,7 @@ flowchart LR
     W -. warm .-> KV[(KV)]
 ```
 
-`latest` を動かすのは `start → ingest × N → finalize` の 1 ルートのみ。  
+`latest` を動かすのは `start → ingest × N → R2 upload → finalize` の 1 ルートのみ。staging closure を R2 操作より先に登録し、GC と publish の競合を防ぐ。
 NAR upload → narinfo upload → D1 確定 → KV warming の順で `scripts/publish.ts` が保証し、`test/publish/order.test.ts` で assert している。
 
 ### Deploy path
@@ -83,7 +83,7 @@ Workers Builds が push のたびに `wrangler d1 migrations apply --remote && w
 - `staging → ingest → finalize` の 3 段 publish、finalize が 1 つの `db.batch()` で `latest` を atomic に更新
 - 決定論的 `build_id` = `sha256(host:system:gitRev:flakeLockHash:toplevelStorePath)[:36]` — 再実行は冪等
 - host ごとの build 履歴 + rollback root 登録
-- rollback root から到達不能な NAR を返す GC dry-run
+- host ごとの最新 3 世代と pin / rollback root を保持し、narinfo 非公開化から NAR 削除まで 1 時間の猶予を強制する世代 GC
 
 ### Edge & cost
 

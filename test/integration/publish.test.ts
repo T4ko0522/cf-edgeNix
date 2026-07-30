@@ -55,6 +55,7 @@ async function applyMigrations(db1: D1Database) {
   const sql = `CREATE TABLE IF NOT EXISTS \`build_closure\` (
     \`build_id\` text NOT NULL,
     \`store_hash\` text NOT NULL,
+    \`nar_key\` text,
     PRIMARY KEY(\`build_id\`, \`store_hash\`)
   );
   CREATE INDEX IF NOT EXISTS \`idx_build_closure_store\` ON \`build_closure\` (\`store_hash\`);
@@ -90,6 +91,11 @@ async function applyMigrations(db1: D1Database) {
     \`file_size\` integer NOT NULL,
     \`compression\` text NOT NULL,
     \`created_at\` integer NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS \`gc_marks\` (
+    \`nar_key\` text PRIMARY KEY NOT NULL,
+    \`marked_at\` integer NOT NULL,
+    \`narinfo_deleted_at\` integer
   );
   CREATE TABLE IF NOT EXISTS \`rollback_roots\` (
     \`id\` text PRIMARY KEY NOT NULL,

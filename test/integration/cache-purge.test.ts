@@ -73,11 +73,12 @@ const DEAD_NAR_KEY = `nar/${DEAD_NAR_FILE}`;
 
 async function applyMigrations(db1: D1Database) {
   const stmts = [
-    `CREATE TABLE IF NOT EXISTS \`build_closure\` (\`build_id\` text NOT NULL, \`store_hash\` text NOT NULL, PRIMARY KEY(\`build_id\`, \`store_hash\`))`,
+    `CREATE TABLE IF NOT EXISTS \`build_closure\` (\`build_id\` text NOT NULL, \`store_hash\` text NOT NULL, \`nar_key\` text, PRIMARY KEY(\`build_id\`, \`store_hash\`))`,
     `CREATE TABLE IF NOT EXISTS \`build_manifests\` (\`build_id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`system\` text NOT NULL, \`git_rev\` text NOT NULL, \`flake_lock_hash\` text NOT NULL, \`toplevel_store_path\` text NOT NULL, \`closure_json_key\` text NOT NULL, \`manifest_key\` text NOT NULL, \`manifest_hash\` text NOT NULL, \`created_at\` integer NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS \`builds\` (\`id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`system\` text NOT NULL, \`git_rev\` text NOT NULL, \`flake_lock_hash\` text NOT NULL, \`toplevel_store_path\` text NOT NULL, \`status\` text DEFAULT 'staging' NOT NULL, \`retention_class\` text, \`created_at\` integer NOT NULL, \`published_at\` integer)`,
     `CREATE TABLE IF NOT EXISTS \`nar_files\` (\`file_hash\` text PRIMARY KEY NOT NULL, \`nar_key\` text NOT NULL, \`file_size\` integer NOT NULL, \`compression\` text NOT NULL, \`created_at\` integer NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS \`pinned_builds\` (\`build_id\` text PRIMARY KEY NOT NULL, \`pinned_at\` integer NOT NULL, \`reason\` text)`,
+    `CREATE TABLE IF NOT EXISTS \`gc_marks\` (\`nar_key\` text PRIMARY KEY NOT NULL, \`marked_at\` integer NOT NULL, \`narinfo_deleted_at\` integer)`,
     `CREATE TABLE IF NOT EXISTS \`rollback_roots\` (\`id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`build_id\` text NOT NULL, \`reason\` text, \`pinned\` integer DEFAULT 0 NOT NULL, \`keep_until\` integer, \`created_at\` integer NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS \`store_paths\` (\`store_hash\` text PRIMARY KEY NOT NULL, \`store_path\` text NOT NULL, \`narinfo_key\` text NOT NULL, \`nar_key\` text NOT NULL, \`nar_hash\` text NOT NULL, \`nar_size\` integer NOT NULL, \`file_hash\` text NOT NULL, \`file_size\` integer NOT NULL, \`compression\` text NOT NULL, \`first_seen_build_id\` text, \`created_at\` integer NOT NULL)`,
   ];
@@ -92,6 +93,7 @@ async function cleanupTables(db1: D1Database) {
     "build_manifests",
     "nar_files",
     "pinned_builds",
+    "gc_marks",
     "rollback_roots",
     "store_paths",
     "builds",
@@ -198,6 +200,10 @@ describe("GC execute の edge purge", () => {
     const eenv = authedEnv();
     await insertDeadStorePath(eenv.CONTROL_DB);
     await putDeadObjects(eenv);
+    const elapsed = Date.now() - 60 * 60 * 1000 - 1;
+    await eenv.CONTROL_DB.prepare(
+      "INSERT INTO gc_marks (nar_key, marked_at, narinfo_deleted_at) VALUES (?, ?, ?)",
+    ).bind(DEAD_NAR_KEY, elapsed, elapsed).run();
     const { ctx, purgedTags, flush } = makePurgeCtx();
 
     const res = await apiApp.fetch(
@@ -219,7 +225,7 @@ describe("GC execute の edge purge", () => {
     await putDeadObjects(eenv);
 
     const res = await apiApp.fetch(
-      makeWriteReq("/api/gc/execute", { phase: "all" }),
+      makeWriteReq("/api/gc/execute", { phase: "narinfo" }),
       eenv,
       makePlainCtx(),
     );
@@ -239,7 +245,7 @@ describe("GC execute の edge purge", () => {
     const { ctx, purgedTags, flush } = makePurgeCtx();
 
     const res = await apiApp.fetch(
-      makeWriteReq("/api/gc/execute", { phase: "all", dry_run: true }),
+      makeWriteReq("/api/gc/execute", { phase: "narinfo", dry_run: true }),
       eenv,
       ctx,
     );

@@ -9,14 +9,16 @@ Worker が公開する HTTP エンドポイント一覧。OpenAPI スキーマ�
 | GET/HEAD | `/nar/<file-hash>.nar.zst` | 不要 | NAR 本体（Range: bytes=... / 206 対応・Workers Cache → R2 streaming） |
 | GET | `/api/hosts/:host/latest` | 不要 | host の latest published build |
 | GET | `/api/hosts/:host/builds` | 不要 | build 履歴 |
-| GET | `/api/builds/:id/manifest.json` | 不要 | 復元用 manifest |
+| GET | `/api/builds/:id/manifest.json` | 不要 | 復元用 manifest（削除済み世代は `restorable: false`） |
 | GET | `/api/quota/status` | 不要 | R2 無料枠 kill-switch の現在 state |
 | GET | `/api/quota/metrics` | Bearer | R2 無料枠 kill-switch の詳細 metrics |
 | POST | `/api/publish/start` | Bearer | staging build 作成（latest 不変） |
-| POST | `/api/publish/:build_id/ingest` | Bearer | store_paths を chunk 分割で upsert |
+| POST | `/api/publish/:build_id/ingest` | Bearer | store_paths を最大15件ずつ upsert |
 | POST | `/api/publish/:build_id/finalize` | Bearer | D1 published 確定 + latest 更新（1 batch） |
 | POST | `/api/hosts/:host/rollback` | Bearer | rollback root 登録 |
 | POST | `/api/gc/dry-run` | Bearer | GC live-set 計算（削除はしない） |
+| POST | `/api/gc/backfill` | Bearer | 旧 closure の世代固有 NAR 参照を R2 manifest から復元 |
+| POST | `/api/gc/execute` | Bearer | `narinfo` 非公開化または grace 経過済み NAR の物理削除 |
 | POST | `/api/quota/reset` | Bearer | kill-switch state を `ok` に手動解除 |
 | GET | `/api/openapi.json` | 不要 | OpenAPI 3.0 スキーマ |
 

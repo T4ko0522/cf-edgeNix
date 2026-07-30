@@ -3,7 +3,13 @@ import { BuildNotFoundError, PublishConflictError } from "../db/queries";
 export function errorStatus(err: unknown): 400 | 404 | 409 | 500 {
   if (err instanceof PublishConflictError) return 409;
   if (err instanceof BuildNotFoundError) return 404;
+  if (isGcTriggerConflict(err)) return 409;
   return 500;
+}
+
+function isGcTriggerConflict(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes("pending GC");
 }
 
 /**
@@ -14,6 +20,7 @@ export function errorStatus(err: unknown): 400 | 404 | 409 | 500 {
 export function errorMessage(err: unknown): string {
   if (err instanceof PublishConflictError) return err.message;
   if (err instanceof BuildNotFoundError) return err.message;
+  if (isGcTriggerConflict(err)) return "resource is pending GC";
   return "internal server error";
 }
 

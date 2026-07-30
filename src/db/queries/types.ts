@@ -43,6 +43,7 @@ export interface RollbackRootInput {
 
 export interface LiveSet {
   liveNarKeys: string[];
+  liveStoreHashes: string[];
   deadCandidates: string[];
 }
 

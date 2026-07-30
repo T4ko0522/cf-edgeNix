@@ -350,7 +350,7 @@ D1は以下を管理する。
 
 * buildの成功履歴と hostごとの latest build（正本）
 * rollback可能なbuild / 手動pinされた安定世代
-* 過去世代を remote から復元するための manifest（`build_manifests`）
+* 過去世代を remote から復元するための manifest（`build_manifests`、GC 済み世代は `restorable: false`）
 * GCしてよい / 守るべき R2 object の判定（live set）
 * system closure のうち **自前 R2 で配信している store path 一覧**（cache.nixos.org など upstream にあって R2 に上げていない path は含まない。Nix client 側で extra-substituters により upstream に fall back する前提）
 
@@ -366,7 +366,7 @@ GET /api/builds/<build_id>/manifest.json
 
 なお manifest 自体には署名を付けない（決定）。理由と、将来 public cache 化する場合に署名 + freshness を再検討する判断軸は `fixme.md` を参照。
 
-> GC の削除順序は本 spec では未確定。`fixme.md` を参照。
+GC は narinfo の非公開化、1 時間の grace、live-set 再検証、NAR の物理削除の順で実行する。詳細は §8 と `docs/publish.md` を参照。
 
 ---
 
@@ -405,14 +405,14 @@ delete candidates:
 重要なのは、R2 objectを単純に日付で削除しないこと。
 Nix store pathは世代間で共有されるため、古いbuild由来に見えるNARが最新buildでも必要な場合がある。
 
-そのため、D1上のrollback rootsから到達可能なclosureをlive setとして扱い、mark-and-sweep方式でGCする。
+そのため、D1 上の host ごとの最新 3 published build、pin、rollback root、24 時間以内の staging build から到達可能な closure を live set として扱い、mark-and-sweep 方式で GC する。
 
 ```text
 rollback_roots
   ↓
 builds
   ↓
-build_closure
+build_closure（世代固有 nar_key）
   ↓
 live nar keys
   ↓
@@ -421,7 +421,9 @@ R2 GC対象判定
 
 これにより、binary cacheを単なる高速化基盤ではなく、復旧可能な環境配布基盤として扱える。
 
-GC の **削除順序** は `POST /api/gc/execute` の `phase` で実装済み: `phase=narinfo`（KV/R2 narinfo 削除 + edge の `narinfo:<storeHash>` タグ purge）→ grace period（運用で確保）→ `phase=nar`（NAR/D1 削除 + `nar:<fileName>` タグ purge）。edge purge は Workers Cache の Cache-Tag purge を使い best-effort とする（非対応プランでは negative/positive エントリが TTL で自然失効するのを待つ）。
+GC の **削除順序** は `POST /api/gc/execute` の `phase` で実装済み: `phase=narinfo`（KV/R2 narinfo 削除、tombstone 記録、edge の `narinfo:<storeHash>` タグ purge）→ 1 時間の grace period → `phase=nar`（live-set 再検証、NAR/D1 削除、`nar:<fileName>` タグ purge）。grace は API が `gc_marks.narinfo_deleted_at` で強制する。edge purge は Workers Cache の Cache-Tag purge を使い best-effort とする（非対応プランでは negative/positive エントリが TTL で自然失効するのを待つ）。
+
+migration 前の `build_closure` は世代固有 `nar_key` を持たない。`POST /api/gc/backfill` が R2 の `manifests/<buildId>/manifest.json` から参照を復元し、未解決行が残る間は全 NAR を live とする fail-closed 動作で誤削除を防ぐ。
 
 live/dead 判定は `store_paths.narKey` に加えて `nar_files.narKey` も走査する。`ingest` upsert で `store_paths.narKey` が最新 NAR に置き換わった結果、`store_paths` からは参照されなくなった古い `nar_files` 行と R2 の `nar/<old-fileHash>.nar.zst` を orphan として dead 候補に含めるためである。orphan には対応する `store_paths`（したがって `storeHash` / `narinfoKey`）が無いため、`phase=narinfo` は空振りし、`phase=nar` で R2 NAR と `nar_files` 行のみが回収される。
 
@@ -561,10 +563,12 @@ GET  /api/builds/:id/manifest.json        read  復元用 manifest
 GET  /api/openapi.json                    read  OpenAPI 3.0 スキーマ（hono/zod-openapi 自動生成・認証不要）
 
 POST /api/publish/start                   write  staging build 作成（latest 不変）
-POST /api/publish/:build_id/ingest        write  store_paths を chunk 分割で upsert
+POST /api/publish/:build_id/ingest        write  store_paths を最大15件ずつ upsert
 POST /api/publish/:build_id/finalize      write  D1 published 確定 + latest 更新（1 batch）
 POST /api/hosts/:host/rollback            write  rollback root 登録
 POST /api/gc/dry-run                      write  GC live-set 計算（実削除はしない）
+POST /api/gc/backfill                     write  旧 closure の世代固有 NAR 参照を復元
+POST /api/gc/execute                      write  narinfo 非公開化 / grace 後の NAR 削除
 ```
 
 ---
