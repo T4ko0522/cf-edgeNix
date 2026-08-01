@@ -24,39 +24,43 @@
 #      実 nixosConfigurations 名に置き換える
 #   2. cf-edgeNix の checkout ref を最新の commit SHA に pin する
 #      （branch tip 追従だと上流 commit が即座に secret を持った状態で実行されてしまう）
-#   3. push.branches を実 default branch に合わせる（main / master 等）
+#   3. 自動実行したい場合は、別 workflow から workflow_call で呼び出す
 #
 # ── 動作概要 ────────────────────────────────────────────────────────
 #   - 呼び出し側 repo (flake source) を CWD に、cf-edgeNix を .cf-edgenix/ に checkout
 #   - /nix/store と bun install を cache し再ラン時のビルドを短縮
-#   - host を 1 つの job 内で直列に publish（content-addressed なので衝突せず、
-#     かつ /nix/store の共通依存が host 間で自然に再利用される）
+#   - 全 host を 1 回の publish.sh で build/copy し、共有 closure を重複処理しない
 #   - bash .cf-edgenix/scripts/publish.sh が
 #       nix build .#nixosConfigurations.<HOST>...
 #       nix copy --to file://$CACHE_DIR (署名)
 #       bash scripts/prune-upstream.sh (cache.nixos.org にある path を除外)
 #       bun publish.ts → R2 (S3 API) / KV bulk へ反映
 #     を順に実行する
-#   - 1 host が失敗しても残りを試行し、最後に集約して exit する
+#   - host 指定時も同じ batch 経路を単一引数で実行する
 #   - SKIP_UPSTREAM_PRUNE=1 / UPSTREAM_CACHE_URL=... で prune 挙動を制御可能 (docs/publish.md)
 
 name: publish-cache
 
 on:
+  workflow_call:
+    inputs:
+      host:
+        description: "対象 host を 1 つだけ指定したい場合（空なら全 host）"
+        required: false
+        type: string
   workflow_dispatch:
     inputs:
       host:
         description: "対象 host を 1 つだけ指定したい場合（空なら全 host）"
         required: false
         type: string
-  push:
-    branches: [main]
 
 concurrency:
   group: publish-cache-${{ github.ref }}
   cancel-in-progress: false
 
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
   publish:
@@ -79,7 +83,8 @@ jobs:
           ref: REPLACE_WITH_CF_EDGENIX_COMMIT_SHA # 最新の main commit SHA に書き換える
           path: .cf-edgenix
 
-      # workflow_dispatch.inputs.host が空なら全 host、指定があれば allowlist 内のもののみ。
+      # workflow_call / workflow_dispatch の host が空なら全 host、指定があれば
+      # allowlist 内のもののみ。
       # allowlist と default list を実 nixosConfigurations 名に書き換える。
       - name: Resolve target hosts
         id: hosts
@@ -144,39 +149,23 @@ jobs:
       # CWD は flake source のまま、scripts は .cf-edgenix/scripts/ から起動する。
       # publish.sh は CWD の flake に対して nix build を走らせるので、
       # 呼び出し側 repo の nixosConfigurations.<HOST> がビルドされる。
-      # closure.json は CWD に書き出され publish.ts が CWD から読む（整合）。
-      #
-      # 各 host を順次 publish。publish.sh は 1 host 単位の API なので loop で回す。
-      # 1 host 目で /nix/store に乗った共通依存は 2 host 目でそのまま再利用される。
-      # 1 host が失敗しても残りを試行し、最後に集約して exit する。
-      - name: Build, sign & publish (each host)
+      # publish.sh が全 host をまとめて build/copy/prune/upload する。
+      - name: Build, sign & publish
         env:
           HOSTS: ${{ steps.hosts.outputs.list }}
+          CACHE_DIR: ${{ runner.temp }}/cf-edgenix-cache
           CACHE_PRIVATE_KEY: ${{ secrets.CACHE_PRIVATE_KEY }}
           API_BASE_URL: ${{ vars.API_BASE_URL }}
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
           KV_NAMESPACE_ID: ${{ vars.KV_NAMESPACE_ID }}
           GIT_REV: ${{ github.sha }}
-          SYSTEM: x86_64-linux
           FLAKE_LOCK_HASH: ${{ hashFiles('flake.lock') }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
-          failed=()
-          for host in $HOSTS; do
-            echo "::group::publish $host"
-            export HOST="$host"
-            export CACHE_DIR="${RUNNER_TEMP}/cache-${host}"
-            mkdir -p "$CACHE_DIR"
-            if ! bash .cf-edgenix/scripts/publish.sh; then
-              failed+=("$host")
-            fi
-            echo "::endgroup::"
-          done
-          if [ ${#failed[@]} -ne 0 ]; then
-            echo "failed hosts: ${failed[*]}" >&2
-            exit 1
-          fi
+          mkdir -p "$CACHE_DIR"
+          read -r -a hosts <<< "$HOSTS"
+          bash .cf-edgenix/scripts/publish.sh "${hosts[@]}"

@@ -5,20 +5,21 @@
  * cf-edgeNix の publish オーケストレーションスクリプト。
  * nix copy が生成したローカル binary cache を R2/D1/KV へ反映する。
  *
- * 実行順序（受入 A2）:
- *   1. closure.json / manifest.json を R2 に put（G5）
- *   2. NAR upload (R2) — HEAD で既存スキップ＋並列 PUT（content-addressed・冪等）
- *   3. narinfo upload (R2) — 並列 PUT
- *   4. D1 確定 (POST /api/publish/{start,ingest,finalize})
- *   5. KV warming (最後・失敗は警告のみ) — KV Bulk API で 1 リクエスト最大 5000 件
+ * batch 実行順序:
+ *   1. 全 host の D1 start / ingest
+ *   2. host 別 closure.json / manifest.json
+ *   3. NAR upload（全 host の和集合、narKey で重複排除）
+ *   4. narinfo upload（storeHash で重複排除）
+ *   5. host 別 finalize
+ *   6. KV warming（和集合に対して一度、失敗は警告のみ）
  *
  * R2 へは S3 互換 API を直接叩く (UNSIGNED-PAYLOAD で SigV4 署名)。
  * `bunx wrangler` の起動コスト (~1s/回) を排除し、ファイルあたり数十 ms に落とす。
  *
+ * CLI:
+ *   --plan <path>         秘密情報を含まない version 1 publish plan
+ *
  * 必要な env:
- *   HOST                  対象 nixosConfiguration 名
- *   CACHE_DIR             nix copy の出力先ディレクトリ
- *   TOPLEVEL_STORE_PATH   toplevel store path（publish.sh から渡す）
  *   API_BASE_URL          Worker の URL (例: https://cache.example.com)
  *   ADMIN_TOKEN           管理API の Bearer トークン
  *   CLOUDFLARE_ACCOUNT_ID CF アカウント ID
@@ -31,7 +32,7 @@
 
 /// <reference types="@types/bun" />
 import { readdir, readFile, writeFile } from "fs/promises";
-import { resolve, join } from "path";
+import { isAbsolute, resolve, join } from "path";
 import { createHash, createHmac } from "crypto";
 
 // ─── 型定義 ───────────────────────────────────────────────────────────────────
@@ -67,6 +68,116 @@ export interface ManifestMeta {
   gitRev: string;
   flakeLockHash: string;
   toplevelStorePath: string;
+}
+
+export interface PublishPlanTarget {
+  host: string;
+  system: string;
+  gitRev: string;
+  flakeLockHash: string;
+  toplevelStorePath: string;
+  closureJsonPath: string;
+  closureStorePaths: string[];
+}
+
+export interface PublishPlan {
+  version: 1;
+  cacheDir: string;
+  targets: PublishPlanTarget[];
+}
+
+export interface PublishEnv {
+  apiBaseUrl: string;
+  adminToken: string;
+  r2BucketName: string;
+  kvNamespaceId: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requiredString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${label} must be a non-empty string`);
+  }
+  return value;
+}
+
+function assertExactKeys(
+  value: Record<string, unknown>,
+  allowed: ReadonlyArray<string>,
+  label: string,
+): void {
+  const allowedSet = new Set(allowed);
+  const unknown = Object.keys(value).filter((key) => !allowedSet.has(key));
+  if (unknown.length > 0) {
+    throw new Error(`${label} contains unknown fields: ${unknown.join(", ")}`);
+  }
+}
+
+export function parsePublishPlan(value: unknown): PublishPlan {
+  if (!isRecord(value)) throw new Error("publish plan must be an object");
+  assertExactKeys(value, ["version", "cacheDir", "targets"], "publish plan");
+  if (value["version"] !== 1) throw new Error("publish plan version must be 1");
+  const cacheDir = requiredString(value["cacheDir"], "cacheDir");
+  if (!isAbsolute(cacheDir)) throw new Error("cacheDir must be absolute");
+  if (!Array.isArray(value["targets"]) || value["targets"].length === 0) {
+    throw new Error("targets must be a non-empty array");
+  }
+
+  const hosts = new Set<string>();
+  const targets = value["targets"].map((raw, index): PublishPlanTarget => {
+    if (!isRecord(raw)) throw new Error(`targets[${index}] must be an object`);
+    assertExactKeys(raw, [
+      "host", "system", "gitRev", "flakeLockHash", "toplevelStorePath",
+      "closureJsonPath", "closureStorePaths",
+    ], `targets[${index}]`);
+    const host = requiredString(raw["host"], `targets[${index}].host`);
+    if (!/^[A-Za-z0-9._-]+$/.test(host)) {
+      throw new Error(`targets[${index}].host is invalid`);
+    }
+    if (hosts.has(host)) throw new Error(`duplicate host: ${host}`);
+    hosts.add(host);
+
+    const toplevelStorePath = requiredString(raw["toplevelStorePath"], `targets[${index}].toplevelStorePath`);
+    if (!toplevelStorePath.startsWith("/nix/store/")) {
+      throw new Error(`targets[${index}].toplevelStorePath must be a Nix store path`);
+    }
+    const closureJsonPath = requiredString(raw["closureJsonPath"], `targets[${index}].closureJsonPath`);
+    if (!isAbsolute(closureJsonPath)) {
+      throw new Error(`targets[${index}].closureJsonPath must be absolute`);
+    }
+    if (!Array.isArray(raw["closureStorePaths"])) {
+      throw new Error(`targets[${index}].closureStorePaths must be an array`);
+    }
+    const closureStorePaths = raw["closureStorePaths"].map((path, pathIndex) => {
+      const parsed = requiredString(path, `targets[${index}].closureStorePaths[${pathIndex}]`);
+      if (!parsed.startsWith("/nix/store/")) {
+        throw new Error(`targets[${index}].closureStorePaths[${pathIndex}] must be a Nix store path`);
+      }
+      return parsed;
+    });
+    if (new Set(closureStorePaths).size !== closureStorePaths.length) {
+      throw new Error(`targets[${index}].closureStorePaths contains duplicates`);
+    }
+    const system = requiredString(raw["system"], `targets[${index}].system`);
+    const gitRev = requiredString(raw["gitRev"], `targets[${index}].gitRev`);
+    const flakeLockHash = requiredString(raw["flakeLockHash"], `targets[${index}].flakeLockHash`);
+    if (system.length > 64 || gitRev.length > 512 || flakeLockHash.length > 512) {
+      throw new Error(`targets[${index}] metadata exceeds API limits`);
+    }
+    return {
+      host,
+      system,
+      gitRev,
+      flakeLockHash,
+      toplevelStorePath,
+      closureJsonPath,
+      closureStorePaths,
+    };
+  });
+  return { version: 1, cacheDir, targets };
 }
 
 // ─── exec アダプタ（テスト時モック可能） ─────────────────────────────────────
@@ -548,6 +659,146 @@ const D1_INGEST_CHUNK = 15;
 const HEAD_CONCURRENCY = 32;
 const R2_PUT_CONCURRENCY = 24;
 
+function buildIdFor(target: PublishPlanTarget): string {
+  const input = `${target.host}:${target.system}:${target.gitRev}:${target.flakeLockHash}:${target.toplevelStorePath}`;
+  return createHash("sha256").update(input).digest("hex").slice(0, 36);
+}
+
+async function readCacheNarinfos(cacheDir: string): Promise<NarinfoMeta[]> {
+  const files = await readdir(cacheDir);
+  const narinfos: NarinfoMeta[] = [];
+  for (const file of files.filter((name) => name.endsWith(".narinfo")).sort()) {
+    narinfos.push(parseNarinfo(await readFile(join(cacheDir, file), "utf-8")));
+  }
+  return narinfos;
+}
+
+export async function publishBatch(
+  plan: PublishPlan,
+  env: PublishEnv,
+  exec: ExecAdapter,
+): Promise<void> {
+  const narinfos = await readCacheNarinfos(plan.cacheDir);
+  const narinfoByStorePath = new Map<string, NarinfoMeta>();
+  const narinfoByStoreHash = new Map<string, NarinfoMeta>();
+  for (const narinfo of narinfos) {
+    if (narinfoByStorePath.has(narinfo.storePath)) {
+      throw new Error(`duplicate narinfo StorePath: ${narinfo.storePath}`);
+    }
+    const sameHash = narinfoByStoreHash.get(narinfo.storeHash);
+    if (sameHash && sameHash.storePath !== narinfo.storePath) {
+      throw new Error(`conflicting narinfo storeHash: ${narinfo.storeHash}`);
+    }
+    narinfoByStorePath.set(narinfo.storePath, narinfo);
+    narinfoByStoreHash.set(narinfo.storeHash, narinfo);
+  }
+
+  const createdAt = Date.now();
+  const targets = plan.targets.map((target) => {
+    const buildMeta: BuildMeta = {
+      id: buildIdFor(target),
+      host: target.host,
+      system: target.system,
+      gitRev: target.gitRev,
+      flakeLockHash: target.flakeLockHash,
+      toplevelStorePath: target.toplevelStorePath,
+      createdAt,
+    };
+    const targetNarinfos = target.closureStorePaths.flatMap((storePath) => {
+      const narinfo = narinfoByStorePath.get(storePath);
+      return narinfo ? [narinfo] : [];
+    });
+    return { target, buildMeta, narinfos: targetNarinfos, confirmedBuildId: "" };
+  });
+
+  const apiBase = env.apiBaseUrl.replace(/\/$/, "");
+  for (const state of targets) {
+    const start = (await exec.apiPost(
+      `${apiBase}/api/publish/start`,
+      env.adminToken,
+      { build: state.buildMeta },
+    )) as { build_id: string };
+    state.confirmedBuildId = start.build_id;
+    for (let i = 0; i < state.narinfos.length; i += D1_INGEST_CHUNK) {
+      await exec.apiPost(
+        `${apiBase}/api/publish/${state.confirmedBuildId}/ingest`,
+        env.adminToken,
+        { storePaths: state.narinfos.slice(i, i + D1_INGEST_CHUNK) },
+      );
+    }
+  }
+
+  const manifests = new Map<string, ManifestMeta>();
+  for (const state of targets) {
+    const buildId = state.buildMeta.id;
+    const closureJsonKey = `manifests/${buildId}/closure.json`;
+    const manifestKey = `manifests/${buildId}/manifest.json`;
+    await exec.r2Put(env.r2BucketName, closureJsonKey, state.target.closureJsonPath);
+    const manifestJson = buildManifestJson({
+      buildId,
+      host: state.buildMeta.host,
+      system: state.buildMeta.system,
+      gitRev: state.buildMeta.gitRev,
+      flakeLockHash: state.buildMeta.flakeLockHash,
+      toplevelStorePath: state.buildMeta.toplevelStorePath,
+      narinfos: state.narinfos,
+      closureJsonKey,
+    });
+    await exec.r2PutContent(env.r2BucketName, manifestKey, manifestJson);
+    manifests.set(buildId, {
+      closureJsonKey,
+      manifestKey,
+      manifestHash: sha256HexPrefixed(manifestJson),
+      host: state.buildMeta.host,
+      system: state.buildMeta.system,
+      gitRev: state.buildMeta.gitRev,
+      flakeLockHash: state.buildMeta.flakeLockHash,
+      toplevelStorePath: state.buildMeta.toplevelStorePath,
+    });
+  }
+
+  const uploadNarinfos = new Map<string, NarinfoMeta>();
+  for (const state of targets) {
+    for (const narinfo of state.narinfos) uploadNarinfos.set(narinfo.storeHash, narinfo);
+  }
+  const uniqueNarKeys = new Set([...uploadNarinfos.values()].map((narinfo) => narinfo.narKey));
+  const missingNarKeys: string[] = [];
+  await runPool([...uniqueNarKeys], HEAD_CONCURRENCY, async (key) => {
+    if (!(await exec.r2Has(env.r2BucketName, key))) missingNarKeys.push(key);
+  });
+  await runPool(missingNarKeys, R2_PUT_CONCURRENCY, async (key) => {
+    await exec.r2Put(env.r2BucketName, key, resolve(plan.cacheDir, key));
+  });
+  await runPool([...uploadNarinfos.values()], R2_PUT_CONCURRENCY, async (narinfo) => {
+    await exec.r2Put(
+      env.r2BucketName,
+      narinfo.narinfoKey,
+      resolve(plan.cacheDir, `${narinfo.storeHash}.narinfo`),
+    );
+  });
+
+  for (const state of targets) {
+    await exec.apiPost(
+      `${apiBase}/api/publish/${state.confirmedBuildId}/finalize`,
+      env.adminToken,
+      { manifest: manifests.get(state.buildMeta.id) },
+    );
+  }
+
+  try {
+    const items: Array<{ key: string; value: string }> = [];
+    for (const narinfo of uploadNarinfos.values()) {
+      items.push({
+        key: `narinfo:${narinfo.storeHash}`,
+        value: await readFile(resolve(plan.cacheDir, `${narinfo.storeHash}.narinfo`), "utf-8"),
+      });
+    }
+    await exec.kvPutBulk(env.kvNamespaceId, items);
+  } catch (e) {
+    console.warn(`[KV] warming failed (non-fatal): ${errMessage(e)}`);
+  }
+}
+
 export async function publish(
   cacheDir: string,
   buildMeta: BuildMeta,
@@ -698,31 +949,26 @@ if (
   typeof process.argv[1] !== "undefined" &&
   import.meta.filename === process.argv[1]
 ) {
-  const host = process.env["HOST"];
-  const cacheDir = process.env["CACHE_DIR"];
+  const planFlag = process.argv[2];
+  const planPath = process.argv[3];
   const apiBaseUrl = process.env["API_BASE_URL"];
   const adminToken = process.env["ADMIN_TOKEN"];
   const r2BucketName = process.env["R2_BUCKET_NAME"];
   const kvNamespaceId = process.env["KV_NAMESPACE_ID"];
-  const gitRev = process.env["GIT_REV"] ?? "unknown";
-  const system = process.env["SYSTEM"] ?? "x86_64-linux";
-  const flakeLockHash = process.env["FLAKE_LOCK_HASH"] ?? "unknown";
-  const toplevelStorePath = process.env["TOPLEVEL_STORE_PATH"];
-
   const accountId = process.env["CLOUDFLARE_ACCOUNT_ID"];
   const cfApiToken = process.env["CLOUDFLARE_API_TOKEN"];
   const r2AccessKeyId = process.env["R2_ACCESS_KEY_ID"];
   const r2SecretAccessKey = process.env["R2_SECRET_ACCESS_KEY"];
 
-  if (!host || !cacheDir || !apiBaseUrl || !adminToken || !r2BucketName || !kvNamespaceId) {
-    console.error(
-      "Missing required env: HOST, CACHE_DIR, API_BASE_URL, ADMIN_TOKEN, R2_BUCKET_NAME, KV_NAMESPACE_ID",
-    );
+  if (planFlag !== "--plan" || !planPath) {
+    console.error("Usage: bun scripts/publish.ts --plan <plan.json>");
     process.exit(1);
   }
 
-  if (!toplevelStorePath) {
-    console.error("Missing required env: TOPLEVEL_STORE_PATH (set by publish.sh)");
+  if (!apiBaseUrl || !adminToken || !r2BucketName || !kvNamespaceId) {
+    console.error(
+      "Missing required env: API_BASE_URL, ADMIN_TOKEN, R2_BUCKET_NAME, KV_NAMESPACE_ID",
+    );
     process.exit(1);
   }
 
@@ -733,20 +979,6 @@ if (
     process.exit(1);
   }
 
-  // build_id は決定的に生成 (修正6)。
-  const buildIdInput = `${host}:${system}:${gitRev}:${flakeLockHash}:${toplevelStorePath}`;
-  const buildId = createHash("sha256").update(buildIdInput).digest("hex").slice(0, 36);
-
-  const buildMeta: BuildMeta = {
-    id: buildId,
-    host,
-    system,
-    gitRev,
-    flakeLockHash,
-    toplevelStorePath,
-    createdAt: Date.now(),
-  };
-
   const adapter = makeFetchAdapter({
     accountId,
     r2AccessKeyId,
@@ -754,12 +986,13 @@ if (
     cfApiToken,
   });
 
-  publish(
-    cacheDir,
-    buildMeta,
-    { apiBaseUrl, adminToken, r2BucketName, kvNamespaceId },
-    adapter,
-  )
+  readFile(planPath, "utf-8")
+    .then((content) => parsePublishPlan(JSON.parse(content) as unknown))
+    .then((plan) => publishBatch(
+      plan,
+      { apiBaseUrl, adminToken, r2BucketName, kvNamespaceId },
+      adapter,
+    ))
     .then(() => {
       console.log("publish complete");
     })

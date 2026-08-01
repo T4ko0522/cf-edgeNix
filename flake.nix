@@ -35,6 +35,7 @@
                 bun
                 nodejs_22
                 git
+                jq
                 zstd
                 nix
               ]);

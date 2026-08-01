@@ -13,12 +13,23 @@ async function writeExecutable(path: string, content: string): Promise<void> {
   await writeFile(path, content, { mode: 0o755 });
 }
 
-async function runPublishSh(env: Record<string, string>): Promise<string[]> {
+async function runPublishSh(
+  env: Record<string, string>,
+  hosts: string[] = [],
+): Promise<{
+  copyArgs: string[];
+  nixCommands: string[];
+  bunArgs: string[];
+  plan: { targets: Array<{ host: string; system: string }> };
+  stdout: string;
+}> {
   const dir = await mkdtemp(join(tmpdir(), "cf-edgenix-publish-sh-"));
   const binDir = join(dir, "bin");
   const cacheDir = join(dir, "cache");
   const nixLog = join(dir, "nix-args.log");
+  const nixCommandsLog = join(dir, "nix-commands.log");
   const bunLog = join(dir, "bun-args.log");
+  const planLog = join(dir, "plan.json");
   await mkdir(binDir);
   await mkdir(cacheDir);
 
@@ -26,18 +37,28 @@ async function runPublishSh(env: Record<string, string>): Promise<string[]> {
     join(binDir, "nix"),
     `#!/usr/bin/env bash
 set -euo pipefail
+printf '%s' "$1" >> "$NIX_COMMANDS_LOG"
+for arg in "\${@:2}"; do printf '\\t%s' "$arg" >> "$NIX_COMMANDS_LOG"; done
+printf '\\n' >> "$NIX_COMMANDS_LOG"
 case "$1" in
   build)
-    echo "/nix/store/abcdef123456aaaa-system"
+    ;;
+  eval)
+    case "$3" in
+      *laptop*pkgs.system*) echo "x86_64-linux" ;;
+      *desktop*pkgs.system*) echo "aarch64-linux" ;;
+      *laptop*) echo "/nix/store/laptop000000000-system" ;;
+      *desktop*) echo "/nix/store/desktop000000000-system" ;;
+      *) echo "/nix/store/abcdef123456aaaa-system" ;;
+    esac
     ;;
   path-info)
-    echo '{"paths":["/nix/store/abcdef123456aaaa-system"]}'
+    out="\${@: -1}"
+    printf '{"/nix/store/shared0000000000-shared":{},"%s":{}}\\n' "$out"
     ;;
   copy)
     : > "$NIX_STUB_LOG"
-    for arg in "$@"; do
-      printf '%s\\n' "$arg" >> "$NIX_STUB_LOG"
-    done
+    for arg in "$@"; do printf '%s\\n' "$arg" >> "$NIX_STUB_LOG"; done
     mkdir -p "$CACHE_DIR/nar"
     printf 'nar' > "$CACHE_DIR/nar/sha256:file001.nar.zst"
     cat > "$CACHE_DIR/abcdef123456aaaa.narinfo" <<'EOF'
@@ -63,10 +84,18 @@ esac
     `#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$@" > "$BUN_STUB_LOG"
+cp "$3" "$PLAN_LOG"
 `,
   );
 
-  await execFileAsync("bash", [scriptPath], {
+  await writeExecutable(
+    join(binDir, "curl"),
+    `#!/usr/bin/env bash
+printf '404'
+`,
+  );
+
+  const result = await execFileAsync("bash", [scriptPath, ...hosts], {
     cwd: dir,
     env: {
       ...process.env,
@@ -83,27 +112,35 @@ printf '%s\\n' "$@" > "$BUN_STUB_LOG"
       FLAKE_LOCK_HASH: "sha256:lock",
       SKIP_UPSTREAM_PRUNE: "1",
       NIX_STUB_LOG: nixLog,
+      NIX_COMMANDS_LOG: nixCommandsLog,
       BUN_STUB_LOG: bunLog,
+      PLAN_LOG: planLog,
       ...env,
     },
   });
 
-  return (await readFile(nixLog, "utf8")).trim().split("\n");
+  return {
+    copyArgs: (await readFile(nixLog, "utf8")).trim().split("\n"),
+    nixCommands: (await readFile(nixCommandsLog, "utf8")).trim().split("\n"),
+    bunArgs: (await readFile(bunLog, "utf8")).trim().split("\n"),
+    plan: JSON.parse(await readFile(planLog, "utf8")) as {
+      targets: Array<{ host: string; system: string }>;
+    },
+    stdout: result.stdout,
+  };
 }
 
 describe("scripts/publish.sh", () => {
   test("ZSTD_LEVEL 未指定時は compression-level=9 を使う", async () => {
-    const args = await runPublishSh({});
-
-    expect(args[2]).toContain("?compression=zstd&compression-level=9&secret-key=");
+    const { copyArgs } = await runPublishSh({});
+    expect(copyArgs[2]).toContain("?compression=zstd&compression-level=9&secret-key=");
   });
 
   test("nix copy の file URL に zstd の compression-level を含める", async () => {
-    const args = await runPublishSh({ ZSTD_LEVEL: "9" });
-
-    expect(args[0]).toBe("copy");
-    expect(args[1]).toBe("--to");
-    expect(args[2]).toContain("?compression=zstd&compression-level=9&secret-key=");
+    const { copyArgs } = await runPublishSh({ ZSTD_LEVEL: "9" });
+    expect(copyArgs[0]).toBe("copy");
+    expect(copyArgs[1]).toBe("--to");
+    expect(copyArgs[2]).toContain("?compression=zstd&compression-level=9&secret-key=");
   });
 
   test("ZSTD_LEVEL が整数でない場合は失敗する", async () => {
@@ -111,5 +148,43 @@ describe("scripts/publish.sh", () => {
       code: 2,
       stderr: expect.stringContaining("ZSTD_LEVEL must be an integer"),
     });
+  });
+
+  test("2ホストをbuild/copy/publish各1回で処理する", async () => {
+    const result = await runPublishSh({ HOST: "" }, ["laptop", "desktop"]);
+    expect(result.nixCommands.filter((line) => line.startsWith("build\t"))).toHaveLength(1);
+    expect(result.nixCommands.filter((line) => line.startsWith("copy\t"))).toHaveLength(1);
+    expect(result.nixCommands.find((line) => line.startsWith("build\t"))).toContain("laptop");
+    expect(result.nixCommands.find((line) => line.startsWith("build\t"))).toContain("desktop");
+    expect(result.copyArgs).toContain("/nix/store/laptop000000000-system");
+    expect(result.copyArgs).toContain("/nix/store/desktop000000000-system");
+    expect(result.bunArgs[1]).toBe("--plan");
+    expect(result.plan.targets).toHaveLength(2);
+    expect(JSON.stringify(result.plan)).not.toContain("test-private-key");
+  });
+
+  test("2ホストでもupstream pruneを一度だけ実行する", async () => {
+    const result = await runPublishSh(
+      { HOST: "", SKIP_UPSTREAM_PRUNE: "0" },
+      ["laptop", "desktop"],
+    );
+    expect(result.stdout.match(/\[prune\] checking/g)).toHaveLength(1);
+  });
+
+  test("各hostのsystemをflake属性から個別に取得する", async () => {
+    const result = await runPublishSh(
+      { HOST: "", SYSTEM: "" },
+      ["laptop", "desktop"],
+    );
+    expect(result.plan.targets.map(({ host, system }) => ({ host, system }))).toEqual([
+      { host: "laptop", system: "x86_64-linux" },
+      { host: "desktop", system: "aarch64-linux" },
+    ]);
+  });
+
+  test("位置引数とHOSTの同時指定、重複、不正名を拒否する", async () => {
+    await expect(runPublishSh({}, ["laptop"])).rejects.toMatchObject({ code: 2 });
+    await expect(runPublishSh({ HOST: "" }, ["laptop", "laptop"])).rejects.toMatchObject({ code: 2 });
+    await expect(runPublishSh({ HOST: "" }, ["../laptop"])).rejects.toMatchObject({ code: 2 });
   });
 });

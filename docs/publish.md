@@ -18,7 +18,9 @@ GitHub Actions の Environment (`production`) に事前登録する値。
 | --- | --- | --- |
 | `CACHE_PRIVATE_KEY` | Secret | NAR / narinfo の署名秘密鍵。`nix copy` が `Sig:` フィールドに書き込む。 |
 | `ADMIN_TOKEN` | Secret | Worker 管理 API（write 系）の Bearer トークン。 |
-| `CLOUDFLARE_API_TOKEN` | Secret | R2 write / KV write 権限を持つ Cloudflare トークン（wrangler CLI が参照）。 |
+| `CLOUDFLARE_API_TOKEN` | Secret | KV write 権限を持つ Cloudflare API トークン。 |
+| `R2_ACCESS_KEY_ID` | Secret | R2 S3 互換 API のアクセスキー。 |
+| `R2_SECRET_ACCESS_KEY` | Secret | R2 S3 互換 API のシークレットキー。 |
 | `CLOUDFLARE_ACCOUNT_ID` | Variable | Cloudflare アカウント ID。 |
 | `API_BASE_URL` | Variable | デプロイ済み Worker の URL（例: `https://cf-edgenix.<account>.workers.dev`）。 |
 | `R2_BUCKET_NAME` | Variable | R2 バケット名（例: `cf-edgenix-nar`）。 |
@@ -34,37 +36,37 @@ GitHub Actions の Environment (`production`) に事前登録する値。
 
 | 変数名 | 用途 |
 | --- | --- |
-| `HOST` | publish 対象の nixosConfiguration 名（例: `myhost`）。`matrix.host` または `workflow_dispatch` input。 |
-| `CACHE_DIR` | `nix copy --to file://` の出力先ディレクトリ。CI では `${{ runner.temp }}/nix-cache` など一時パス。 |
+| 位置引数 / `HOST` | 対象の nixosConfiguration 名。複数は位置引数、単一は従来どおり `HOST` でも指定可能。両方の同時指定は不可。 |
+| `CACHE_DIR` | 全対象で共有する `nix copy --to file://` の出力先。既存ファイルの混入を防ぐため、実行開始時に空でなければならない。 |
 
 ---
 
 ## publish の全体フロー
 
 ```
-nix build                          ← NixOS system closure をビルド
+全 host を単一 nix build            ← NixOS system closure をビルド
   ↓
 nix copy --to file://$CACHE_DIR       ← 署名済み .narinfo と nar/*.nar.zst を生成
   ↓
 scripts/prune-upstream.sh             ← cache.nixos.org に既にある path を除外
   ↓
-scripts/publish.ts                    ← R2/D1/KV への反映（以下の 6 段）
+scripts/publish.ts --plan <JSON>      ← R2/D1/KV への一括反映
   │
-  ├── Step 0: D1 start → ingest（staging closure を先に GC 保護）
-  ├── Step 1: closure.json / manifest.json を R2 の manifests/<buildId>/ に put
+  ├── Step 0: 全 host の D1 start → ingest（staging closure を先に GC 保護）
+  ├── Step 1: host 別 closure.json / manifest.json を R2 に put
   ├── Step 2: NAR upload (R2)
   ├── Step 3: narinfo upload (R2)
-  ├── Step 4: D1 finalize（latest 更新）
-  └── Step 5: KV warming（失敗は警告のみ）
+  ├── Step 4: host ごとに D1 finalize（latest 更新）
+  └── Step 5: 全 host の和集合を KV warming（1回、失敗は警告のみ）
 ```
 
-`scripts/publish.sh` が nix build / copy / upstream prune を行い、続けて `scripts/publish.ts`（bun）に委譲して Step 0–5 を実行する。staging closure を R2 の HEAD/PUT より先に登録することで、publish と GC が並行しても既存 NAR を誤って回収しない。
+`scripts/publish.sh` は全hostを一度の build / copy / upstream prune で処理し、秘密情報を含まない一時publish planを `scripts/publish.ts` へ渡す。共有 `CACHE_DIR` は一度だけ走査される。各hostのmanifestは `host closure ∩ prune後のnarinfo` で作り、他host専用pathを混入させない。全pathがupstreamにあるhostは空closureとしてfinalizeする。
 
 ### upstream prune（R2 容量節約）
 
 `nix copy` は closure 全体（nixpkgs 由来の path を含む）を `CACHE_DIR` に吐く。これをそのまま R2 に上げると、cache.nixos.org に既にある path で容量を浪費する。
 
-`scripts/prune-upstream.sh` は `CACHE_DIR` 直下の各 `<storeHash>.narinfo` について `https://cache.nixos.org/<storeHash>.narinfo` を HEAD で確認し、200 を返すものは narinfo と対応する `nar/<fileHash>.nar.zst` をローカル CACHE_DIR から削除する。`publish.ts` は CACHE_DIR を列挙して R2/D1/KV に反映するため、削除した分は **自動的に全レイヤから除外**される（D1 build_closure にも入らない）。
+`scripts/prune-upstream.sh` は `CACHE_DIR` 直下の各 `<storeHash>.narinfo` について `https://cache.nixos.org/<storeHash>.narinfo` を HEAD で確認し、200 を返す **narinfoだけ**を削除する。NAR本体は別のstore pathから共有される可能性があるため削除しない。`publish.ts` は残ったnarinfoを起点にR2/D1/KVへ反映する。
 
 Nix client 側は `extra-substituters = [ "https://nix.t4ko.pet" ];` のように cf-edgeNix と cache.nixos.org の **両方**を持つ前提なので、自前 cache に無い path は upstream から fetch される。`docs/setup.md` の C4 設定が守られていれば破綻しない。
 
@@ -118,6 +120,8 @@ POST /api/publish/:build_id/finalize
 ```
 D1 start / ingest（staging closure を GC 保護）
   ↓
+host 別 manifest (R2)
+  ↓
 NAR 本体 (R2)
   ↓  ← narinfo が先だと Nix client が存在しない NAR へ 404 を起こす
 .narinfo (R2)
@@ -148,8 +152,8 @@ KV warming に失敗した場合はログに `[KV] warming failed (non-fatal):` 
 ## 手動実行
 
 ```bash
-# nix develop 内で実行すること（bun は devShell が提供する）
-HOST=myhost \
+# nix develop 内で実行すること。CACHE_DIR は空にする。
+mkdir -p /tmp/nix-cache
 CACHE_DIR=/tmp/nix-cache \
 CACHE_PRIVATE_KEY="$(cat /path/to/cache-private-key.pem)" \
 ZSTD_LEVEL=9 \
@@ -158,25 +162,33 @@ ADMIN_TOKEN=your-token \
 R2_BUCKET_NAME=cf-edgenix-nar \
 KV_NAMESPACE_ID=<kv-namespace-id> \
 CLOUDFLARE_ACCOUNT_ID=<account-id> \
-CLOUDFLARE_API_TOKEN=<r2-kv-write-token> \
-bash scripts/publish.sh
+CLOUDFLARE_API_TOKEN=<kv-write-token> \
+R2_ACCESS_KEY_ID=<r2-access-key> \
+R2_SECRET_ACCESS_KEY=<r2-secret-key> \
+bash scripts/publish.sh laptop desktop
 ```
 
+単一hostは `HOST=myhost bash scripts/publish.sh` も引き続き利用できる。
+
 `scripts/publish.sh` は内部で以下を順に実行する:
-1. `nix build .#nixosConfigurations.<HOST>.config.system.build.toplevel`
-2. `nix path-info -r --json <out> > closure.json`
-3. `nix copy --to "file://$CACHE_DIR?compression=zstd&compression-level=$ZSTD_LEVEL&secret-key=$CACHE_PRIVATE_KEY" <out>`
-4. `bun scripts/publish.ts`（R2/D1/KV 反映）
+1. 全installableを単一の `nix build` でbuild
+2. 各flake属性を `nix eval` し、hostとtoplevelを出力順に依存せず対応付け
+3. host別closure JSONを生成
+4. 全toplevelを単一の `nix copy` で共有 `CACHE_DIR` へ出力
+5. upstream pruneを一度だけ実行
+6. `bun scripts/publish.ts --plan <plan.json>` を一度だけ実行
 
 `ZSTD_LEVEL` は Nix の binary cache store URL に渡す `compression-level` で、省略時は `9`（CI 時間と R2 サイズのバランス重視）。Nix 側の既定値を使いたい場合は `ZSTD_LEVEL=-1` を指定する。
+
+`system` は各hostの `nixosConfigurations.<host>.pkgs.system` から取得する。`SYSTEM` を明示した場合だけ全targetへのoverrideとして扱う。
 
 ---
 
 ## GitHub Actions での実行
 
-`.github/workflows/publish.yml` の `Build, sign & publish to R2/D1/KV` ステップが全 env を付与して `bash scripts/publish.sh` を実行する（publish.sh 内で publish.ts に委譲）。
+テンプレートの `Build, sign & publish` ステップが `bash scripts/publish.sh host1 host2` を一度だけ実行する。`workflow_dispatch.inputs.host` 指定時は単一引数になる。
 
-必要な Secret / Variable は [§前提 A](#a-呼び出し側-repo-に登録する-secret--variable) に集約。workflow は `push: branches: [main]` および `workflow_dispatch`（手動実行・host 入力）でトリガーされる。
+必要な Secret / Variable は [§前提 A](#a-呼び出し側-repo-に登録する-secret--variable) に集約。テンプレートは `workflow_call`（別workflowからの再利用）と `workflow_dispatch`（手動実行・host入力）に対応する。
 
 ---
 
@@ -190,6 +202,8 @@ bash scripts/publish.sh
 - `finalize` は既に published でも manifest が同一なら冪等に 200、差分があれば 409 を返す。
 
 staging で中断した場合は、同じ条件で再実行すれば途中から続行できる。完了済み published build の再実行は `start` で 409 になる。環境変数 `BUILD_ID` を手動指定する仕組みは不要である。
+
+batchの一部だけがfinalize後に失敗した場合、完了済みbuildへの再startは409になる。現行APIは複数host全体のatomicなlatest更新を保証しないため、未完了hostだけを単一引数で再実行する。
 
 ---
 
