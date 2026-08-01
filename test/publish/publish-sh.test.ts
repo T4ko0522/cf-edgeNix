@@ -18,6 +18,7 @@ async function runPublishSh(
   hosts: string[] = [],
 ): Promise<{
   copyArgs: string[];
+  copyStdin: string[];
   nixCommands: string[];
   bunArgs: string[];
   plan: { targets: Array<{ host: string; system: string; closureStorePaths: string[] }> };
@@ -28,10 +29,13 @@ async function runPublishSh(
   const cacheDir = join(dir, "cache");
   const nixLog = join(dir, "nix-args.log");
   const nixCommandsLog = join(dir, "nix-commands.log");
+  const nixStdinLog = join(dir, "nix-stdin.log");
   const bunLog = join(dir, "bun-args.log");
   const planLog = join(dir, "plan.json");
   await mkdir(binDir);
   await mkdir(cacheDir);
+  await writeFile(nixLog, "");
+  await writeFile(nixStdinLog, "");
 
   await writeExecutable(
     join(binDir, "nix"),
@@ -68,6 +72,7 @@ case "$1" in
   copy)
     : > "$NIX_STUB_LOG"
     for arg in "$@"; do printf '%s\\n' "$arg" >> "$NIX_STUB_LOG"; done
+    cat > "$NIX_STDIN_LOG"
     mkdir -p "$CACHE_DIR/nar"
     printf 'nar' > "$CACHE_DIR/nar/sha256:file001.nar.zst"
     cat > "$CACHE_DIR/abcdef123456aaaa.narinfo" <<'EOF'
@@ -100,7 +105,11 @@ cp "$3" "$PLAN_LOG"
   await writeExecutable(
     join(binDir, "curl"),
     `#!/usr/bin/env bash
-printf '404'
+if [ "\${UPSTREAM_ALL_HIT:-0}" = "1" ] || { [ -n "\${UPSTREAM_HIT_HASH:-}" ] && [[ "\${*: -1}" == *"/$UPSTREAM_HIT_HASH.narinfo" ]]; }; then
+  printf '200'
+else
+  printf '404'
+fi
 `,
   );
 
@@ -122,6 +131,7 @@ printf '404'
       SKIP_UPSTREAM_PRUNE: "1",
       NIX_STUB_LOG: nixLog,
       NIX_COMMANDS_LOG: nixCommandsLog,
+      NIX_STDIN_LOG: nixStdinLog,
       BUN_STUB_LOG: bunLog,
       PLAN_LOG: planLog,
       ...env,
@@ -130,6 +140,7 @@ printf '404'
 
   return {
     copyArgs: (await readFile(nixLog, "utf8")).trim().split("\n"),
+    copyStdin: (await readFile(nixStdinLog, "utf8")).trim().split("\n").filter(Boolean),
     nixCommands: (await readFile(nixCommandsLog, "utf8")).trim().split("\n"),
     bunArgs: (await readFile(bunLog, "utf8")).trim().split("\n"),
     plan: JSON.parse(await readFile(planLog, "utf8")) as {
@@ -150,6 +161,8 @@ describe("scripts/publish.sh", () => {
     expect(copyArgs[0]).toBe("copy");
     expect(copyArgs[1]).toBe("--to");
     expect(copyArgs[2]).toContain("?compression=zstd&compression-level=9&secret-key=");
+    expect(copyArgs).toContain("--no-recursive");
+    expect(copyArgs).toContain("--stdin");
   });
 
   test("ZSTD_LEVEL が整数でない場合は失敗する", async () => {
@@ -165,19 +178,39 @@ describe("scripts/publish.sh", () => {
     expect(result.nixCommands.filter((line) => line.startsWith("copy\t"))).toHaveLength(1);
     expect(result.nixCommands.find((line) => line.startsWith("build\t"))).toContain("laptop");
     expect(result.nixCommands.find((line) => line.startsWith("build\t"))).toContain("desktop");
-    expect(result.copyArgs).toContain("/nix/store/laptop000000000-system");
-    expect(result.copyArgs).toContain("/nix/store/desktop000000000-system");
+    expect(result.copyStdin).toContain("/nix/store/laptop000000000-system");
+    expect(result.copyStdin).toContain("/nix/store/desktop000000000-system");
     expect(result.bunArgs[1]).toBe("--plan");
     expect(result.plan.targets).toHaveLength(2);
     expect(JSON.stringify(result.plan)).not.toContain("test-private-key");
   });
 
-  test("2ホストでもupstream pruneを一度だけ実行する", async () => {
+  test("upstream保有pathを圧縮前に除外し、未保有pathだけをcopyする", async () => {
     const result = await runPublishSh(
-      { HOST: "", SKIP_UPSTREAM_PRUNE: "0" },
+      {
+        HOST: "",
+        SKIP_UPSTREAM_PRUNE: "0",
+        UPSTREAM_HIT_HASH: "shared0000000000",
+      },
       ["laptop", "desktop"],
     );
-    expect(result.stdout.match(/\[prune\] checking/g)).toHaveLength(1);
+    expect(result.copyStdin).not.toContain("/nix/store/shared0000000000-shared");
+    expect(result.copyStdin).toEqual([
+      "/nix/store/desktop000000000-system",
+      "/nix/store/laptop000000000-system",
+    ]);
+    expect(result.stdout).toContain("[preflight] upstream owns 1/3; copying 2");
+  });
+
+  test("全pathがupstreamにあればcopyを省略してpublishを続行する", async () => {
+    const result = await runPublishSh({
+      SKIP_UPSTREAM_PRUNE: "0",
+      UPSTREAM_ALL_HIT: "1",
+    });
+
+    expect(result.nixCommands.filter((line) => line.startsWith("copy\t"))).toHaveLength(0);
+    expect(result.bunArgs[1]).toBe("--plan");
+    expect(result.stdout).toContain("[copy] no self-hosted paths to copy");
   });
 
   test("各hostのsystemをflake属性から個別に取得する", async () => {

@@ -46,9 +46,9 @@ GitHub Actions の Environment (`production`) に事前登録する値。
 ```
 全 host を単一 nix build            ← NixOS system closure をビルド
   ↓
-nix copy --to file://$CACHE_DIR       ← 署名済み .narinfo と nar/*.nar.zst を生成
+upstream preflight                    ← cache.nixos.org の保有 path を先に HEAD
   ↓
-scripts/prune-upstream.sh             ← cache.nixos.org に既にある path を除外
+nix copy --no-recursive --stdin       ← 未保有 path だけを圧縮・署名
   ↓
 scripts/publish.ts --plan <JSON>      ← R2/D1/KV への一括反映
   │
@@ -60,13 +60,13 @@ scripts/publish.ts --plan <JSON>      ← R2/D1/KV への一括反映
   └── Step 5: 全 host の和集合を KV warming（1回、失敗は警告のみ）
 ```
 
-`scripts/publish.sh` は全hostを一度の build / copy / upstream prune で処理し、秘密情報を含まない一時publish planを `scripts/publish.ts` へ渡す。共有 `CACHE_DIR` は一度だけ走査される。各hostのmanifestは `host closure ∩ prune後のnarinfo` で作り、他host専用pathを混入させない。全pathがupstreamにあるhostは空closureとしてfinalizeする。
+`scripts/publish.sh` は全hostを一度の build / preflight / copy で処理し、秘密情報を含まない一時publish planを `scripts/publish.ts` へ渡す。共有 `CACHE_DIR` は一度だけ走査される。各hostのmanifestは `host closure ∩ copy後のnarinfo` で作り、他host専用pathを混入させない。全pathがupstreamにあるhostは空closureとしてfinalizeする。
 
-### upstream prune（R2 容量節約）
+### upstream preflight（圧縮時間とR2容量の節約）
 
-`nix copy` は closure 全体（nixpkgs 由来の path を含む）を `CACHE_DIR` に吐く。これをそのまま R2 に上げると、cache.nixos.org に既にある path で容量を浪費する。
+closure 全体を先に `nix copy` すると、後から削除する path にも zstd 圧縮と署名のCPU時間を使う。`publish.sh` はhost別closureの和集合を作り、各store hashのnarinfoをupstreamへ並列HEADしてからcopy対象を決める。
 
-`scripts/prune-upstream.sh` は `CACHE_DIR` 直下の各 `<storeHash>.narinfo` について `https://cache.nixos.org/<storeHash>.narinfo` を HEAD で確認し、200 を返す **narinfoだけ**を削除する。NAR本体は別のstore pathから共有される可能性があるため削除しない。`publish.ts` は残ったnarinfoを起点にR2/D1/KVへ反映する。
+200を返したpathはupstream所有として除外し、それ以外だけを `nix copy --no-recursive --stdin` へ渡す。これによりupstream所有pathはローカルcacheに圧縮せず、R2にも送らない。`--stdin` を使うため巨大なclosureでもOSのコマンドライン長制限を受けない。
 
 Nix client 側は `extra-substituters = [ "https://nix.t4ko.pet" ];` のように cf-edgeNix と cache.nixos.org の **両方**を持つ前提なので、自前 cache に無い path は upstream から fetch される。`docs/setup.md` の C4 設定が守られていれば破綻しない。
 
@@ -75,7 +75,7 @@ Nix client 側は `extra-substituters = [ "https://nix.t4ko.pet" ];` のよう�
 | 環境変数 | 既定 | 用途 |
 | --- | --- | --- |
 | `UPSTREAM_CACHE_URL` | `https://cache.nixos.org` | 対象 substituter URL（自前で複数階層 cache を運用するときに使用） |
-| `SKIP_UPSTREAM_PRUNE` | `0` | `1` にすると prune ステップを丸ごとスキップ（デバッグ用） |
+| `SKIP_UPSTREAM_PRUNE` | `0` | `1` にすると preflight をスキップして全pathをcopy（デバッグ用） |
 | `PRUNE_CONCURRENCY` | `32` | 並列 curl 数 |
 | `PRUNE_TIMEOUT` | `5` | 1 リクエストの最大秒数 |
 
@@ -174,8 +174,8 @@ bash scripts/publish.sh laptop desktop
 1. 全installableを単一の `nix build` でbuild
 2. 各flake属性を `nix eval` し、hostとtoplevelを出力順に依存せず対応付け
 3. host別closure JSONを生成
-4. 全toplevelを単一の `nix copy` で共有 `CACHE_DIR` へ出力
-5. upstream pruneを一度だけ実行
+4. closure和集合をupstreamへpreflight
+5. 未保有pathだけを単一の非再帰 `nix copy` で共有 `CACHE_DIR` へ出力
 6. `bun scripts/publish.ts --plan <plan.json>` を一度だけ実行
 
 `ZSTD_LEVEL` は Nix の binary cache store URL に渡す `compression-level` で、省略時は `9`（CI 時間と R2 サイズのバランス重視）。Nix 側の既定値を使いたい場合は `ZSTD_LEVEL=-1` を指定する。

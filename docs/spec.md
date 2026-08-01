@@ -443,8 +443,8 @@ GitHub Actionsでビルドした成果物をCloudflareへpublishする。
 1. 全hostのinstallableを単一の nix build でビルド
 2. 各flake属性から個別にtoplevel store pathを確定（build出力順には依存しない）
 3. host別closure JSONとstore path一覧を生成
-4. 全toplevelを単一の nix copy で共有CACHE_DIRへ出力
-5. 共有CACHE_DIRを一度だけupstream prune（narinfoだけを削除し、NARは残す）
+4. closure和集合を一度だけupstream preflight
+5. 未保有pathだけを単一の非再帰 nix copy で共有CACHE_DIRへ出力
 6. CACHE_DIRのnarinfoを一度だけ走査し、host closureとの積集合を作る
 7. 全hostの POST /api/publish/start と ingest を完了
 8. host別closure.json / manifest.jsonをR2へ保存
@@ -475,7 +475,7 @@ KV を warming（速度層・最後）
 `latest` pointer が更新されるのは `POST /api/publish/:id/finalize` の 1 ステップのみ。
 `start` / `ingest` 途中で中断しても read path（narinfo / NAR）には影響しない。
 
-manifestとD1 `build_closure` は各hostのclosureとprune後narinfoの積集合に限定する。他host専用pathを混入させない。全pathがupstreamに存在するhostは空closureとしてfinalizeする。複数host全体のlatest更新はatomicではなく、一部hostのfinalize後に失敗した場合は未完了hostだけを再実行する。
+manifestとD1 `build_closure` は各hostのclosureとcopy後narinfoの積集合に限定する。他host専用pathを混入させない。全pathがupstreamに存在するhostは空closureとしてfinalizeする。複数host全体のlatest更新はatomicではなく、一部hostのfinalize後に失敗した場合は未完了hostだけを再実行する。
 
 詳細な運用手順・冪等再実行・トラブルシューティングは `docs/publish.md` を参照。
 

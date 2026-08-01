@@ -32,12 +32,12 @@
 #   - 全 host を 1 回の publish.sh で build/copy し、共有 closure を重複処理しない
 #   - bash .cf-edgenix/scripts/publish.sh が
 #       nix build .#nixosConfigurations.<HOST>...
-#       nix copy --to file://$CACHE_DIR (署名)
-#       bash scripts/prune-upstream.sh (cache.nixos.org にある path を除外)
+#       cache.nixos.org の保有 path を preflight
+#       nix copy --no-recursive --stdin --to file://$CACHE_DIR (未保有pathだけ圧縮・署名)
 #       bun publish.ts → R2 (S3 API) / KV bulk へ反映
 #     を順に実行する
 #   - host 指定時も同じ batch 経路を単一引数で実行する
-#   - SKIP_UPSTREAM_PRUNE=1 / UPSTREAM_CACHE_URL=... で prune 挙動を制御可能 (docs/publish.md)
+#   - SKIP_UPSTREAM_PRUNE=1 / UPSTREAM_CACHE_URL=... で preflight 挙動を制御可能 (docs/publish.md)
 
 name: publish-cache
 
@@ -149,7 +149,7 @@ jobs:
       # CWD は flake source のまま、scripts は .cf-edgenix/scripts/ から起動する。
       # publish.sh は CWD の flake に対して nix build を走らせるので、
       # 呼び出し側 repo の nixosConfigurations.<HOST> がビルドされる。
-      # publish.sh が全 host をまとめて build/copy/prune/upload する。
+      # publish.sh が全 host をまとめて build/preflight/copy/upload する。
       - name: Build, sign & publish
         env:
           HOSTS: ${{ steps.hosts.outputs.list }}
