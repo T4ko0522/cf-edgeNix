@@ -73,15 +73,15 @@ CF 側に置く必要があるのは Workers Builds 用の Cloudflare 権限の�
 
 ## 6. 初回 publish
 
-publish workflow は **このレポではなく、flake を持つ側の repo** （例: `t4ko0522/dotfiles`）に置く。テンプレート [`.github/templates/publish-cache.yml`](../.github/templates/publish-cache.yml) を相手側の `.github/workflows/` にコピーし、`matrix.host` を実 nixosConfiguration 名に書き換える。
+publish workflow は **このレポではなく、flake を持つ側の repo** （例: `t4ko0522/dotfiles`）に置く。テンプレート [`.github/templates/publish-cache.yml`](../.github/templates/publish-cache.yml) を相手側の `.github/workflows/` にコピーし、`Resolve target hosts` のallowlistとdefault listを実nixosConfiguration名に書き換える。
 
-呼び出し側 repo の Environment (`production`) に以下の Secret / Variable を登録してから push または手動実行する。
+呼び出し側 repo の Environment (`production`) に以下の Secret / Variable を登録し、別workflowから呼び出すか手動実行する。
 
 | 名前 | 種別 | 用途 |
 | --- | --- | --- |
 | `CACHE_PRIVATE_KEY` | Secret | NAR 署名用秘密鍵（§1 で生成したもの） |
 | `ADMIN_TOKEN` | Secret | Worker 管理 API の Bearer トークン |
-| `CLOUDFLARE_API_TOKEN` | Secret | R2 write / KV write 最小権限トークン |
+| `CLOUDFLARE_API_TOKEN` | Secret | KV write 最小権限トークン |
 | `CLOUDFLARE_ACCOUNT_ID` | Variable | Cloudflare アカウント ID |
 | `API_BASE_URL` | Variable | §4 で記録した Worker の URL |
 | `R2_BUCKET_NAME` | Variable | R2 バケット名（例: `cf-edgenix-nar`） |

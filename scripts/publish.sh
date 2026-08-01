@@ -1,55 +1,104 @@
 #!/usr/bin/env bash
-# cf-edgeNix publish step (spec docs/spec.md §9)
-#
-# 公開順序を厳守する:
-#   NAR本体(R2) → .narinfo(R2) → D1 で published/latest 確定 → KV warming(最後)
-# .narinfo を先に公開すると、Nix client が存在しない NAR を取りに行って 404 になる。
-#
-# 必要な env:
-#   HOST               対象 nixosConfiguration 名
-#   CACHE_DIR          nix copy の出力先（file:// ローカル binary cache）
-#   CACHE_PRIVATE_KEY  NAR 署名用 secret key（fork PR では絶対に露出させない・§9.1）
-#   ZSTD_LEVEL         zstd compression-level（省略時: 9）
-#   API_BASE_URL       Worker の URL
-#   ADMIN_TOKEN        管理API Bearer トークン
-#   R2_BUCKET_NAME     R2 バケット名
-#   KV_NAMESPACE_ID    KV 名前空間 ID
+# cf-edgeNix batch publish step (spec docs/spec.md §9)
 set -euo pipefail
 
-: "${HOST:?HOST is required}"
 : "${CACHE_DIR:?CACHE_DIR is required}"
 : "${CACHE_PRIVATE_KEY:?CACHE_PRIVATE_KEY is required}"
 : "${ZSTD_LEVEL:=9}"
+
+if [ "$#" -gt 0 ] && [ -n "${HOST:-}" ]; then
+  echo "hosts must be specified by positional arguments or HOST, not both" >&2
+  exit 2
+fi
+if [ "$#" -eq 0 ]; then
+  : "${HOST:?HOST or positional host arguments are required}"
+  hosts=("$HOST")
+else
+  hosts=("$@")
+fi
+
+declare -A seen_hosts=()
+for host in "${hosts[@]}"; do
+  if ! [[ "$host" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "invalid host name: $host" >&2
+    exit 2
+  fi
+  if [ -n "${seen_hosts[$host]:-}" ]; then
+    echo "duplicate host: $host" >&2
+    exit 2
+  fi
+  seen_hosts[$host]=1
+done
 
 if ! [[ "$ZSTD_LEVEL" =~ ^-?[0-9]+$ ]]; then
   echo "ZSTD_LEVEL must be an integer" >&2
   exit 2
 fi
+if [ ! -d "$CACHE_DIR" ]; then
+  echo "CACHE_DIR must already exist: $CACHE_DIR" >&2
+  exit 2
+fi
+if [ -n "$(find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+  echo "CACHE_DIR must be empty: $CACHE_DIR" >&2
+  exit 2
+fi
 
-# ─── Phase 1: nix build + nix copy（署名付き binary cache 生成） ──────────────
+: "${API_BASE_URL:?API_BASE_URL is required}"
+: "${ADMIN_TOKEN:?ADMIN_TOKEN is required}"
+: "${R2_BUCKET_NAME:?R2_BUCKET_NAME is required}"
+: "${KV_NAMESPACE_ID:?KV_NAMESPACE_ID is required}"
 
-# 1. NixOS system closure をビルド
-out="$(nix build ".#nixosConfigurations.${HOST}.config.system.build.toplevel" \
-  --print-out-paths --no-link)"
+git_rev="${GIT_REV:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
+flake_lock_hash="${FLAKE_LOCK_HASH:-unknown}"
 
-# 2. closure を列挙（復元用 manifest / build_closure の素材）
-nix path-info -r --json "$out" > closure.json
+work_dir="$(mktemp -d)"
+key_file="${work_dir}/cache-private-key"
+targets_file="${work_dir}/targets.jsonl"
+plan_file="${work_dir}/publish-plan.json"
+trap 'rm -rf "$work_dir"' EXIT
+chmod 700 "$work_dir"
+printf '%s' "$CACHE_PRIVATE_KEY" > "$key_file"
+chmod 600 "$key_file"
 
-# 3. 鍵を一時ファイルに書き出して nix copy に渡す（argv に秘密鍵を露出させない・G9）
-#    trap で確実に削除し、パーミッション 600 を維持する。
-_key_file="$(mktemp)"
-chmod 600 "$_key_file"
-# shellcheck disable=SC2064  # _key_file を展開時に確定させる（意図的）
-trap "rm -f '$_key_file'" EXIT
+installables=()
+for host in "${hosts[@]}"; do
+  installables+=(".#nixosConfigurations.\"${host}\".config.system.build.toplevel")
+done
+nix build "${installables[@]}" --no-link
 
-printf '%s' "$CACHE_PRIVATE_KEY" > "$_key_file"
+out_paths=()
+for host in "${hosts[@]}"; do
+  installable=".#nixosConfigurations.\"${host}\".config.system.build.toplevel"
+  out="$(nix eval --raw "$installable")"
+  if ! [[ "$out" == /nix/store/* ]]; then
+    echo "nix eval returned an invalid toplevel for $host: $out" >&2
+    exit 1
+  fi
+  out_paths+=("$out")
+  target_system="${SYSTEM:-$(nix eval --raw ".#nixosConfigurations.\"${host}\".pkgs.system")}"
 
-nix copy --to "file://${CACHE_DIR}?compression=zstd&compression-level=${ZSTD_LEVEL}&secret-key=${_key_file}" "$out"
+  target_dir="${work_dir}/targets/${host}"
+  closure_json_path="${target_dir}/closure.json"
+  mkdir -p "$target_dir"
+  nix path-info -r --json "$out" > "$closure_json_path"
+  closure_store_paths="$(jq -c 'keys' "$closure_json_path")"
+  jq -cn \
+    --arg host "$host" \
+    --arg system "$target_system" \
+    --arg gitRev "$git_rev" \
+    --arg flakeLockHash "$flake_lock_hash" \
+    --arg toplevelStorePath "$out" \
+    --arg closureJsonPath "$closure_json_path" \
+    --argjson closureStorePaths "$closure_store_paths" \
+    '{host: $host, system: $system, gitRev: $gitRev, flakeLockHash: $flakeLockHash,
+      toplevelStorePath: $toplevelStorePath, closureJsonPath: $closureJsonPath,
+      closureStorePaths: $closureStorePaths}' >> "$targets_file"
+done
 
-echo "build out path: $out"
-echo "local binary cache generated at: ${CACHE_DIR}"
+nix copy \
+  --to "file://${CACHE_DIR}?compression=zstd&compression-level=${ZSTD_LEVEL}&secret-key=${key_file}" \
+  "${out_paths[@]}"
 
-# Phase 1.5: upstream substituter にある path を CACHE_DIR から除外（docs/publish.md）。
 if [ "${SKIP_UPSTREAM_PRUNE:-0}" = "1" ]; then
   echo "[prune] SKIP_UPSTREAM_PRUNE=1, skipping upstream subtraction"
 else
@@ -58,20 +107,10 @@ else
     "${UPSTREAM_CACHE_URL:-https://cache.nixos.org}"
 fi
 
-# ─── Phase 2: R2/D1/KV への反映（publish.ts に委譲・env 検証はここで行う） ───
+jq -s --arg cacheDir "$CACHE_DIR" \
+  '{version: 1, cacheDir: $cacheDir, targets: .}' \
+  "$targets_file" > "$plan_file"
 
-: "${API_BASE_URL:?API_BASE_URL is required}"
-: "${ADMIN_TOKEN:?ADMIN_TOKEN is required}"
-: "${R2_BUCKET_NAME:?R2_BUCKET_NAME is required}"
-: "${KV_NAMESPACE_ID:?KV_NAMESPACE_ID is required}"
-
-export HOST CACHE_DIR API_BASE_URL ADMIN_TOKEN R2_BUCKET_NAME KV_NAMESPACE_ID
-export GIT_REV="${GIT_REV:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
-export SYSTEM="${SYSTEM:-x86_64-linux}"
-export FLAKE_LOCK_HASH="${FLAKE_LOCK_HASH:-unknown}"
-# toplevel store path を closure.json から渡す
-export TOPLEVEL_STORE_PATH="$out"
-
-echo "Uploading to R2/D1/KV via scripts/publish.ts..."
-bun "$(dirname "$0")/publish.ts"
+echo "Uploading ${#hosts[@]} host(s) to R2/D1/KV via scripts/publish.ts..."
+bun "$(dirname "$0")/publish.ts" --plan "$plan_file"
 echo "publish.ts complete"

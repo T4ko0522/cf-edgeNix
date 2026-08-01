@@ -10,12 +10,18 @@
  *   A2: 公開順序保証（closure/manifest → NAR → narinfo → D1 → KV）
  *   A5: 再 publish 冪等（NAR スキップ）
  */
-import { describe, expect, test, vi } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
+
+let mockNarinfoFiles = ["abcdef123456aaaa.narinfo"];
+let mockFileContents = new Map<string, string>();
 
 // vi.mock はトップレベルに置く必要がある（vitest がホイストするため）
 vi.mock("fs/promises", () => ({
-  readdir: vi.fn(async () => ["abcdef123456aaaa.narinfo"]),
+  readdir: vi.fn(async () => mockNarinfoFiles),
   readFile: vi.fn(async (path: string, _enc: unknown) => {
+    for (const [suffix, content] of mockFileContents) {
+      if (String(path).endsWith(suffix)) return content;
+    }
     if (typeof path === "string" && path.includes("closure.json")) {
       return JSON.stringify({ paths: ["/nix/store/abcdef123456aaaa-hello-2.12.1"] });
     }
@@ -35,8 +41,10 @@ import {
   type ExecAdapter,
   type NarinfoMeta,
   buildManifestJson,
+  parsePublishPlan,
   parseNarinfo,
   publish,
+  publishBatch,
   sha256Hex,
 } from "../../scripts/publish";
 
@@ -67,6 +75,42 @@ const SAMPLE_ENV = {
   r2BucketName: "my-bucket",
   kvNamespaceId: "kv-ns-001",
 };
+
+beforeEach(() => {
+  mockNarinfoFiles = ["abcdef123456aaaa.narinfo"];
+  mockFileContents = new Map();
+});
+
+describe("parsePublishPlan", () => {
+  const validPlan = {
+    version: 1,
+    cacheDir: "/tmp/cache",
+    targets: [{
+      host: "laptop",
+      system: "x86_64-linux",
+      gitRev: "deadbeef",
+      flakeLockHash: "sha256:lock",
+      toplevelStorePath: "/nix/store/laptop-system",
+      closureJsonPath: "/tmp/targets/laptop/closure.json",
+      closureStorePaths: ["/nix/store/shared", "/nix/store/laptop-system"],
+    }],
+  };
+
+  test("version 1 のplanを受理する", () => {
+    expect(parsePublishPlan(validPlan)).toEqual(validPlan);
+  });
+
+  test.each([
+    [{ ...validPlan, version: 2 }],
+    [{ ...validPlan, targets: [] }],
+    [{ ...validPlan, targets: [validPlan.targets[0], validPlan.targets[0]] }],
+    [{ ...validPlan, targets: [{ ...validPlan.targets[0], host: "../bad" }] }],
+    [{ ...validPlan, cacheDir: "relative/cache" }],
+    [{ ...validPlan, adminToken: "must-not-be-in-plan" }],
+  ])("不正または曖昧なplanを拒否する", (plan) => {
+    expect(() => parsePublishPlan(plan)).toThrow();
+  });
+});
 
 // ─── parseNarinfo (publish.ts 版) ─────────────────────────────────────────────
 
@@ -413,5 +457,153 @@ describe("publish — exec アダプタ注入によるテスト", () => {
     const items = bulkCall?.[1] as ReadonlyArray<{ key: string; value: string }>;
     expect(items).toHaveLength(1);
     expect(items[0]?.key).toBe("narinfo:abcdef123456aaaa");
+  });
+});
+
+describe("publishBatch", () => {
+  const shared = `StorePath: /nix/store/shared0000000000-shared
+URL: nar/shared.nar.zst
+Compression: zstd
+FileHash: sha256:shared
+FileSize: 10
+NarHash: sha256:sharednar
+NarSize: 20
+`;
+  const laptopOnly = shared
+    .replaceAll("shared0000000000-shared", "laptop000000000-laptop")
+    .replaceAll("shared.nar", "laptop.nar")
+    .replaceAll("sha256:sharednar", "sha256:laptopnar")
+    .replaceAll("sha256:shared", "sha256:laptop");
+  const desktopOnly = shared
+    .replaceAll("shared0000000000-shared", "desktop000000000-desktop")
+    .replaceAll("shared.nar", "desktop.nar")
+    .replaceAll("sha256:sharednar", "sha256:desktopnar")
+    .replaceAll("sha256:shared", "sha256:desktop");
+
+  function batchPlan() {
+    return parsePublishPlan({
+      version: 1,
+      cacheDir: "/fake/cache",
+      targets: [
+        {
+          host: "laptop",
+          system: "x86_64-linux",
+          gitRev: "deadbeef",
+          flakeLockHash: "sha256:lock",
+          toplevelStorePath: "/nix/store/laptop000000000-laptop",
+          closureJsonPath: "/fake/targets/laptop/closure.json",
+          closureStorePaths: [
+            "/nix/store/shared0000000000-shared",
+            "/nix/store/laptop000000000-laptop",
+          ],
+        },
+        {
+          host: "desktop",
+          system: "x86_64-linux",
+          gitRev: "deadbeef",
+          flakeLockHash: "sha256:lock",
+          toplevelStorePath: "/nix/store/desktop000000000-desktop",
+          closureJsonPath: "/fake/targets/desktop/closure.json",
+          closureStorePaths: [
+            "/nix/store/shared0000000000-shared",
+            "/nix/store/desktop000000000-desktop",
+          ],
+        },
+      ],
+    });
+  }
+
+  function batchAdapter() {
+    const sequence: string[] = [];
+    const manifests = new Map<string, string>();
+    const adapter: ExecAdapter = {
+      r2Put: vi.fn(async (_bucket, key) => {
+        sequence.push(`r2:${key}`);
+      }),
+      r2PutContent: vi.fn(async (_bucket, key, content) => {
+        sequence.push(`r2:${key}`);
+        manifests.set(key, content);
+      }),
+      r2Has: vi.fn(async (_bucket, key) => {
+        sequence.push(`head:${key}`);
+        return false;
+      }),
+      kvPutBulk: vi.fn(async () => {
+        sequence.push("kv");
+      }),
+      apiPost: vi.fn(async (url, _token, body) => {
+        if (url.endsWith("/start")) {
+          const id = (body as { build: { id: string } }).build.id;
+          sequence.push(`start:${id}`);
+          return { build_id: id };
+        }
+        if (url.endsWith("/ingest")) sequence.push(`ingest:${url}`);
+        if (url.endsWith("/finalize")) sequence.push(`finalize:${url}`);
+        return {};
+      }),
+    };
+    return { adapter, sequence, manifests };
+  }
+
+  beforeEach(() => {
+    mockNarinfoFiles = [
+      "shared0000000000.narinfo",
+      "laptop000000000.narinfo",
+      "desktop000000000.narinfo",
+    ];
+    mockFileContents = new Map([
+      ["shared0000000000.narinfo", shared],
+      ["laptop000000000.narinfo", laptopOnly],
+      ["desktop000000000.narinfo", desktopOnly],
+    ]);
+  });
+
+  test("ホストごとのclosureを分離しshared pathだけを共有する", async () => {
+    const { adapter, manifests } = batchAdapter();
+    await publishBatch(batchPlan(), SAMPLE_ENV, adapter);
+
+    const parsed = [...manifests.entries()]
+      .filter(([key]) => key.endsWith("manifest.json"))
+      .map(([, value]) => JSON.parse(value) as { host: string; storePaths: Array<{ storePath: string }> });
+    const laptop = parsed.find((manifest) => manifest.host === "laptop");
+    const desktop = parsed.find((manifest) => manifest.host === "desktop");
+    expect(laptop?.storePaths.map((path) => path.storePath)).toEqual([
+      "/nix/store/shared0000000000-shared",
+      "/nix/store/laptop000000000-laptop",
+    ]);
+    expect(desktop?.storePaths.map((path) => path.storePath)).toEqual([
+      "/nix/store/shared0000000000-shared",
+      "/nix/store/desktop000000000-desktop",
+    ]);
+  });
+
+  test("共有NAR/narinfoを一度だけuploadしKVを和集合で一度だけwarmingする", async () => {
+    const { adapter } = batchAdapter();
+    await publishBatch(batchPlan(), SAMPLE_ENV, adapter);
+
+    expect(adapter.r2Has).toHaveBeenCalledTimes(3);
+    const r2Put = adapter.r2Put as ReturnType<typeof vi.fn>;
+    expect(r2Put.mock.calls.filter((call) => String(call[1]).startsWith("nar/"))).toHaveLength(3);
+    expect(r2Put.mock.calls.filter((call) => String(call[1]).endsWith(".narinfo"))).toHaveLength(3);
+    expect(adapter.kvPutBulk).toHaveBeenCalledTimes(1);
+    expect((adapter.kvPutBulk as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]).toHaveLength(3);
+  });
+
+  test("全start/ingest、manifest、NAR、narinfo、全finalize、KVの順序を守る", async () => {
+    const { adapter, sequence } = batchAdapter();
+    await publishBatch(batchPlan(), SAMPLE_ENV, adapter);
+
+    const lastIngest = sequence.map((item) => item.startsWith("ingest:")).lastIndexOf(true);
+    const firstManifest = sequence.findIndex((item) => item.includes("manifest.json"));
+    const firstNar = sequence.findIndex((item) => item.startsWith("r2:nar/"));
+    const firstNarinfo = sequence.findIndex((item) => item.endsWith(".narinfo"));
+    const firstFinalize = sequence.findIndex((item) => item.startsWith("finalize:"));
+    const lastFinalize = sequence.map((item) => item.startsWith("finalize:")).lastIndexOf(true);
+    const kv = sequence.indexOf("kv");
+    expect(lastIngest).toBeLessThan(firstManifest);
+    expect(firstManifest).toBeLessThan(firstNar);
+    expect(firstNar).toBeLessThan(firstNarinfo);
+    expect(firstNarinfo).toBeLessThan(firstFinalize);
+    expect(lastFinalize).toBeLessThan(kv);
   });
 });

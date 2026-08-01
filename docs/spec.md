@@ -435,50 +435,36 @@ GitHub Actionsでビルドした成果物をCloudflareへpublishする。
 
 `.narinfo` は自前生成せず、Nix 自身に binary cache 形式（署名 `Sig:` 込み）を作らせる。
 
-```bash
-set -euo pipefail
+複数hostは `bash scripts/publish.sh laptop desktop`、単一hostは同じ位置引数または互換形式の `HOST=laptop bash scripts/publish.sh` で実行する。位置引数と `HOST` の同時指定、重複host、不正なhost名は拒否する。共有 `CACHE_DIR` は実行開始時に空でなければならない。
 
-out="$(nix build ".#nixosConfigurations.${HOST}.config.system.build.toplevel" \
-  --print-out-paths --no-link)"
-
-nix path-info -r --json "$out" > closure.json
-
-# 鍵を一時ファイルに書き出して nix copy に渡す（argv に秘密鍵を露出させない）
-_key_file="$(mktemp)"
-chmod 600 "$_key_file"
-trap "rm -f '$_key_file'" EXIT
-printf '%s' "$CACHE_PRIVATE_KEY" > "$_key_file"
-
-# Nix が署名済み .narinfo と nar/<file-hash>.nar.zst を生成する
-ZSTD_LEVEL="${ZSTD_LEVEL:-9}"
-nix copy --to "file://${CACHE_DIR}?compression=zstd&compression-level=${ZSTD_LEVEL}&secret-key=${_key_file}" "$out"
-```
-
-基本手順は以下。`scripts/publish.sh` が 1–3 を担い、`scripts/publish.ts`（bun）が 0・4–8 を担う。
+基本手順は以下。`scripts/publish.sh` が 1–5 と秘密情報を含まないpublish plan生成を担い、`scripts/publish.ts --plan <JSON>` が 6–11 を担う。
 
 ```text
-0. closure.json / manifest.json を R2 の manifests/<buildId>/ 配下に put（冪等・決定的 buildId）
-1. nix build で NixOS system closure をビルド
-2. nix copy --to "file://..." で署名済み .narinfo と NAR を Nix に生成させる
-3. closure を列挙（nix path-info -r --json）
-4. NAR本体（nar/<file-hash>.nar.zst）を R2 へ upload（重複 narKey はスキップ）
-5. すべての NAR upload 完了を確認してから次へ
-6. .narinfo を R2 へ upload
-7. D1 確定（3 段状態遷移）:
-     POST /api/publish/start          → staging build 作成（latest 不変）
-     POST /api/publish/:id/ingest × N → store_paths を chunk 分割で upsert
-     POST /api/publish/:id/finalize   → build_manifests insert + published + latest 更新（1 batch）
-8. KV を warming（最後・失敗は警告のみ）
+1. 全hostのinstallableを単一の nix build でビルド
+2. 各flake属性から個別にtoplevel store pathを確定（build出力順には依存しない）
+3. host別closure JSONとstore path一覧を生成
+4. 全toplevelを単一の nix copy で共有CACHE_DIRへ出力
+5. 共有CACHE_DIRを一度だけupstream prune（narinfoだけを削除し、NARは残す）
+6. CACHE_DIRのnarinfoを一度だけ走査し、host closureとの積集合を作る
+7. 全hostの POST /api/publish/start と ingest を完了
+8. host別closure.json / manifest.jsonをR2へ保存
+9. 全hostの和集合からNARをnarKey単位、narinfoをstoreHash単位で重複排除してupload
+10. hostごとにfinalize（各hostのlatestを更新）
+11. narinfoの和集合を一度だけKV warming（失敗は警告のみ）
 ```
 
 重要なのは公開順序である。
 
 ```text
-NAR本体（R2）
+全hostの start / ingest
+  ↓
+host別 manifest（R2）
+  ↓
+NAR本体（R2、全hostの和集合）
   ↓
 .narinfo（R2）
   ↓
-D1 で published / latest を確定（control plane の正本）
+host別 finalize（control plane の正本）
   ↓
 KV を warming（速度層・最後）
 ```
@@ -488,6 +474,8 @@ KV を warming（速度層・最後）
 
 `latest` pointer が更新されるのは `POST /api/publish/:id/finalize` の 1 ステップのみ。
 `start` / `ingest` 途中で中断しても read path（narinfo / NAR）には影響しない。
+
+manifestとD1 `build_closure` は各hostのclosureとprune後narinfoの積集合に限定する。他host専用pathを混入させない。全pathがupstreamに存在するhostは空closureとしてfinalizeする。複数host全体のlatest更新はatomicではなく、一部hostのfinalize後に失敗した場合は未完了hostだけを再実行する。
 
 詳細な運用手順・冪等再実行・トラブルシューティングは `docs/publish.md` を参照。
 
