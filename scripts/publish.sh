@@ -2,6 +2,13 @@
 # cf-edgeNix batch publish step (spec docs/spec.md §9)
 set -euo pipefail
 
+total_started=$SECONDS
+log_timing() {
+  local phase="$1"
+  local started="$2"
+  echo "[timing] ${phase}=$(( SECONDS - started ))s"
+}
+
 : "${CACHE_DIR:?CACHE_DIR is required}"
 : "${CACHE_PRIVATE_KEY:?CACHE_PRIVATE_KEY is required}"
 : "${ZSTD_LEVEL:=9}"
@@ -67,8 +74,11 @@ installables=()
 for host in "${hosts[@]}"; do
   installables+=(".#nixosConfigurations.\"${host}\".config.system.build.toplevel")
 done
+phase_started=$SECONDS
 nix build "${installables[@]}" --no-link
+log_timing "build" "$phase_started"
 
+phase_started=$SECONDS
 for host in "${hosts[@]}"; do
   installable=".#nixosConfigurations.\"${host}\".config.system.build.toplevel"
   out="$(nix eval --raw "$installable")"
@@ -95,10 +105,12 @@ for host in "${hosts[@]}"; do
       toplevelStorePath: $toplevelStorePath, closureJsonPath: $closureJsonPath,
       closureStorePaths: ($closure[0] | keys)}' >> "$targets_file"
 done
+log_timing "closure-metadata" "$phase_started"
 
 sort -u -o "$closure_paths_file" "$closure_paths_file"
 closure_count="$(wc -l < "$closure_paths_file")"
 
+phase_started=$SECONDS
 if [ "${SKIP_UPSTREAM_PRUNE:-0}" = "1" ]; then
   cp "$closure_paths_file" "$self_candidates_file"
   echo "[preflight] SKIP_UPSTREAM_PRUNE=1, passing all ${closure_count} paths to self cache check"
@@ -134,8 +146,10 @@ else
   upstream_count=$(( closure_count - self_candidate_count ))
   echo "[preflight] upstream owns ${upstream_count}/${closure_count}; self candidates ${self_candidate_count}"
 fi
+log_timing "upstream-preflight" "$phase_started"
 
 self_candidate_count="$(wc -l < "$self_candidates_file")"
+phase_started=$SECONDS
 if [ "${SKIP_SELF_CACHE_REUSE:-0}" = "1" ]; then
   cp "$self_candidates_file" "$copy_paths_file"
   echo "[preflight] SKIP_SELF_CACHE_REUSE=1, copying ${self_candidate_count} self candidates"
@@ -178,8 +192,10 @@ else
   reused_count=$(( self_candidate_count - copy_count ))
   echo "[preflight] self cache reuses ${reused_count}/${self_candidate_count}; copying ${copy_count}"
 fi
+log_timing "self-cache-preflight" "$phase_started"
 
 copy_count="$(wc -l < "$copy_paths_file")"
+phase_started=$SECONDS
 if [ "$copy_count" -gt 0 ]; then
   nix copy \
     --to "file://${CACHE_DIR}?compression=zstd&compression-level=${ZSTD_LEVEL}&secret-key=${key_file}" \
@@ -189,11 +205,15 @@ if [ "$copy_count" -gt 0 ]; then
 else
   echo "[copy] no self-hosted paths to copy"
 fi
+log_timing "copy" "$phase_started"
 
 jq -s --arg cacheDir "$CACHE_DIR" \
   '{version: 1, cacheDir: $cacheDir, targets: .}' \
   "$targets_file" > "$plan_file"
 
 echo "Uploading ${#hosts[@]} host(s) to R2/D1/KV via scripts/publish.ts..."
+phase_started=$SECONDS
 bun "$(dirname "$0")/publish.ts" --plan "$plan_file"
+log_timing "publish" "$phase_started"
+log_timing "total" "$total_started"
 echo "publish.ts complete"

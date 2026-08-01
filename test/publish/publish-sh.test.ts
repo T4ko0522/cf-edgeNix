@@ -187,6 +187,17 @@ describe("scripts/publish.sh", () => {
     expect(copyArgs).toContain("--stdin");
   });
 
+  test("主要phaseの所要時間をログへ出す", async () => {
+    const { stdout } = await runPublishSh({});
+    expect(stdout).toMatch(/\[timing\] build=\d+s/);
+    expect(stdout).toMatch(/\[timing\] closure-metadata=\d+s/);
+    expect(stdout).toMatch(/\[timing\] upstream-preflight=\d+s/);
+    expect(stdout).toMatch(/\[timing\] self-cache-preflight=\d+s/);
+    expect(stdout).toMatch(/\[timing\] copy=\d+s/);
+    expect(stdout).toMatch(/\[timing\] publish=\d+s/);
+    expect(stdout).toMatch(/\[timing\] total=\d+s/);
+  });
+
   test("ZSTD_LEVEL が整数でない場合は失敗する", async () => {
     await expect(runPublishSh({ ZSTD_LEVEL: "fast" })).rejects.toMatchObject({
       code: 2,
