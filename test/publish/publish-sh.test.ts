@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -19,6 +19,7 @@ async function runPublishSh(
 ): Promise<{
   copyArgs: string[];
   copyStdin: string[];
+  cacheNarinfos: string[];
   nixCommands: string[];
   bunArgs: string[];
   plan: { targets: Array<{ host: string; system: string; closureStorePaths: string[] }> };
@@ -105,6 +106,25 @@ cp "$3" "$PLAN_LOG"
   await writeExecutable(
     join(binDir, "curl"),
     `#!/usr/bin/env bash
+output="/dev/null"
+args=("$@")
+for ((i = 0; i < \${#args[@]}; i++)); do
+  if [ "\${args[$i]}" = "-o" ]; then output="\${args[$((i + 1))]}"; fi
+done
+url="\${args[-1]}"
+if [ -n "\${SELF_CACHE_HIT_HASH:-}" ] && [[ "$url" == "https://cache.example.com/$SELF_CACHE_HIT_HASH.narinfo" ]]; then
+  cat > "$output" <<EOF
+StorePath: /nix/store/\${SELF_CACHE_STORE_HASH:-$SELF_CACHE_HIT_HASH}-shared
+URL: nar/shared.nar.zst
+Compression: zstd
+FileHash: sha256:shared
+FileSize: 10
+NarHash: sha256:sharednar
+NarSize: 20
+EOF
+  printf '200'
+  exit 0
+fi
 if [ "\${UPSTREAM_ALL_HIT:-0}" = "1" ] || { [ -n "\${UPSTREAM_HIT_HASH:-}" ] && [[ "\${*: -1}" == *"/$UPSTREAM_HIT_HASH.narinfo" ]]; }; then
   printf '200'
 else
@@ -129,6 +149,7 @@ fi
       SYSTEM: "x86_64-linux",
       FLAKE_LOCK_HASH: "sha256:lock",
       SKIP_UPSTREAM_PRUNE: "1",
+      SKIP_SELF_CACHE_REUSE: "1",
       NIX_STUB_LOG: nixLog,
       NIX_COMMANDS_LOG: nixCommandsLog,
       NIX_STDIN_LOG: nixStdinLog,
@@ -141,6 +162,7 @@ fi
   return {
     copyArgs: (await readFile(nixLog, "utf8")).trim().split("\n"),
     copyStdin: (await readFile(nixStdinLog, "utf8")).trim().split("\n").filter(Boolean),
+    cacheNarinfos: (await readdir(cacheDir)).filter((name) => name.endsWith(".narinfo")).sort(),
     nixCommands: (await readFile(nixCommandsLog, "utf8")).trim().split("\n"),
     bunArgs: (await readFile(bunLog, "utf8")).trim().split("\n"),
     plan: JSON.parse(await readFile(planLog, "utf8")) as {
@@ -190,6 +212,7 @@ describe("scripts/publish.sh", () => {
       {
         HOST: "",
         SKIP_UPSTREAM_PRUNE: "0",
+        SKIP_SELF_CACHE_REUSE: "0",
         UPSTREAM_HIT_HASH: "shared0000000000",
       },
       ["laptop", "desktop"],
@@ -199,7 +222,8 @@ describe("scripts/publish.sh", () => {
       "/nix/store/desktop000000000-system",
       "/nix/store/laptop000000000-system",
     ]);
-    expect(result.stdout).toContain("[preflight] upstream owns 1/3; copying 2");
+    expect(result.stdout).toContain("[preflight] upstream owns 1/3; self candidates 2");
+    expect(result.stdout).toContain("[preflight] self cache reuses 0/2; copying 2");
   });
 
   test("全pathがupstreamにあればcopyを省略してpublishを続行する", async () => {
@@ -211,6 +235,31 @@ describe("scripts/publish.sh", () => {
     expect(result.nixCommands.filter((line) => line.startsWith("copy\t"))).toHaveLength(0);
     expect(result.bunArgs[1]).toBe("--plan");
     expect(result.stdout).toContain("[copy] no self-hosted paths to copy");
+  });
+
+  test("self cache保有pathはnarinfoを再利用してcopy対象から外す", async () => {
+    const result = await runPublishSh({
+      SKIP_UPSTREAM_PRUNE: "0",
+      SKIP_SELF_CACHE_REUSE: "0",
+      SELF_CACHE_HIT_HASH: "shared0000000000",
+    });
+
+    expect(result.copyStdin).not.toContain("/nix/store/shared0000000000-shared");
+    expect(result.cacheNarinfos).toContain("shared0000000000.narinfo");
+    expect(result.stdout).toContain("[preflight] self cache reuses 1/2; copying 1");
+  });
+
+  test("self cacheのnarinfoがstore pathと一致しなければcopyへフォールバックする", async () => {
+    const result = await runPublishSh({
+      SKIP_UPSTREAM_PRUNE: "0",
+      SKIP_SELF_CACHE_REUSE: "0",
+      SELF_CACHE_HIT_HASH: "shared0000000000",
+      SELF_CACHE_STORE_HASH: "different00000000",
+    });
+
+    expect(result.copyStdin).toContain("/nix/store/shared0000000000-shared");
+    expect(result.cacheNarinfos).not.toContain("shared0000000000.narinfo");
+    expect(result.stdout).toContain("[preflight] self cache reuses 0/2; copying 2");
   });
 
   test("各hostのsystemをflake属性から個別に取得する", async () => {

@@ -32,12 +32,12 @@
 #   - 全 host を 1 回の publish.sh で build/copy し、共有 closure を重複処理しない
 #   - bash .cf-edgenix/scripts/publish.sh が
 #       nix build .#nixosConfigurations.<HOST>...
-#       cache.nixos.org の保有 path を preflight
+#       cache.nixos.org とself cacheの保有 path を preflight
 #       nix copy --no-recursive --stdin --to file://$CACHE_DIR (未保有pathだけ圧縮・署名)
 #       bun publish.ts → R2 (S3 API) / KV bulk へ反映
 #     を順に実行する
 #   - host 指定時も同じ batch 経路を単一引数で実行する
-#   - SKIP_UPSTREAM_PRUNE=1 / UPSTREAM_CACHE_URL=... で preflight 挙動を制御可能 (docs/publish.md)
+#   - upstream/self cacheのpreflight挙動は環境変数で制御可能 (docs/publish.md)
 
 name: publish-cache
 

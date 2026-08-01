@@ -48,6 +48,8 @@ GitHub Actions の Environment (`production`) に事前登録する値。
   ↓
 upstream preflight                    ← cache.nixos.org の保有 path を先に HEAD
   ↓
+self cache preflight                  ← 既存narinfoを再利用し、live-set参照を維持
+  ↓
 nix copy --no-recursive --stdin       ← 未保有 path だけを圧縮・署名
   ↓
 scripts/publish.ts --plan <JSON>      ← R2/D1/KV への一括反映
@@ -60,7 +62,7 @@ scripts/publish.ts --plan <JSON>      ← R2/D1/KV への一括反映
   └── Step 5: 全 host の和集合を KV warming（1回、失敗は警告のみ）
 ```
 
-`scripts/publish.sh` は全hostを一度の build / preflight / copy で処理し、秘密情報を含まない一時publish planを `scripts/publish.ts` へ渡す。共有 `CACHE_DIR` は一度だけ走査される。各hostのmanifestは `host closure ∩ copy後のnarinfo` で作り、他host専用pathを混入させない。全pathがupstreamにあるhostは空closureとしてfinalizeする。
+`scripts/publish.sh` は全hostを一度の build / preflight / copy で処理し、秘密情報を含まない一時publish planを `scripts/publish.ts` へ渡す。共有 `CACHE_DIR` は一度だけ走査される。各hostのmanifestは `host closure ∩ (self cache再利用またはcopy後のnarinfo)` で作り、他host専用pathを混入させない。全pathがupstreamにあるhostは空closureとしてfinalizeする。
 
 ### upstream preflight（圧縮時間とR2容量の節約）
 
@@ -80,6 +82,19 @@ Nix client 側は `extra-substituters = [ "https://nix.t4ko.pet" ];` のよう�
 | `PRUNE_TIMEOUT` | `5` | 1 リクエストの最大秒数 |
 
 upstream が不通の場合（DNS NXDOMAIN / timeout / 5xx 等）は **削除しない**（=「無い扱い」ではなく「不明扱い」で安全側に倒す）。結果として R2 容量節約は効かないが、誤って必要な NAR を消す事故は起きない。
+
+### self cache reuse（再publishの圧縮省略）
+
+upstreamに無いpathは、続けて `API_BASE_URL/<storeHash>.narinfo` をGETする。200かつ `StorePath` と `URL` が期待形式に一致すれば、そのnarinfoを `CACHE_DIR` に復元し、`nix copy` 対象から外す。`publish.ts` は復元したnarinfoを通常どおりD1 ingestとmanifestへ含めるため、既存NARは新世代のGC live-setから参照され続ける。
+
+単にself cacheの200 pathを除外すると新世代の `build_closure` から消え、古い世代のGC時に稼働中NARまで削除し得る。narinfo再利用は圧縮を省略しつつこの参照を維持するための必須条件である。self cacheが不通、404、またはnarinfo不整合なら安全側に倒してローカルcopyする。
+
+| 環境変数 | 既定 | 用途 |
+| --- | --- | --- |
+| `SELF_CACHE_URL` | `API_BASE_URL` | 再利用するcf-edgeNixのread URL |
+| `SKIP_SELF_CACHE_REUSE` | `0` | `1` にするとself cache照会を省略して全候補をcopy |
+| `SELF_CACHE_CONCURRENCY` | `PRUNE_CONCURRENCY` または `32` | 並列GET数 |
+| `SELF_CACHE_TIMEOUT` | `PRUNE_TIMEOUT` または `5` | 1リクエストの最大秒数 |
 
 ---
 
@@ -174,8 +189,8 @@ bash scripts/publish.sh laptop desktop
 1. 全installableを単一の `nix build` でbuild
 2. 各flake属性を `nix eval` し、hostとtoplevelを出力順に依存せず対応付け
 3. host別closure JSONを生成
-4. closure和集合をupstreamへpreflight
-5. 未保有pathだけを単一の非再帰 `nix copy` で共有 `CACHE_DIR` へ出力
+4. closure和集合をupstreamとself cacheへpreflight
+5. どちらにも無いpathだけを単一の非再帰 `nix copy` で共有 `CACHE_DIR` へ出力
 6. `bun scripts/publish.ts --plan <plan.json>` を一度だけ実行
 
 `ZSTD_LEVEL` は Nix の binary cache store URL に渡す `compression-level` で、省略時は `9`（CI 時間と R2 サイズのバランス重視）。Nix 側の既定値を使いたい場合は `ZSTD_LEVEL=-1` を指定する。

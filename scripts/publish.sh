@@ -56,6 +56,7 @@ key_file="${work_dir}/cache-private-key"
 targets_file="${work_dir}/targets.jsonl"
 plan_file="${work_dir}/publish-plan.json"
 closure_paths_file="${work_dir}/closure-paths"
+self_candidates_file="${work_dir}/self-candidates"
 copy_paths_file="${work_dir}/copy-paths"
 trap 'rm -rf "$work_dir"' EXIT
 chmod 700 "$work_dir"
@@ -99,8 +100,8 @@ sort -u -o "$closure_paths_file" "$closure_paths_file"
 closure_count="$(wc -l < "$closure_paths_file")"
 
 if [ "${SKIP_UPSTREAM_PRUNE:-0}" = "1" ]; then
-  cp "$closure_paths_file" "$copy_paths_file"
-  echo "[preflight] SKIP_UPSTREAM_PRUNE=1, copying all ${closure_count} closure paths"
+  cp "$closure_paths_file" "$self_candidates_file"
+  echo "[preflight] SKIP_UPSTREAM_PRUNE=1, passing all ${closure_count} paths to self cache check"
 else
   upstream="${UPSTREAM_CACHE_URL:-https://cache.nixos.org}"
   upstream="${upstream%/}"
@@ -127,11 +128,55 @@ else
   xargs -r -P "$concurrency" -n 1 bash -c \
     'set -euo pipefail; select_missing_path "$1"' _ \
     < "$closure_paths_file" \
+    | sort > "$self_candidates_file"
+
+  self_candidate_count="$(wc -l < "$self_candidates_file")"
+  upstream_count=$(( closure_count - self_candidate_count ))
+  echo "[preflight] upstream owns ${upstream_count}/${closure_count}; self candidates ${self_candidate_count}"
+fi
+
+self_candidate_count="$(wc -l < "$self_candidates_file")"
+if [ "${SKIP_SELF_CACHE_REUSE:-0}" = "1" ]; then
+  cp "$self_candidates_file" "$copy_paths_file"
+  echo "[preflight] SKIP_SELF_CACHE_REUSE=1, copying ${self_candidate_count} self candidates"
+else
+  self_cache_url="${SELF_CACHE_URL:-$API_BASE_URL}"
+  self_cache_url="${self_cache_url%/}"
+  self_concurrency="${SELF_CACHE_CONCURRENCY:-${PRUNE_CONCURRENCY:-32}}"
+  self_timeout="${SELF_CACHE_TIMEOUT:-${PRUNE_TIMEOUT:-5}}"
+  export PREFLIGHT_SELF_CACHE_URL="$self_cache_url"
+  export PREFLIGHT_SELF_TIMEOUT_SEC="$self_timeout"
+  export PREFLIGHT_CACHE_DIR="$CACHE_DIR"
+
+  reuse_or_select_path() {
+    local store_path="$1"
+    local base store_hash tmp status
+    base="${store_path##*/}"
+    store_hash="${base%%-*}"
+    tmp="${PREFLIGHT_CACHE_DIR}/.${store_hash}.narinfo.tmp.$$"
+    status="$(curl -sS -o "$tmp" \
+      --max-time "$PREFLIGHT_SELF_TIMEOUT_SEC" \
+      -w '%{http_code}' \
+      "${PREFLIGHT_SELF_CACHE_URL}/${store_hash}.narinfo" 2>/dev/null || echo "000")"
+    if [ "$status" = "200" ] \
+      && grep -Fqx "StorePath: ${store_path}" "$tmp" \
+      && grep -Eq '^URL: nar/[0-9a-z]+\.nar(\.(xz|zst|gz|br))?$' "$tmp"; then
+      mv "$tmp" "${PREFLIGHT_CACHE_DIR}/${store_hash}.narinfo"
+      return 0
+    fi
+    rm -f "$tmp"
+    printf '%s\n' "$store_path"
+  }
+  export -f reuse_or_select_path
+
+  xargs -r -P "$self_concurrency" -n 1 bash -c \
+    'set -euo pipefail; reuse_or_select_path "$1"' _ \
+    < "$self_candidates_file" \
     | sort > "$copy_paths_file"
 
   copy_count="$(wc -l < "$copy_paths_file")"
-  upstream_count=$(( closure_count - copy_count ))
-  echo "[preflight] upstream owns ${upstream_count}/${closure_count}; copying ${copy_count}"
+  reused_count=$(( self_candidate_count - copy_count ))
+  echo "[preflight] self cache reuses ${reused_count}/${self_candidate_count}; copying ${copy_count}"
 fi
 
 copy_count="$(wc -l < "$copy_paths_file")"
