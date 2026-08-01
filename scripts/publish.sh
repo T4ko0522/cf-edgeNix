@@ -81,18 +81,17 @@ for host in "${hosts[@]}"; do
   closure_json_path="${target_dir}/closure.json"
   mkdir -p "$target_dir"
   nix path-info -r --json "$out" > "$closure_json_path"
-  closure_store_paths="$(jq -c 'keys' "$closure_json_path")"
   jq -cn \
+    --slurpfile closure "$closure_json_path" \
     --arg host "$host" \
     --arg system "$target_system" \
     --arg gitRev "$git_rev" \
     --arg flakeLockHash "$flake_lock_hash" \
     --arg toplevelStorePath "$out" \
     --arg closureJsonPath "$closure_json_path" \
-    --argjson closureStorePaths "$closure_store_paths" \
     '{host: $host, system: $system, gitRev: $gitRev, flakeLockHash: $flakeLockHash,
       toplevelStorePath: $toplevelStorePath, closureJsonPath: $closureJsonPath,
-      closureStorePaths: $closureStorePaths}' >> "$targets_file"
+      closureStorePaths: ($closure[0] | keys)}' >> "$targets_file"
 done
 
 nix copy \

@@ -20,7 +20,7 @@ async function runPublishSh(
   copyArgs: string[];
   nixCommands: string[];
   bunArgs: string[];
-  plan: { targets: Array<{ host: string; system: string }> };
+  plan: { targets: Array<{ host: string; system: string; closureStorePaths: string[] }> };
   stdout: string;
 }> {
   const dir = await mkdtemp(join(tmpdir(), "cf-edgenix-publish-sh-"));
@@ -54,7 +54,16 @@ case "$1" in
     ;;
   path-info)
     out="\${@: -1}"
-    printf '{"/nix/store/shared0000000000-shared":{},"%s":{}}\\n' "$out"
+    if [ -n "\${CLOSURE_PATH_COUNT:-}" ]; then
+      printf '{'
+      for ((i = 0; i < CLOSURE_PATH_COUNT; i++)); do
+        if [ "$i" -gt 0 ]; then printf ','; fi
+        printf '"/nix/store/%032d-package-%05d":{}' "$i" "$i"
+      done
+      printf ',"%s":{}}\\n' "$out"
+    else
+      printf '{"/nix/store/shared0000000000-shared":{},"%s":{}}\\n' "$out"
+    fi
     ;;
   copy)
     : > "$NIX_STUB_LOG"
@@ -124,7 +133,7 @@ printf '404'
     nixCommands: (await readFile(nixCommandsLog, "utf8")).trim().split("\n"),
     bunArgs: (await readFile(bunLog, "utf8")).trim().split("\n"),
     plan: JSON.parse(await readFile(planLog, "utf8")) as {
-      targets: Array<{ host: string; system: string }>;
+      targets: Array<{ host: string; system: string; closureStorePaths: string[] }>;
     },
     stdout: result.stdout,
   };
@@ -180,6 +189,11 @@ describe("scripts/publish.sh", () => {
       { host: "laptop", system: "x86_64-linux" },
       { host: "desktop", system: "aarch64-linux" },
     ]);
+  });
+
+  test("巨大なclosureをコマンドライン引数にせずplanへ格納する", async () => {
+    const result = await runPublishSh({ CLOSURE_PATH_COUNT: "3000" });
+    expect(result.plan.targets[0]?.closureStorePaths).toHaveLength(3001);
   });
 
   test("位置引数とHOSTの同時指定、重複、不正名を拒否する", async () => {
