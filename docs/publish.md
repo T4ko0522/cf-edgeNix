@@ -197,6 +197,8 @@ bash scripts/publish.sh laptop desktop
 
 `system` は各hostの `nixosConfigurations.<host>.pkgs.system` から取得する。`SYSTEM` を明示した場合だけ全targetへのoverrideとして扱う。
 
+各実行は `[timing] build=...s`、`closure-metadata`、`upstream-preflight`、`self-cache-preflight`、`copy`、`publish`、`total` をログへ出す。Actionsのstep全体だけでなく、圧縮・照会・uploadのどこに時間が移ったかをrun間で比較できる。
+
 ---
 
 ## GitHub Actions での実行
@@ -225,6 +227,10 @@ batchの一部だけがfinalize後に失敗した場合、完了済みbuildへ�
 ## 過去世代を GC する
 
 GC は host ごとの最新 3 published 世代、pin、rollback root、作成から 24 時間以内の staging build を保持する。世代ごとの `build_closure.nar_key` を live-set の正本とし、同じ store hash の NAR が世代間で変化しても個別に判定する。
+
+Workerのhourly Cron Trigger（毎時17分）は、前回までに1時間のgraceを満たしたNARを `phase: nar` で最大10件削除してから、新しいdead候補のnarinfoを `phase: narinfo` で最大10件非公開化する。物理削除を先にすることで、直前のhourly実行で付けたtombstoneを回収し、その後に次回対象を作る。API自身がlive-set再検証とgraceを強制する。`ADMIN_TOKEN` が未設定ならscheduled GCは安全にskipする。
+
+旧migration由来closureのbackfillはエラー確認と再実行が必要な移行操作なので自動化せず、以下の管理API手順を使う。
 
 migration `0003_safe_generational_gc.sql` の適用直後は、旧 closure の `nar_key` が未解決である間、GC は fail-closed で全 NAR を live として扱う。`0004_gc_review_fixes.sql` は既存 build を `restorable=0` から開始して復元可否を永続化し、`build_closure.nar_key` の index を追加する。backfill が closure 全体の整合性を確認できた build だけを `restorable=1` にする。R2 manifest から参照を復元し、`closure_rows_remaining` が 0 になるまで backfill を繰り返す。
 

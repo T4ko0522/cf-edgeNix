@@ -366,7 +366,7 @@ GET /api/builds/<build_id>/manifest.json
 
 なお manifest 自体には署名を付けない（決定）。理由と、将来 public cache 化する場合に署名 + freshness を再検討する判断軸は `fixme.md` を参照。
 
-GC は narinfo の非公開化、1 時間の grace、live-set 再検証、NAR の物理削除の順で実行する。詳細は §8 と `docs/publish.md` を参照。
+GC は narinfo の非公開化、1 時間の grace、live-set 再検証、NAR の物理削除の順で実行する。hourly Cronは前回のgrace済みNARを最大10件削除した後、新しいnarinfoを最大10件非公開化する。詳細は §8 と `docs/publish.md` を参照。
 
 ---
 

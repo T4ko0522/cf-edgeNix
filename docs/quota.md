@@ -11,7 +11,7 @@ read path の手前には Workers Cache（`wrangler.toml` の `[cache]`）があ
 
 ## 監視対象としきい値
 
-Cron Trigger（`*/5 * * * *`）が Cloudflare GraphQL Analytics API を読み、月初 UTC から現在までの使用量を `META_KV` の `quota:state` に保存する。
+quota用Cron Trigger（`*/5 * * * *`）が Cloudflare GraphQL Analytics API を読み、月初 UTC から現在までの使用量を `META_KV` の `quota:state` に保存する。別のhourly trigger（`17 * * * *`）は世代GC専用で、quota集計は実行しない。
 
 | 指標 | 無料枠 | `warn` | `killed` |
 | --- | ---: | ---: | ---: |

@@ -6,6 +6,7 @@ import { handleNar } from "./handlers/nar";
 import { apiApp } from "./api/app";
 import { checkReadPathAllowed } from "./quota/guard";
 import { runQuotaCheck } from "./quota/cron";
+import { runScheduledGc } from "./gc/cron";
 
 /**
  * cf-edgeNix Worker entry。
@@ -48,7 +49,11 @@ export default {
     }
   },
 
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (controller.cron === "17 * * * *") {
+      await runScheduledGc(env, ctx);
+      return;
+    }
     if (!env.CF_ACCOUNT_ID || !env.CF_ANALYTICS_TOKEN) {
       console.warn("[quota] CF_ACCOUNT_ID or CF_ANALYTICS_TOKEN not set; skipping check");
       return;
