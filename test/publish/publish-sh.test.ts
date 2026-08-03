@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -18,6 +18,8 @@ async function runPublishSh(
   hosts: string[] = [],
 ): Promise<{
   copyArgs: string[];
+  copyStdin: string[];
+  cacheNarinfos: string[];
   nixCommands: string[];
   bunArgs: string[];
   plan: { targets: Array<{ host: string; system: string; closureStorePaths: string[] }> };
@@ -28,10 +30,13 @@ async function runPublishSh(
   const cacheDir = join(dir, "cache");
   const nixLog = join(dir, "nix-args.log");
   const nixCommandsLog = join(dir, "nix-commands.log");
+  const nixStdinLog = join(dir, "nix-stdin.log");
   const bunLog = join(dir, "bun-args.log");
   const planLog = join(dir, "plan.json");
   await mkdir(binDir);
   await mkdir(cacheDir);
+  await writeFile(nixLog, "");
+  await writeFile(nixStdinLog, "");
 
   await writeExecutable(
     join(binDir, "nix"),
@@ -68,6 +73,7 @@ case "$1" in
   copy)
     : > "$NIX_STUB_LOG"
     for arg in "$@"; do printf '%s\\n' "$arg" >> "$NIX_STUB_LOG"; done
+    cat > "$NIX_STDIN_LOG"
     mkdir -p "$CACHE_DIR/nar"
     printf 'nar' > "$CACHE_DIR/nar/sha256:file001.nar.zst"
     cat > "$CACHE_DIR/abcdef123456aaaa.narinfo" <<'EOF'
@@ -100,7 +106,30 @@ cp "$3" "$PLAN_LOG"
   await writeExecutable(
     join(binDir, "curl"),
     `#!/usr/bin/env bash
-printf '404'
+output="/dev/null"
+args=("$@")
+for ((i = 0; i < \${#args[@]}; i++)); do
+  if [ "\${args[$i]}" = "-o" ]; then output="\${args[$((i + 1))]}"; fi
+done
+url="\${args[-1]}"
+if [ -n "\${SELF_CACHE_HIT_HASH:-}" ] && [[ "$url" == "https://cache.example.com/$SELF_CACHE_HIT_HASH.narinfo" ]]; then
+  cat > "$output" <<EOF
+StorePath: /nix/store/\${SELF_CACHE_STORE_HASH:-$SELF_CACHE_HIT_HASH}-shared
+URL: nar/shared.nar.zst
+Compression: zstd
+FileHash: sha256:shared
+FileSize: 10
+NarHash: sha256:sharednar
+NarSize: 20
+EOF
+  printf '200'
+  exit 0
+fi
+if [ "\${UPSTREAM_ALL_HIT:-0}" = "1" ] || { [ -n "\${UPSTREAM_HIT_HASH:-}" ] && [[ "\${*: -1}" == *"/$UPSTREAM_HIT_HASH.narinfo" ]]; }; then
+  printf '200'
+else
+  printf '404'
+fi
 `,
   );
 
@@ -120,8 +149,10 @@ printf '404'
       SYSTEM: "x86_64-linux",
       FLAKE_LOCK_HASH: "sha256:lock",
       SKIP_UPSTREAM_PRUNE: "1",
+      SKIP_SELF_CACHE_REUSE: "1",
       NIX_STUB_LOG: nixLog,
       NIX_COMMANDS_LOG: nixCommandsLog,
+      NIX_STDIN_LOG: nixStdinLog,
       BUN_STUB_LOG: bunLog,
       PLAN_LOG: planLog,
       ...env,
@@ -130,6 +161,8 @@ printf '404'
 
   return {
     copyArgs: (await readFile(nixLog, "utf8")).trim().split("\n"),
+    copyStdin: (await readFile(nixStdinLog, "utf8")).trim().split("\n").filter(Boolean),
+    cacheNarinfos: (await readdir(cacheDir)).filter((name) => name.endsWith(".narinfo")).sort(),
     nixCommands: (await readFile(nixCommandsLog, "utf8")).trim().split("\n"),
     bunArgs: (await readFile(bunLog, "utf8")).trim().split("\n"),
     plan: JSON.parse(await readFile(planLog, "utf8")) as {
@@ -150,6 +183,19 @@ describe("scripts/publish.sh", () => {
     expect(copyArgs[0]).toBe("copy");
     expect(copyArgs[1]).toBe("--to");
     expect(copyArgs[2]).toContain("?compression=zstd&compression-level=9&secret-key=");
+    expect(copyArgs).toContain("--no-recursive");
+    expect(copyArgs).toContain("--stdin");
+  });
+
+  test("主要phaseの所要時間をログへ出す", async () => {
+    const { stdout } = await runPublishSh({});
+    expect(stdout).toMatch(/\[timing\] build=\d+s/);
+    expect(stdout).toMatch(/\[timing\] closure-metadata=\d+s/);
+    expect(stdout).toMatch(/\[timing\] upstream-preflight=\d+s/);
+    expect(stdout).toMatch(/\[timing\] self-cache-preflight=\d+s/);
+    expect(stdout).toMatch(/\[timing\] copy=\d+s/);
+    expect(stdout).toMatch(/\[timing\] publish=\d+s/);
+    expect(stdout).toMatch(/\[timing\] total=\d+s/);
   });
 
   test("ZSTD_LEVEL が整数でない場合は失敗する", async () => {
@@ -165,19 +211,66 @@ describe("scripts/publish.sh", () => {
     expect(result.nixCommands.filter((line) => line.startsWith("copy\t"))).toHaveLength(1);
     expect(result.nixCommands.find((line) => line.startsWith("build\t"))).toContain("laptop");
     expect(result.nixCommands.find((line) => line.startsWith("build\t"))).toContain("desktop");
-    expect(result.copyArgs).toContain("/nix/store/laptop000000000-system");
-    expect(result.copyArgs).toContain("/nix/store/desktop000000000-system");
+    expect(result.copyStdin).toContain("/nix/store/laptop000000000-system");
+    expect(result.copyStdin).toContain("/nix/store/desktop000000000-system");
     expect(result.bunArgs[1]).toBe("--plan");
     expect(result.plan.targets).toHaveLength(2);
     expect(JSON.stringify(result.plan)).not.toContain("test-private-key");
   });
 
-  test("2ホストでもupstream pruneを一度だけ実行する", async () => {
+  test("upstream保有pathを圧縮前に除外し、未保有pathだけをcopyする", async () => {
     const result = await runPublishSh(
-      { HOST: "", SKIP_UPSTREAM_PRUNE: "0" },
+      {
+        HOST: "",
+        SKIP_UPSTREAM_PRUNE: "0",
+        SKIP_SELF_CACHE_REUSE: "0",
+        UPSTREAM_HIT_HASH: "shared0000000000",
+      },
       ["laptop", "desktop"],
     );
-    expect(result.stdout.match(/\[prune\] checking/g)).toHaveLength(1);
+    expect(result.copyStdin).not.toContain("/nix/store/shared0000000000-shared");
+    expect(result.copyStdin).toEqual([
+      "/nix/store/desktop000000000-system",
+      "/nix/store/laptop000000000-system",
+    ]);
+    expect(result.stdout).toContain("[preflight] upstream owns 1/3; self candidates 2");
+    expect(result.stdout).toContain("[preflight] self cache reuses 0/2; copying 2");
+  });
+
+  test("全pathがupstreamにあればcopyを省略してpublishを続行する", async () => {
+    const result = await runPublishSh({
+      SKIP_UPSTREAM_PRUNE: "0",
+      UPSTREAM_ALL_HIT: "1",
+    });
+
+    expect(result.nixCommands.filter((line) => line.startsWith("copy\t"))).toHaveLength(0);
+    expect(result.bunArgs[1]).toBe("--plan");
+    expect(result.stdout).toContain("[copy] no self-hosted paths to copy");
+  });
+
+  test("self cache保有pathはnarinfoを再利用してcopy対象から外す", async () => {
+    const result = await runPublishSh({
+      SKIP_UPSTREAM_PRUNE: "0",
+      SKIP_SELF_CACHE_REUSE: "0",
+      SELF_CACHE_HIT_HASH: "shared0000000000",
+    });
+
+    expect(result.copyStdin).not.toContain("/nix/store/shared0000000000-shared");
+    expect(result.cacheNarinfos).toContain("shared0000000000.narinfo");
+    expect(result.stdout).toContain("[preflight] self cache reuses 1/2; copying 1");
+  });
+
+  test("self cacheのnarinfoがstore pathと一致しなければcopyへフォールバックする", async () => {
+    const result = await runPublishSh({
+      SKIP_UPSTREAM_PRUNE: "0",
+      SKIP_SELF_CACHE_REUSE: "0",
+      SELF_CACHE_HIT_HASH: "shared0000000000",
+      SELF_CACHE_STORE_HASH: "different00000000",
+    });
+
+    expect(result.copyStdin).toContain("/nix/store/shared0000000000-shared");
+    expect(result.cacheNarinfos).not.toContain("shared0000000000.narinfo");
+    expect(result.stdout).toContain("[preflight] self cache reuses 0/2; copying 2");
   });
 
   test("各hostのsystemをflake属性から個別に取得する", async () => {

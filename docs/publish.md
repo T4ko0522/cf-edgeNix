@@ -46,9 +46,11 @@ GitHub Actions の Environment (`production`) に事前登録する値。
 ```
 全 host を単一 nix build            ← NixOS system closure をビルド
   ↓
-nix copy --to file://$CACHE_DIR       ← 署名済み .narinfo と nar/*.nar.zst を生成
+upstream preflight                    ← cache.nixos.org の保有 path を先に HEAD
   ↓
-scripts/prune-upstream.sh             ← cache.nixos.org に既にある path を除外
+self cache preflight                  ← 既存narinfoを再利用し、live-set参照を維持
+  ↓
+nix copy --no-recursive --stdin       ← 未保有 path だけを圧縮・署名
   ↓
 scripts/publish.ts --plan <JSON>      ← R2/D1/KV への一括反映
   │
@@ -60,13 +62,13 @@ scripts/publish.ts --plan <JSON>      ← R2/D1/KV への一括反映
   └── Step 5: 全 host の和集合を KV warming（1回、失敗は警告のみ）
 ```
 
-`scripts/publish.sh` は全hostを一度の build / copy / upstream prune で処理し、秘密情報を含まない一時publish planを `scripts/publish.ts` へ渡す。共有 `CACHE_DIR` は一度だけ走査される。各hostのmanifestは `host closure ∩ prune後のnarinfo` で作り、他host専用pathを混入させない。全pathがupstreamにあるhostは空closureとしてfinalizeする。
+`scripts/publish.sh` は全hostを一度の build / preflight / copy で処理し、秘密情報を含まない一時publish planを `scripts/publish.ts` へ渡す。共有 `CACHE_DIR` は一度だけ走査される。各hostのmanifestは `host closure ∩ (self cache再利用またはcopy後のnarinfo)` で作り、他host専用pathを混入させない。全pathがupstreamにあるhostは空closureとしてfinalizeする。
 
-### upstream prune（R2 容量節約）
+### upstream preflight（圧縮時間とR2容量の節約）
 
-`nix copy` は closure 全体（nixpkgs 由来の path を含む）を `CACHE_DIR` に吐く。これをそのまま R2 に上げると、cache.nixos.org に既にある path で容量を浪費する。
+closure 全体を先に `nix copy` すると、後から削除する path にも zstd 圧縮と署名のCPU時間を使う。`publish.sh` はhost別closureの和集合を作り、各store hashのnarinfoをupstreamへ並列HEADしてからcopy対象を決める。
 
-`scripts/prune-upstream.sh` は `CACHE_DIR` 直下の各 `<storeHash>.narinfo` について `https://cache.nixos.org/<storeHash>.narinfo` を HEAD で確認し、200 を返す **narinfoだけ**を削除する。NAR本体は別のstore pathから共有される可能性があるため削除しない。`publish.ts` は残ったnarinfoを起点にR2/D1/KVへ反映する。
+200を返したpathはupstream所有として除外し、それ以外だけを `nix copy --no-recursive --stdin` へ渡す。これによりupstream所有pathはローカルcacheに圧縮せず、R2にも送らない。`--stdin` を使うため巨大なclosureでもOSのコマンドライン長制限を受けない。
 
 Nix client 側は `extra-substituters = [ "https://nix.t4ko.pet" ];` のように cf-edgeNix と cache.nixos.org の **両方**を持つ前提なので、自前 cache に無い path は upstream から fetch される。`docs/setup.md` の C4 設定が守られていれば破綻しない。
 
@@ -75,11 +77,24 @@ Nix client 側は `extra-substituters = [ "https://nix.t4ko.pet" ];` のよう�
 | 環境変数 | 既定 | 用途 |
 | --- | --- | --- |
 | `UPSTREAM_CACHE_URL` | `https://cache.nixos.org` | 対象 substituter URL（自前で複数階層 cache を運用するときに使用） |
-| `SKIP_UPSTREAM_PRUNE` | `0` | `1` にすると prune ステップを丸ごとスキップ（デバッグ用） |
+| `SKIP_UPSTREAM_PRUNE` | `0` | `1` にすると preflight をスキップして全pathをcopy（デバッグ用） |
 | `PRUNE_CONCURRENCY` | `32` | 並列 curl 数 |
 | `PRUNE_TIMEOUT` | `5` | 1 リクエストの最大秒数 |
 
 upstream が不通の場合（DNS NXDOMAIN / timeout / 5xx 等）は **削除しない**（=「無い扱い」ではなく「不明扱い」で安全側に倒す）。結果として R2 容量節約は効かないが、誤って必要な NAR を消す事故は起きない。
+
+### self cache reuse（再publishの圧縮省略）
+
+upstreamに無いpathは、続けて `API_BASE_URL/<storeHash>.narinfo` をGETする。200かつ `StorePath` と `URL` が期待形式に一致すれば、そのnarinfoを `CACHE_DIR` に復元し、`nix copy` 対象から外す。`publish.ts` は復元したnarinfoを通常どおりD1 ingestとmanifestへ含めるため、既存NARは新世代のGC live-setから参照され続ける。
+
+単にself cacheの200 pathを除外すると新世代の `build_closure` から消え、古い世代のGC時に稼働中NARまで削除し得る。narinfo再利用は圧縮を省略しつつこの参照を維持するための必須条件である。self cacheが不通、404、またはnarinfo不整合なら安全側に倒してローカルcopyする。
+
+| 環境変数 | 既定 | 用途 |
+| --- | --- | --- |
+| `SELF_CACHE_URL` | `API_BASE_URL` | 再利用するcf-edgeNixのread URL |
+| `SKIP_SELF_CACHE_REUSE` | `0` | `1` にするとself cache照会を省略して全候補をcopy |
+| `SELF_CACHE_CONCURRENCY` | `PRUNE_CONCURRENCY` または `32` | 並列GET数 |
+| `SELF_CACHE_TIMEOUT` | `PRUNE_TIMEOUT` または `5` | 1リクエストの最大秒数 |
 
 ---
 
@@ -174,13 +189,15 @@ bash scripts/publish.sh laptop desktop
 1. 全installableを単一の `nix build` でbuild
 2. 各flake属性を `nix eval` し、hostとtoplevelを出力順に依存せず対応付け
 3. host別closure JSONを生成
-4. 全toplevelを単一の `nix copy` で共有 `CACHE_DIR` へ出力
-5. upstream pruneを一度だけ実行
+4. closure和集合をupstreamとself cacheへpreflight
+5. どちらにも無いpathだけを単一の非再帰 `nix copy` で共有 `CACHE_DIR` へ出力
 6. `bun scripts/publish.ts --plan <plan.json>` を一度だけ実行
 
 `ZSTD_LEVEL` は Nix の binary cache store URL に渡す `compression-level` で、省略時は `9`（CI 時間と R2 サイズのバランス重視）。Nix 側の既定値を使いたい場合は `ZSTD_LEVEL=-1` を指定する。
 
 `system` は各hostの `nixosConfigurations.<host>.pkgs.system` から取得する。`SYSTEM` を明示した場合だけ全targetへのoverrideとして扱う。
+
+各実行は `[timing] build=...s`、`closure-metadata`、`upstream-preflight`、`self-cache-preflight`、`copy`、`publish`、`total` をログへ出す。Actionsのstep全体だけでなく、圧縮・照会・uploadのどこに時間が移ったかをrun間で比較できる。
 
 ---
 
@@ -210,6 +227,10 @@ batchの一部だけがfinalize後に失敗した場合、完了済みbuildへ�
 ## 過去世代を GC する
 
 GC は host ごとの最新 3 published 世代、pin、rollback root、作成から 24 時間以内の staging build を保持する。世代ごとの `build_closure.nar_key` を live-set の正本とし、同じ store hash の NAR が世代間で変化しても個別に判定する。
+
+Workerのhourly Cron Trigger（毎時17分）は、前回までに1時間のgraceを満たしたNARを `phase: nar` で最大10件削除してから、新しいdead候補のnarinfoを `phase: narinfo` で最大10件非公開化する。物理削除を先にすることで、直前のhourly実行で付けたtombstoneを回収し、その後に次回対象を作る。API自身がlive-set再検証とgraceを強制する。`ADMIN_TOKEN` が未設定ならscheduled GCは安全にskipする。
+
+旧migration由来closureのbackfillはエラー確認と再実行が必要な移行操作なので自動化せず、以下の管理API手順を使う。
 
 migration `0003_safe_generational_gc.sql` の適用直後は、旧 closure の `nar_key` が未解決である間、GC は fail-closed で全 NAR を live として扱う。`0004_gc_review_fixes.sql` は既存 build を `restorable=0` から開始して復元可否を永続化し、`build_closure.nar_key` の index を追加する。backfill が closure 全体の整合性を確認できた build だけを `restorable=1` にする。R2 manifest から参照を復元し、`closure_rows_remaining` が 0 になるまで backfill を繰り返す。
 

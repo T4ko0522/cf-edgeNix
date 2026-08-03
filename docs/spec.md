@@ -366,7 +366,7 @@ GET /api/builds/<build_id>/manifest.json
 
 なお manifest 自体には署名を付けない（決定）。理由と、将来 public cache 化する場合に署名 + freshness を再検討する判断軸は `fixme.md` を参照。
 
-GC は narinfo の非公開化、1 時間の grace、live-set 再検証、NAR の物理削除の順で実行する。詳細は §8 と `docs/publish.md` を参照。
+GC は narinfo の非公開化、1 時間の grace、live-set 再検証、NAR の物理削除の順で実行する。hourly Cronは前回のgrace済みNARを最大10件削除した後、新しいnarinfoを最大10件非公開化する。詳細は §8 と `docs/publish.md` を参照。
 
 ---
 
@@ -443,8 +443,8 @@ GitHub Actionsでビルドした成果物をCloudflareへpublishする。
 1. 全hostのinstallableを単一の nix build でビルド
 2. 各flake属性から個別にtoplevel store pathを確定（build出力順には依存しない）
 3. host別closure JSONとstore path一覧を生成
-4. 全toplevelを単一の nix copy で共有CACHE_DIRへ出力
-5. 共有CACHE_DIRを一度だけupstream prune（narinfoだけを削除し、NARは残す）
+4. closure和集合を一度だけupstreamとself cacheへpreflight
+5. upstream非保有かつself cacheでnarinfoを再利用できないpathだけを単一の非再帰 nix copy で共有CACHE_DIRへ出力
 6. CACHE_DIRのnarinfoを一度だけ走査し、host closureとの積集合を作る
 7. 全hostの POST /api/publish/start と ingest を完了
 8. host別closure.json / manifest.jsonをR2へ保存
@@ -475,7 +475,7 @@ KV を warming（速度層・最後）
 `latest` pointer が更新されるのは `POST /api/publish/:id/finalize` の 1 ステップのみ。
 `start` / `ingest` 途中で中断しても read path（narinfo / NAR）には影響しない。
 
-manifestとD1 `build_closure` は各hostのclosureとprune後narinfoの積集合に限定する。他host専用pathを混入させない。全pathがupstreamに存在するhostは空closureとしてfinalizeする。複数host全体のlatest更新はatomicではなく、一部hostのfinalize後に失敗した場合は未完了hostだけを再実行する。
+manifestとD1 `build_closure` は各hostのclosureとself cache再利用またはcopy後narinfoの積集合に限定する。他host専用pathを混入させない。self cache再利用pathは新世代のlive-set参照を維持する。全pathがupstreamに存在するhostは空closureとしてfinalizeする。複数host全体のlatest更新はatomicではなく、一部hostのfinalize後に失敗した場合は未完了hostだけを再実行する。
 
 詳細な運用手順・冪等再実行・トラブルシューティングは `docs/publish.md` を参照。
 

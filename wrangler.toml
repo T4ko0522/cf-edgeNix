@@ -61,7 +61,7 @@ CF_ACCOUNT_ID = "8aa8b75c4cc3e97fdcef331a87539b11"
 QUOTA_R2_BUCKET_NAME = "cf-edgenix-nar"
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/5 * * * *", "17 * * * *"]
 
 # Workers Logs を有効化（dashboard の Logs タブ / wrangler tail で確認可能）。
 # invocation_logs = true で 1 リクエスト 1 行のサマリログも残す。
