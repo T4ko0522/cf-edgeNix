@@ -22,9 +22,7 @@
 # ── 設置後に書き換える箇所 ──────────────────────────────────────────────
 #   1. Resolve target hosts ステップの allowlist (host1|host2) と default list を
 #      実 nixosConfigurations 名に置き換える
-#   2. cf-edgeNix の checkout ref を最新の commit SHA に pin する
-#      （branch tip 追従だと上流 commit が即座に secret を持った状態で実行されてしまう）
-#   3. 自動実行したい場合は、別 workflow から workflow_call で呼び出す
+#   2. 自動実行したい場合は、別 workflow から workflow_call で呼び出す
 #
 # ── 動作概要 ────────────────────────────────────────────────────────
 #   - 呼び出し側 repo (flake source) を CWD に、cf-edgeNix を .cf-edgenix/ に checkout
@@ -32,12 +30,12 @@
 #   - 全 host を 1 回の publish.sh で build/copy し、共有 closure を重複処理しない
 #   - bash .cf-edgenix/scripts/publish.sh が
 #       nix build .#nixosConfigurations.<HOST>...
-#       cache.nixos.org とself cacheの保有 path を preflight
-#       nix copy --no-recursive --stdin --to file://$CACHE_DIR (未保有pathだけ圧縮・署名)
+#       nix copy --to file://$CACHE_DIR (完全なclosureを圧縮・署名)
+#       cache.nixos.org が保有するnarinfoをCACHE_DIRからprune
 #       bun publish.ts → R2 (S3 API) / KV bulk へ反映
 #     を順に実行する
 #   - host 指定時も同じ batch 経路を単一引数で実行する
-#   - upstream/self cacheのpreflight挙動は環境変数で制御可能 (docs/publish.md)
+#   - upstream pruneの挙動は環境変数で制御可能 (docs/publish.md)
 
 name: publish-cache
 
@@ -80,7 +78,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: T4ko0522/cf-edgeNix
-          ref: REPLACE_WITH_CF_EDGENIX_COMMIT_SHA # 最新の main commit SHA に書き換える
+          ref: main
           path: .cf-edgenix
 
       # workflow_call / workflow_dispatch の host が空なら全 host、指定があれば
@@ -149,7 +147,7 @@ jobs:
       # CWD は flake source のまま、scripts は .cf-edgenix/scripts/ から起動する。
       # publish.sh は CWD の flake に対して nix build を走らせるので、
       # 呼び出し側 repo の nixosConfigurations.<HOST> がビルドされる。
-      # publish.sh が全 host をまとめて build/preflight/copy/upload する。
+      # publish.sh が全 host をまとめて build/copy/prune/upload する。
       - name: Build, sign & publish
         env:
           HOSTS: ${{ steps.hosts.outputs.list }}
