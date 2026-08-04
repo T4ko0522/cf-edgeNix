@@ -62,9 +62,6 @@ work_dir="$(mktemp -d)"
 key_file="${work_dir}/cache-private-key"
 targets_file="${work_dir}/targets.jsonl"
 plan_file="${work_dir}/publish-plan.json"
-closure_paths_file="${work_dir}/closure-paths"
-self_candidates_file="${work_dir}/self-candidates"
-copy_paths_file="${work_dir}/copy-paths"
 trap 'rm -rf "$work_dir"' EXIT
 chmod 700 "$work_dir"
 printf '%s' "$CACHE_PRIVATE_KEY" > "$key_file"
@@ -79,6 +76,7 @@ nix build "${installables[@]}" --no-link
 log_timing "build" "$phase_started"
 
 phase_started=$SECONDS
+out_paths=()
 for host in "${hosts[@]}"; do
   installable=".#nixosConfigurations.\"${host}\".config.system.build.toplevel"
   out="$(nix eval --raw "$installable")"
@@ -86,13 +84,13 @@ for host in "${hosts[@]}"; do
     echo "nix eval returned an invalid toplevel for $host: $out" >&2
     exit 1
   fi
+  out_paths+=("$out")
   target_system="${SYSTEM:-$(nix eval --raw ".#nixosConfigurations.\"${host}\".pkgs.system")}"
 
   target_dir="${work_dir}/targets/${host}"
   closure_json_path="${target_dir}/closure.json"
   mkdir -p "$target_dir"
   nix path-info -r --json "$out" > "$closure_json_path"
-  jq -r 'keys[]' "$closure_json_path" >> "$closure_paths_file"
   jq -cn \
     --slurpfile closure "$closure_json_path" \
     --arg host "$host" \
@@ -107,105 +105,21 @@ for host in "${hosts[@]}"; do
 done
 log_timing "closure-metadata" "$phase_started"
 
-sort -u -o "$closure_paths_file" "$closure_paths_file"
-closure_count="$(wc -l < "$closure_paths_file")"
+phase_started=$SECONDS
+nix copy \
+  --to "file://${CACHE_DIR}?compression=zstd&compression-level=${ZSTD_LEVEL}&secret-key=${key_file}" \
+  "${out_paths[@]}"
+log_timing "copy" "$phase_started"
 
 phase_started=$SECONDS
 if [ "${SKIP_UPSTREAM_PRUNE:-0}" = "1" ]; then
-  cp "$closure_paths_file" "$self_candidates_file"
-  echo "[preflight] SKIP_UPSTREAM_PRUNE=1, passing all ${closure_count} paths to self cache check"
+  echo "[prune] SKIP_UPSTREAM_PRUNE=1, skipping upstream subtraction"
 else
-  upstream="${UPSTREAM_CACHE_URL:-https://cache.nixos.org}"
-  upstream="${upstream%/}"
-  concurrency="${PRUNE_CONCURRENCY:-32}"
-  timeout="${PRUNE_TIMEOUT:-5}"
-  export PREFLIGHT_UPSTREAM="$upstream"
-  export PREFLIGHT_TIMEOUT_SEC="$timeout"
-
-  select_missing_path() {
-    local store_path="$1"
-    local base store_hash status
-    base="${store_path##*/}"
-    store_hash="${base%%-*}"
-    status="$(curl -sS -o /dev/null --head \
-      --max-time "$PREFLIGHT_TIMEOUT_SEC" \
-      -w '%{http_code}' \
-      "${PREFLIGHT_UPSTREAM}/${store_hash}.narinfo" 2>/dev/null || echo "000")"
-    if [ "$status" != "200" ]; then
-      printf '%s\n' "$store_path"
-    fi
-  }
-  export -f select_missing_path
-
-  xargs -r -P "$concurrency" -n 1 bash -c \
-    'set -euo pipefail; select_missing_path "$1"' _ \
-    < "$closure_paths_file" \
-    | sort > "$self_candidates_file"
-
-  self_candidate_count="$(wc -l < "$self_candidates_file")"
-  upstream_count=$(( closure_count - self_candidate_count ))
-  echo "[preflight] upstream owns ${upstream_count}/${closure_count}; self candidates ${self_candidate_count}"
+  bash "$(dirname "$0")/prune-upstream.sh" \
+    "$CACHE_DIR" \
+    "${UPSTREAM_CACHE_URL:-https://cache.nixos.org}"
 fi
-log_timing "upstream-preflight" "$phase_started"
-
-self_candidate_count="$(wc -l < "$self_candidates_file")"
-phase_started=$SECONDS
-if [ "${SKIP_SELF_CACHE_REUSE:-0}" = "1" ]; then
-  cp "$self_candidates_file" "$copy_paths_file"
-  echo "[preflight] SKIP_SELF_CACHE_REUSE=1, copying ${self_candidate_count} self candidates"
-else
-  self_cache_url="${SELF_CACHE_URL:-$API_BASE_URL}"
-  self_cache_url="${self_cache_url%/}"
-  self_concurrency="${SELF_CACHE_CONCURRENCY:-${PRUNE_CONCURRENCY:-32}}"
-  self_timeout="${SELF_CACHE_TIMEOUT:-${PRUNE_TIMEOUT:-5}}"
-  export PREFLIGHT_SELF_CACHE_URL="$self_cache_url"
-  export PREFLIGHT_SELF_TIMEOUT_SEC="$self_timeout"
-  export PREFLIGHT_CACHE_DIR="$CACHE_DIR"
-
-  reuse_or_select_path() {
-    local store_path="$1"
-    local base store_hash tmp status
-    base="${store_path##*/}"
-    store_hash="${base%%-*}"
-    tmp="${PREFLIGHT_CACHE_DIR}/.${store_hash}.narinfo.tmp.$$"
-    status="$(curl -sS -o "$tmp" \
-      --max-time "$PREFLIGHT_SELF_TIMEOUT_SEC" \
-      -w '%{http_code}' \
-      "${PREFLIGHT_SELF_CACHE_URL}/${store_hash}.narinfo" 2>/dev/null || echo "000")"
-    if [ "$status" = "200" ] \
-      && grep -Fqx "StorePath: ${store_path}" "$tmp" \
-      && grep -Eq '^URL: nar/[0-9a-z]+\.nar(\.(xz|zst|gz|br))?$' "$tmp"; then
-      mv "$tmp" "${PREFLIGHT_CACHE_DIR}/${store_hash}.narinfo"
-      return 0
-    fi
-    rm -f "$tmp"
-    printf '%s\n' "$store_path"
-  }
-  export -f reuse_or_select_path
-
-  xargs -r -P "$self_concurrency" -n 1 bash -c \
-    'set -euo pipefail; reuse_or_select_path "$1"' _ \
-    < "$self_candidates_file" \
-    | sort > "$copy_paths_file"
-
-  copy_count="$(wc -l < "$copy_paths_file")"
-  reused_count=$(( self_candidate_count - copy_count ))
-  echo "[preflight] self cache reuses ${reused_count}/${self_candidate_count}; copying ${copy_count}"
-fi
-log_timing "self-cache-preflight" "$phase_started"
-
-copy_count="$(wc -l < "$copy_paths_file")"
-phase_started=$SECONDS
-if [ "$copy_count" -gt 0 ]; then
-  nix copy \
-    --to "file://${CACHE_DIR}?compression=zstd&compression-level=${ZSTD_LEVEL}&secret-key=${key_file}" \
-    --no-recursive \
-    --stdin \
-    < "$copy_paths_file"
-else
-  echo "[copy] no self-hosted paths to copy"
-fi
-log_timing "copy" "$phase_started"
+log_timing "upstream-prune" "$phase_started"
 
 jq -s --arg cacheDir "$CACHE_DIR" \
   '{version: 1, cacheDir: $cacheDir, targets: .}' \
