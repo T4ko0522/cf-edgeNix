@@ -59,6 +59,8 @@ CACHE_INFO_PRIORITY = "30"
 # quota kill-switch 用。deploy 前に実 Cloudflare Account ID に置換すること。
 CF_ACCOUNT_ID = "8aa8b75c4cc3e97fdcef331a87539b11"
 QUOTA_R2_BUCKET_NAME = "cf-edgenix-nar"
+# host ごとの published build 保持世代数。0 を指定すると世代数による保護を無効化する。
+GC_KEEP_GENERATIONS = "3"
 
 [triggers]
 crons = ["*/5 * * * *"]

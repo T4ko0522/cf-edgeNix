@@ -421,7 +421,7 @@ R2 GC対象判定
 
 これにより、binary cacheを単なる高速化基盤ではなく、復旧可能な環境配布基盤として扱える。
 
-GC の **削除順序** は `POST /api/gc/execute` の `phase` で実装済み: `phase=narinfo`（KV/R2 narinfo 削除 + edge の `narinfo:<storeHash>` タグ purge）→ grace period（運用で確保）→ `phase=nar`（NAR/D1 削除 + `nar:<fileName>` タグ purge）。edge purge は Workers Cache の Cache-Tag purge を使い best-effort とする（非対応プランでは negative/positive エントリが TTL で自然失効するのを待つ）。
+GC の **削除順序** は `POST /api/gc/execute` の `phase` で実装済み: `phase=narinfo`（KV/R2 narinfo 削除 + edge の `narinfo:<storeHash>` タグ purge）→ grace period（運用で確保）→ `phase=nar`（NAR/D1 削除 + `nar:<fileName>` タグ purge）。live root は staging、hostごとの最新 `GC_KEEP_GENERATIONS` published build、有効 rollback root（pinned、期限未指定、または未期限切れ）、手動 pin である。共有 NAR は最後の store path 参照がなくなるまで削除せず、保護対象外 build の manifest R2 object と D1 history は同じ nar フェーズで削除する。edge purge は Workers Cache の Cache-Tag purge を使い best-effort とする（非対応プランでは negative/positive エントリが TTL で自然失効するのを待つ）。
 
 live/dead 判定は `store_paths.narKey` に加えて `nar_files.narKey` も走査する。`ingest` upsert で `store_paths.narKey` が最新 NAR に置き換わった結果、`store_paths` からは参照されなくなった古い `nar_files` 行と R2 の `nar/<old-fileHash>.nar.zst` を orphan として dead 候補に含めるためである。orphan には対応する `store_paths`（したがって `storeHash` / `narinfoKey`）が無いため、`phase=narinfo` は空振りし、`phase=nar` で R2 NAR と `nar_files` 行のみが回収される。
 

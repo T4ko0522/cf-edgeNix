@@ -9,6 +9,7 @@ export type {
 } from "./types";
 export {
   finalizeBuild,
+  assertBuildClosureCanBecomeLiveRoot,
   getLatestBuild,
   getManifest,
   ingestStorePaths,
@@ -21,8 +22,16 @@ export type { Build, BuildManifest } from "./builds";
 export {
   computeLiveSet,
   deleteDeadStorePaths,
+  deleteBuildHistory,
+  deleteGcMarks,
+  deleteStaleGcMarks,
+  listCollectableBuilds,
   listDeadStorePaths,
+  listMarkedDeadStorePaths,
   listOrphanedNarFiles,
+  listReclaimableNarFiles,
+  listUnmarkedDeadStorePaths,
+  markStorePathsForGc,
   pinBuild,
   unpinBuild,
 } from "./gc";

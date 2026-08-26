@@ -18,6 +18,8 @@ export interface Env {
   CF_ANALYTICS_TOKEN?: string;
   /** quota 監視対象の R2 バケット名 */
   QUOTA_R2_BUCKET_NAME?: string;
+  /** host ごとに GC から保護する published build 世代数。0 は latest を含む世代保持を無効化する。 */
+  GC_KEEP_GENERATIONS?: string;
   /** 管理API（publish / rollback / GC）の認証トークン（secret）。 */
   ADMIN_TOKEN?: string;
 }

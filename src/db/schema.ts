@@ -69,6 +69,12 @@ export const pinnedBuilds = sqliteTable("pinned_builds", {
   reason: text("reason"),
 });
 
+/** narinfo をunpublish済みで、grace後のNAR回収待ちである store path。 */
+export const gcMarks = sqliteTable("gc_marks", {
+  storeHash: text("store_hash").primaryKey(),
+  markedAt: integer("marked_at").notNull(),
+});
+
 export const buildManifests = sqliteTable(
   "build_manifests",
   {
@@ -92,4 +98,5 @@ export type NarFile = typeof narFiles.$inferSelect;
 export type BuildClosure = typeof buildClosure.$inferSelect;
 export type RollbackRoot = typeof rollbackRoots.$inferSelect;
 export type PinnedBuild = typeof pinnedBuilds.$inferSelect;
+export type GcMark = typeof gcMarks.$inferSelect;
 export type BuildManifest = typeof buildManifests.$inferSelect;

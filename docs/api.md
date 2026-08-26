@@ -44,6 +44,14 @@ read 系の応答には `Cache-Tag`（`narinfo:<store-hash>` / `nar:<file-name>`
 
 `/api/*` の応答は全て `Cache-Control: no-store` で edge キャッシュ対象外。
 
+## GC 保持ポリシー
+
+`GC_KEEP_GENERATIONS`（既定 `3`）は host ごとに保護する新しい published build 数。`0` はこの世代保持を無効化する。不正な値は安全側で既定値 `3` として扱う。staging build、手動 pin、有効な rollback root（`pinned=true`、`keep_until` 未指定、または未来の `keep_until`）は世代数にかかわらず保持する。
+
+GC dry-run は NAR の `dead_candidates` に加え、共有NARでも回収可能な `dead_store_paths` と、manifest/history回収候補の `dead_build_ids` を返す。execute の `dead_total` / `dead_remaining` はstore pathとorphan NARのwork item数である。
+
+`POST /api/gc/execute` の `max_deletes` は既定・上限ともに `20`。安全に複数回実行する。narinfo を削除済みとしてmarkされたclosureは、NARを再uploadしたうえで `ingest` を再実行するまで pin / rollback root に登録できない。
+
 ## 無料枠 kill-switch
 
 `killed` state の間は `/api/*` 以外の read path（narinfo / NAR / nix-cache-info）が 503 を返す。詳細は [`quota.md`](quota.md) を参照。

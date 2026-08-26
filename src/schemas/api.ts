@@ -38,6 +38,14 @@ export type PatchBuildResponse = z.infer<typeof PatchBuildResponseSchema>;
 
 export const GcDryRunResponseSchema = z.object({
   live_nar_keys: z.array(z.string()),
+  // NAR が live store path と共有されても、narinfo/store_paths は個別に回収できる。
+  dead_store_paths: z.array(z.object({
+    store_hash: z.string(),
+    narinfo_key: z.string(),
+    nar_key: z.string(),
+  })),
+  // manifest/history の回収候補。NAR key だけでは見えない control plane 側の候補。
+  dead_build_ids: z.array(z.string()),
   dead_candidates: z.array(z.string()),
 });
 
@@ -51,10 +59,9 @@ export const GcExecuteRequestSchema = z.object({
   // `phase: "all"` は grace を無視した即時削除であり edge / Nix client が古い narinfo を
   // 持つ間 404 を撒くリスクがあるため、開発・テスト用途以外では使わない。
   phase: z.enum(["narinfo", "nar", "all"]).default("narinfo"),
-  // Free プラン subrequest 上限 50/invocation に収めるため KV narinfo delete (=1 subreq/件) の本数を絞る。
-  // computeLiveSet + listDeadStorePaths + R2 bulk delete×2 + D1 COUNT×3 + D1 batch×3 で固定 ~14 subreq 消費するため KV に使える残予算は ~36 件。
-  // デフォルトは余裕を見て 40、上限も 50 にハードキャップ。
-  max_deletes: z.number().int().positive().max(50).default(40),
+  // KV narinfo delete (=1 subrequest/件) とD1 mark/build cleanupの余裕を確保する。
+  // デフォルト/上限は20。複数回の呼び出しで安全に前進する。
+  max_deletes: z.number().int().positive().max(20).default(20),
   dry_run: z.boolean().default(false),
 });
 
@@ -72,9 +79,14 @@ export const GcExecuteResponseSchema = z.object({
   ok: z.literal(true),
   phase: z.enum(["narinfo", "nar", "all"]),
   dry_run: z.boolean(),
+  // store path と orphan NAR の work item 数。build history の回収数は含まない。
   dead_total: z.number().int().nonnegative(),
   processed: z.number().int().nonnegative(),
   dead_remaining: z.number().int().nonnegative(),
+  // manifest/history を持つ dead build のwork item数。store/NARの件数とは独立。
+  build_total: z.number().int().nonnegative(),
+  build_processed: z.number().int().nonnegative(),
+  build_remaining: z.number().int().nonnegative(),
   deleted: GcExecuteDeletedSchema,
   // Workers Cache のタグ purge が成功したタグ数（best-effort・非対応ランタイムでは 0）。
   edge_purge_attempted: z.number().int().nonnegative(),

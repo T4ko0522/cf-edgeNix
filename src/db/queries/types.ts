@@ -44,6 +44,10 @@ export interface RollbackRootInput {
 export interface LiveSet {
   liveNarKeys: string[];
   deadCandidates: string[];
+  /** live build の closure から到達できない store path。narKey が共有でも narinfo は回収できる。 */
+  deadStorePaths: DeadStorePath[];
+  /** 保持ポリシー外で、manifest/history の削除候補になる build。 */
+  deadBuildIds: string[];
 }
 
 export interface DeadStorePath {

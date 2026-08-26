@@ -203,11 +203,19 @@ curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/dry-run \
 ```json
 {
   "live_nar_keys": ["nar/abc123.nar.zst", ...],
+  "dead_store_paths": [
+    {
+      "store_hash": "old-store-hash",
+      "narinfo_key": "old-store-hash.narinfo",
+      "nar_key": "nar/old456.nar.zst"
+    }
+  ],
+  "dead_build_ids": ["old-build-id"],
   "dead_candidates": ["nar/old456.nar.zst", ...]
 }
 ```
 
-`dead_candidates` は `rollback_roots` から到達できない NAR の一覧。実 R2 物理削除は現時点では未実装（`fixme.md` §1 参照）。
+`dead_candidates` は保持対象 build から到達できない NAR、`dead_store_paths` は共有 NAR の有無にかかわらず narinfo を回収できる store path、`dead_build_ids` は manifest/history の回収候補。物理削除は `POST /api/gc/execute` を `phase=narinfo`、grace period、`phase=nar` の順に実行する。
 
 `ingest` upsert で `store_paths.narKey` が最新 NAR に置き換わった場合、古い `nar_files` 行と R2 の `nar/<old-fileHash>.nar.zst` は `store_paths` からは辿れなくなる。GC は `store_paths.narKey` に加えて `nar_files.narKey` も dead 判定源として走査するため、これらの orphan も `dead_candidates` に載って `phase=nar` で回収される。orphan は `narinfo` を持たないため `phase=narinfo` の対象にはならない。
 
@@ -220,7 +228,7 @@ curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/dry-run \
 `finalize` が走っていない状態。原因は ingest 途中の中断、または finalize のネットワークエラー。
 
 - `GET /api/hosts/<host>/latest` を確認し、latest が旧 build のままなら問題なし（read path は正常）。
-- GC dry-run で当該 `build_id` に対応する NAR が `dead_candidates` に入るのを確認してから無視するか、同じ `build_id` で `finalize` だけ再送する。
+- staging build は publish 中の誤削除を避けるため GC の live root になる。同じ `build_id` で publish を再実行して finalize する。
 
 ### narinfo は見えるが NAR が 404 になる
 

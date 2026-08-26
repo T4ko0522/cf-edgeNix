@@ -1,6 +1,6 @@
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "../client";
-import { buildClosure, buildManifests, builds, narFiles, rollbackRoots, storePaths } from "../schema";
+import { buildClosure, buildManifests, builds, gcMarks, narFiles, rollbackRoots, storePaths } from "../schema";
 import type { Build, BuildManifest } from "../schema";
 import { BuildNotFoundError, PublishConflictError } from "./errors";
 import type { BuildMeta, ManifestMeta, NarinfoMeta, RollbackRootInput } from "./types";
@@ -55,6 +55,27 @@ export async function getManifest(db: Db, buildId: string): Promise<BuildManifes
     .where(eq(buildManifests.buildId, buildId))
     .limit(1);
   return rows[0] ?? null;
+}
+
+/**
+ * narinfo を既に unpublish した closure は、R2 を再投入する ingest が済むまで
+ * live root に戻せない。pin / rollback 登録の前に呼ぶ。
+ */
+export async function assertBuildClosureCanBecomeLiveRoot(
+  db: Db,
+  buildId: string,
+): Promise<void> {
+  const marked = await db
+    .select({ storeHash: gcMarks.storeHash })
+    .from(buildClosure)
+    .innerJoin(gcMarks, eq(buildClosure.storeHash, gcMarks.storeHash))
+    .where(eq(buildClosure.buildId, buildId))
+    .limit(1);
+  if (marked[0]) {
+    throw new PublishConflictError(
+      `build ${buildId} references store path ${marked[0].storeHash} pending GC; republish and ingest it first`,
+    );
+  }
 }
 
 /**
@@ -169,11 +190,10 @@ export async function ingestStorePaths(
   // build_closure はこの build について全入力行に対して挿入する（修正7）。
   // 既存 store_path でも当該 build の closure 行を作ることで GC/liveset が正しくなる。
   // CHUNK_SIZE: 1 行あたり最大 3 statements (store_paths + nar_files + build_closure)。
-  // 新規行 chunk: 3 × 25 = 75 statements ≤ 90（実 D1 上限 100 の安全余裕を持たせる）（修正1）。
-  // 差分既存行 chunk: 3 × 25 = 75 statements（nar_files + store_paths update + build_closure）。
-  // build_closure のみ chunk: 1 × 90 = 90 statements（既存行のみの場合）。
-  const STORE_CHUNK = 25;
-  const CLOSURE_CHUNK = 90;
+  // gc mark の解除も同じbatchに含め、ingest済み closure がnar phaseで回収されないようにする。
+  // 新規/差分既存行 chunk: 4 × 20 = 80 statements、closure のみ: 2 × 45 = 90 statements。
+  const STORE_CHUNK = 20;
+  const CLOSURE_CHUNK = 45;
 
   // Step A: 新規 store_paths / nar_files / build_closure を chunk 単位で挿入。
   for (let i = 0; i < newRows.length; i += STORE_CHUNK) {
@@ -209,6 +229,7 @@ export async function ingestStorePaths(
         .insert(buildClosure)
         .values({ buildId, storeHash: row.storeHash })
         .onConflictDoNothing(),
+      db.delete(gcMarks).where(eq(gcMarks.storeHash, row.storeHash)),
     ]);
     await db.batch(stmts as unknown as Parameters<Db["batch"]>[0]);
   }
@@ -244,6 +265,7 @@ export async function ingestStorePaths(
         .insert(buildClosure)
         .values({ buildId, storeHash: row.storeHash })
         .onConflictDoNothing(),
+      db.delete(gcMarks).where(eq(gcMarks.storeHash, row.storeHash)),
     ]);
     await db.batch(stmts as unknown as Parameters<Db["batch"]>[0]);
   }
@@ -251,12 +273,13 @@ export async function ingestStorePaths(
   // Step C: 既存 store_path に対しても build_closure を挿入する（修正7）。
   for (let i = 0; i < unchangedExistingRows.length; i += CLOSURE_CHUNK) {
     const chunk = unchangedExistingRows.slice(i, i + CLOSURE_CHUNK);
-    const stmts = chunk.map((row) =>
+    const stmts = chunk.flatMap((row) => [
       db
         .insert(buildClosure)
         .values({ buildId, storeHash: row.storeHash })
         .onConflictDoNothing(),
-    );
+      db.delete(gcMarks).where(eq(gcMarks.storeHash, row.storeHash)),
+    ]);
     await db.batch(stmts as unknown as Parameters<Db["batch"]>[0]);
   }
 }
@@ -378,6 +401,8 @@ export async function registerRollbackRoot(db: Db, input: RollbackRootInput): Pr
   if (!existing[0]) {
     throw new BuildNotFoundError(`build ${input.buildId} not found`);
   }
+
+  await assertBuildClosureCanBecomeLiveRoot(db, input.buildId);
 
   await db.batch([
     db.insert(rollbackRoots).values({

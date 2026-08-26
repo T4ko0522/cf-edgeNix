@@ -15,6 +15,13 @@
       "when": 1782295417208,
       "tag": "0001_pinned_builds",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1787722780851,
+      "tag": "0002_absent_maddog",
+      "breakpoints": true
     }
   ]
 }

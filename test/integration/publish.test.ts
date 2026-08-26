@@ -91,6 +91,10 @@ async function applyMigrations(db1: D1Database) {
     \`compression\` text NOT NULL,
     \`created_at\` integer NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS \`gc_marks\` (
+    \`store_hash\` text PRIMARY KEY NOT NULL,
+    \`marked_at\` integer NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS \`rollback_roots\` (
     \`id\` text PRIMARY KEY NOT NULL,
     \`host\` text NOT NULL,
@@ -202,6 +206,7 @@ async function cleanupTables(db1: D1Database) {
   for (const table of [
     "build_closure",
     "build_manifests",
+    "gc_marks",
     "nar_files",
     "rollback_roots",
     "store_paths",

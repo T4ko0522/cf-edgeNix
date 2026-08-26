@@ -49,6 +49,7 @@ async function applyMigrations(db1: D1Database) {
     `CREATE TABLE IF NOT EXISTS \`builds\` (\`id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`system\` text NOT NULL, \`git_rev\` text NOT NULL, \`flake_lock_hash\` text NOT NULL, \`toplevel_store_path\` text NOT NULL, \`status\` text DEFAULT 'staging' NOT NULL, \`retention_class\` text, \`created_at\` integer NOT NULL, \`published_at\` integer)`,
     `CREATE INDEX IF NOT EXISTS \`idx_builds_host_published\` ON \`builds\` (\`host\`, \`published_at\`)`,
     `CREATE TABLE IF NOT EXISTS \`nar_files\` (\`file_hash\` text PRIMARY KEY NOT NULL, \`nar_key\` text NOT NULL, \`file_size\` integer NOT NULL, \`compression\` text NOT NULL, \`created_at\` integer NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS \`gc_marks\` (\`store_hash\` text PRIMARY KEY NOT NULL, \`marked_at\` integer NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS \`rollback_roots\` (\`id\` text PRIMARY KEY NOT NULL, \`host\` text NOT NULL, \`build_id\` text NOT NULL, \`reason\` text, \`pinned\` integer DEFAULT 0 NOT NULL, \`keep_until\` integer, \`created_at\` integer NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS \`store_paths\` (\`store_hash\` text PRIMARY KEY NOT NULL, \`store_path\` text NOT NULL, \`narinfo_key\` text NOT NULL, \`nar_key\` text NOT NULL, \`nar_hash\` text NOT NULL, \`nar_size\` integer NOT NULL, \`file_hash\` text NOT NULL, \`file_size\` integer NOT NULL, \`compression\` text NOT NULL, \`first_seen_build_id\` text, \`created_at\` integer NOT NULL)`,
   ];
@@ -61,6 +62,7 @@ async function cleanupTables(db1: D1Database) {
   for (const table of [
     "build_closure",
     "build_manifests",
+    "gc_marks",
     "nar_files",
     "rollback_roots",
     "store_paths",
@@ -109,7 +111,7 @@ function makeStorePath(idx: number) {
   };
 }
 
-describe("ingest chunk 境界（STORE_CHUNK=25 を跨ぐ 60 件）", () => {
+describe("ingest chunk 境界（STORE_CHUNK=20 を跨ぐ 60 件）", () => {
   const CHUNK_BUILD_ID = "chunk-test-build-001";
   const CHUNK_HOST = "chunk-test-host";
   const CHUNK_TOP_HASH = makeHash(1);
@@ -130,7 +132,7 @@ describe("ingest chunk 境界（STORE_CHUNK=25 を跨ぐ 60 件）", () => {
     const eenv = authedEnv();
     const db = getDb();
 
-    // 60 件のストアパスを生成（STORE_CHUNK=25 を 2 回超える）
+    // 60 件のストアパスを生成（STORE_CHUNK=20 を 2 回超える）
     const N = 60;
     const paths = Array.from({ length: N }, (_, i) => makeStorePath(i));
 
