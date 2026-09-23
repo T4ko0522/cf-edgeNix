@@ -48,14 +48,15 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    GHA[GitHub Actions<br/>publish 側 repo] -->|POST /api/publish/*| W[Worker]
-    W --> R2[(R2)]
+    GHA[GitHub Actions<br/>publish 側 repo] --> P[closure 分類・new のみ NAR 化]
+    P -->|POST /api/publish/*| W[Worker]
+    P --> R2[(R2)]
+    P -. warm .-> KV[(KV)]
     W --> D1[(D1: CONTROL_DB)]
-    W -. warm .-> KV[(KV)]
 ```
 
 `latest` を動かすのは `start → ingest × N → R2 upload → finalize` の 1 ルートのみ。staging closure を R2 操作より先に登録し、GC と publish の競合を防ぐ。
-NAR upload → narinfo upload → D1 確定 → KV warming の順で `scripts/publish.ts` が保証し、`test/publish/order.test.ts` で assert している。
+full closure を分類し、external は manifest のみに記録する。owned のうち new だけ NAR 化する。NAR upload → narinfo upload → D1 確定 → KV warming の順序は `scripts/publish.ts` の batch 経路で保証し、`test/publish/publish-script.test.ts` で検証している。
 
 ### Deploy path
 

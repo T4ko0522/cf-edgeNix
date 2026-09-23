@@ -51,6 +51,7 @@ if [ -n "$(find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
 fi
 
 : "${API_BASE_URL:?API_BASE_URL is required}"
+: "${SELF_CACHE_URL:=$API_BASE_URL}"
 : "${ADMIN_TOKEN:?ADMIN_TOKEN is required}"
 : "${R2_BUCKET_NAME:?R2_BUCKET_NAME is required}"
 : "${KV_NAMESPACE_ID:?KV_NAMESPACE_ID is required}"
@@ -62,6 +63,7 @@ work_dir="$(mktemp -d)"
 key_file="${work_dir}/cache-private-key"
 targets_file="${work_dir}/targets.jsonl"
 plan_file="${work_dir}/publish-plan.json"
+self_narinfo_dir="${work_dir}/self-narinfos"
 trap 'rm -rf "$work_dir"' EXIT
 chmod 700 "$work_dir"
 printf '%s' "$CACHE_PRIVATE_KEY" > "$key_file"
@@ -76,7 +78,6 @@ nix build "${installables[@]}" --no-link
 log_timing "build" "$phase_started"
 
 phase_started=$SECONDS
-out_paths=()
 for host in "${hosts[@]}"; do
   installable=".#nixosConfigurations.\"${host}\".config.system.build.toplevel"
   out="$(nix eval --raw "$installable")"
@@ -84,13 +85,12 @@ for host in "${hosts[@]}"; do
     echo "nix eval returned an invalid toplevel for $host: $out" >&2
     exit 1
   fi
-  out_paths+=("$out")
   target_system="${SYSTEM:-$(nix eval --raw ".#nixosConfigurations.\"${host}\".pkgs.system")}"
 
   target_dir="${work_dir}/targets/${host}"
   closure_json_path="${target_dir}/closure.json"
   mkdir -p "$target_dir"
-  nix path-info -r --json "$out" > "$closure_json_path"
+  nix path-info -r --json --json-format 1 "$out" > "$closure_json_path"
   jq -cn \
     --slurpfile closure "$closure_json_path" \
     --arg host "$host" \
@@ -106,23 +106,34 @@ done
 log_timing "closure-metadata" "$phase_started"
 
 phase_started=$SECONDS
-nix copy \
-  --to "file://${CACHE_DIR}?compression=zstd&compression-level=${ZSTD_LEVEL}&secret-key=${key_file}" \
-  "${out_paths[@]}"
-log_timing "copy" "$phase_started"
+# Use Nix's effective configuration rather than the flake's untrusted requests.
+nix config show --json | jq '.substituters.value' > "$work_dir/substituters.json"
+jq -s '[.[].closureStorePaths[]] | unique' "$targets_file" > "$work_dir/all-paths.json"
+bash "$(dirname "$0")/classify-closure.sh" \
+  "$work_dir/all-paths.json" "$self_narinfo_dir" "$SELF_CACHE_URL" "$API_BASE_URL" \
+  "$work_dir/substituters.json" > "$work_dir/classifications.json"
+
+jq -c --slurpfile classification "$work_dir/classifications.json" '
+  . + {
+    externalStorePaths: [.closureStorePaths[] as $p | select($classification[0][$p].kind == "external") |
+      {storePath: $p, substituterUrl: $classification[0][$p].substituterUrl}],
+    selfExistingStorePaths: [.closureStorePaths[] as $p | select($classification[0][$p].kind == "self") | $p],
+    newStorePaths: [.closureStorePaths[] as $p | select($classification[0][$p].kind == "new") | $p]
+  }
+' "$targets_file" > "$work_dir/classified-targets.jsonl"
+mv "$work_dir/classified-targets.jsonl" "$targets_file"
+log_timing "availability" "$phase_started"
 
 phase_started=$SECONDS
-if [ "${SKIP_UPSTREAM_PRUNE:-0}" = "1" ]; then
-  echo "[prune] SKIP_UPSTREAM_PRUNE=1, skipping upstream subtraction"
-else
-  bash "$(dirname "$0")/prune-upstream.sh" \
-    "$CACHE_DIR" \
-    "${UPSTREAM_CACHE_URL:-https://cache.nixos.org}"
+jq -s -r '[.[].newStorePaths[]] | unique[]' "$targets_file" > "$work_dir/new-paths"
+if [ -s "$work_dir/new-paths" ]; then
+  bash "$(dirname "$0")/stage-new.sh" \
+    "$work_dir/new-paths" "$CACHE_DIR" "$key_file" "$ZSTD_LEVEL"
 fi
-log_timing "upstream-prune" "$phase_started"
+log_timing "stage" "$phase_started"
 
-jq -s --arg cacheDir "$CACHE_DIR" \
-  '{version: 1, cacheDir: $cacheDir, targets: .}' \
+jq -s --arg cacheDir "$CACHE_DIR" --arg selfNarinfoDir "$self_narinfo_dir" \
+  '{version: 2, cacheDir: $cacheDir, selfNarinfoDir: $selfNarinfoDir, targets: .}' \
   "$targets_file" > "$plan_file"
 
 echo "Uploading ${#hosts[@]} host(s) to R2/D1/KV via scripts/publish.ts..."

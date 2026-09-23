@@ -3,7 +3,7 @@
  * scripts/publish.ts
  *
  * cf-edgeNix の publish オーケストレーションスクリプト。
- * nix copy が生成したローカル binary cache を R2/D1/KV へ反映する。
+ * 分類後に生成した所有pathのNAR/narinfoを R2/D1/KV へ反映する。
  *
  * batch 実行順序:
  *   1. 全 host の D1 start / ingest
@@ -17,7 +17,7 @@
  * `bunx wrangler` の起動コスト (~1s/回) を排除し、ファイルあたり数十 ms に落とす。
  *
  * CLI:
- *   --plan <path>         秘密情報を含まない version 1 publish plan
+ *   --plan <path>         秘密情報を含まない version 2 publish plan
  *
  * 必要な env:
  *   API_BASE_URL          Worker の URL (例: https://cache.example.com)
@@ -31,7 +31,7 @@
  */
 
 /// <reference types="@types/bun" />
-import { readdir, readFile, writeFile } from "fs/promises";
+import { readdir, readFile } from "fs/promises";
 import { isAbsolute, resolve, join } from "path";
 import { createHash, createHmac } from "crypto";
 
@@ -78,11 +78,15 @@ export interface PublishPlanTarget {
   toplevelStorePath: string;
   closureJsonPath: string;
   closureStorePaths: string[];
+  externalStorePaths: Array<{ storePath: string; substituterUrl: string }>;
+  selfExistingStorePaths: string[];
+  newStorePaths: string[];
 }
 
 export interface PublishPlan {
-  version: 1;
+  version: 2;
   cacheDir: string;
+  selfNarinfoDir: string;
   targets: PublishPlanTarget[];
 }
 
@@ -118,10 +122,12 @@ function assertExactKeys(
 
 export function parsePublishPlan(value: unknown): PublishPlan {
   if (!isRecord(value)) throw new Error("publish plan must be an object");
-  assertExactKeys(value, ["version", "cacheDir", "targets"], "publish plan");
-  if (value["version"] !== 1) throw new Error("publish plan version must be 1");
+  assertExactKeys(value, ["version", "cacheDir", "selfNarinfoDir", "targets"], "publish plan");
+  if (value["version"] !== 2) throw new Error("publish plan version must be 2");
   const cacheDir = requiredString(value["cacheDir"], "cacheDir");
   if (!isAbsolute(cacheDir)) throw new Error("cacheDir must be absolute");
+  const selfNarinfoDir = requiredString(value["selfNarinfoDir"], "selfNarinfoDir");
+  if (!isAbsolute(selfNarinfoDir)) throw new Error("selfNarinfoDir must be absolute");
   if (!Array.isArray(value["targets"]) || value["targets"].length === 0) {
     throw new Error("targets must be a non-empty array");
   }
@@ -131,7 +137,8 @@ export function parsePublishPlan(value: unknown): PublishPlan {
     if (!isRecord(raw)) throw new Error(`targets[${index}] must be an object`);
     assertExactKeys(raw, [
       "host", "system", "gitRev", "flakeLockHash", "toplevelStorePath",
-      "closureJsonPath", "closureStorePaths",
+      "closureJsonPath", "closureStorePaths", "externalStorePaths",
+      "selfExistingStorePaths", "newStorePaths",
     ], `targets[${index}]`);
     const host = requiredString(raw["host"], `targets[${index}].host`);
     if (!/^[A-Za-z0-9._-]+$/.test(host)) {
@@ -161,6 +168,40 @@ export function parsePublishPlan(value: unknown): PublishPlan {
     if (new Set(closureStorePaths).size !== closureStorePaths.length) {
       throw new Error(`targets[${index}].closureStorePaths contains duplicates`);
     }
+    const parsePaths = (key: "selfExistingStorePaths" | "newStorePaths"): string[] => {
+      const input = raw[key];
+      if (!Array.isArray(input)) throw new Error(`targets[${index}].${key} must be an array`);
+      return input.map((path, pathIndex) => {
+        const parsed = requiredString(path, `targets[${index}].${key}[${pathIndex}]`);
+        if (!parsed.startsWith("/nix/store/")) throw new Error(`${key} must contain Nix store paths`);
+        return parsed;
+      });
+    };
+    if (!Array.isArray(raw["externalStorePaths"])) {
+      throw new Error(`targets[${index}].externalStorePaths must be an array`);
+    }
+    const externalStorePaths = raw["externalStorePaths"].map((entry, entryIndex) => {
+      if (!isRecord(entry)) throw new Error(`externalStorePaths[${entryIndex}] must be an object`);
+      assertExactKeys(entry, ["storePath", "substituterUrl"], `externalStorePaths[${entryIndex}]`);
+      const storePath = requiredString(entry["storePath"], "external storePath");
+      const substituterUrl = requiredString(entry["substituterUrl"], "substituterUrl");
+      if (!storePath.startsWith("/nix/store/") || !/^https?:\/\//.test(substituterUrl)) {
+        throw new Error("external entry must have a Nix store path and HTTP(S) substituter");
+      }
+      return { storePath, substituterUrl };
+    });
+    const selfExistingStorePaths = parsePaths("selfExistingStorePaths");
+    const newStorePaths = parsePaths("newStorePaths");
+    const classified = [
+      ...externalStorePaths.map((entry) => entry.storePath),
+      ...selfExistingStorePaths,
+      ...newStorePaths,
+    ];
+    if (classified.length !== closureStorePaths.length ||
+        new Set(classified).size !== classified.length ||
+        classified.some((path) => !closureStorePaths.includes(path))) {
+      throw new Error(`targets[${index}] classification must partition the full closure`);
+    }
     const system = requiredString(raw["system"], `targets[${index}].system`);
     const gitRev = requiredString(raw["gitRev"], `targets[${index}].gitRev`);
     const flakeLockHash = requiredString(raw["flakeLockHash"], `targets[${index}].flakeLockHash`);
@@ -175,9 +216,12 @@ export function parsePublishPlan(value: unknown): PublishPlan {
       toplevelStorePath,
       closureJsonPath,
       closureStorePaths,
+      externalStorePaths,
+      selfExistingStorePaths,
+      newStorePaths,
     };
   });
-  return { version: 1, cacheDir, targets };
+  return { version: 2, cacheDir, selfNarinfoDir, targets };
 }
 
 // ─── exec アダプタ（テスト時モック可能） ─────────────────────────────────────
@@ -590,21 +634,26 @@ export function buildManifestJson(args: {
   flakeLockHash: string;
   toplevelStorePath: string;
   narinfos: NarinfoMeta[];
+  externalStorePaths: Array<{ storePath: string; substituterUrl: string }>;
   closureJsonKey: string;
 }): string {
   return JSON.stringify({
+    version: 2,
     buildId: args.buildId,
     host: args.host,
     system: args.system,
     gitRev: args.gitRev,
     flakeLockHash: args.flakeLockHash,
     toplevelStorePath: args.toplevelStorePath,
-    storePaths: args.narinfos.map((ni) => ({
-      storeHash: ni.storeHash,
-      storePath: ni.storePath,
-      narKey: ni.narKey,
-      narinfoKey: ni.narinfoKey,
-    })),
+    closure: {
+      owned: args.narinfos.map((ni) => ({
+        storeHash: ni.storeHash,
+        storePath: ni.storePath,
+        narKey: ni.narKey,
+        narinfoKey: ni.narinfoKey,
+      })),
+      external: args.externalStorePaths,
+    },
     closureJsonKey: args.closureJsonKey,
   });
 }
@@ -613,9 +662,6 @@ export function buildManifestJson(args: {
 export function sha256HexPrefixed(content: string): string {
   return `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
 }
-
-// 既存 import 互換 (test/publish/publish-script.test.ts が `sha256Hex` を import している)。
-export { sha256HexPrefixed as sha256Hex };
 
 // ─── 並列実行ヘルパ ───────────────────────────────────────────────────────────
 
@@ -660,7 +706,18 @@ const HEAD_CONCURRENCY = 32;
 const R2_PUT_CONCURRENCY = 24;
 
 function buildIdFor(target: PublishPlanTarget): string {
-  const input = `${target.host}:${target.system}:${target.gitRev}:${target.flakeLockHash}:${target.toplevelStorePath}`;
+  // A staging retry with a different external/owned boundary must not inherit
+  // stale build_closure rows from the previous attempt.
+  const input = JSON.stringify({
+    host: target.host,
+    system: target.system,
+    gitRev: target.gitRev,
+    flakeLockHash: target.flakeLockHash,
+    toplevelStorePath: target.toplevelStorePath,
+    closureStorePaths: [...target.closureStorePaths].sort(),
+    externalStorePaths: [...target.externalStorePaths].sort((a, b) =>
+      a.storePath.localeCompare(b.storePath) || a.substituterUrl.localeCompare(b.substituterUrl)),
+  });
   return createHash("sha256").update(input).digest("hex").slice(0, 36);
 }
 
@@ -678,7 +735,18 @@ export async function publishBatch(
   env: PublishEnv,
   exec: ExecAdapter,
 ): Promise<void> {
-  const narinfos = await readCacheNarinfos(plan.cacheDir);
+  const newNarinfos = await readCacheNarinfos(plan.cacheDir);
+  const selfNarinfos = await readCacheNarinfos(plan.selfNarinfoDir);
+  const narinfos = [...newNarinfos, ...selfNarinfos];
+  const newPaths = new Set(plan.targets.flatMap((target) => target.newStorePaths));
+  const selfPaths = new Set(plan.targets.flatMap((target) => target.selfExistingStorePaths));
+  const expectedOwned = new Set([...newPaths, ...selfPaths]);
+  if (narinfos.length !== expectedOwned.size ||
+      narinfos.some((narinfo) => !expectedOwned.has(narinfo.storePath)) ||
+      newNarinfos.some((narinfo) => !newPaths.has(narinfo.storePath)) ||
+      selfNarinfos.some((narinfo) => !selfPaths.has(narinfo.storePath))) {
+    throw new Error("narinfo files do not match classified owned paths");
+  }
   const narinfoByStorePath = new Map<string, NarinfoMeta>();
   const narinfoByStoreHash = new Map<string, NarinfoMeta>();
   for (const narinfo of narinfos) {
@@ -742,6 +810,7 @@ export async function publishBatch(
       flakeLockHash: state.buildMeta.flakeLockHash,
       toplevelStorePath: state.buildMeta.toplevelStorePath,
       narinfos: state.narinfos,
+      externalStorePaths: state.target.externalStorePaths,
       closureJsonKey,
     });
     await exec.r2PutContent(env.r2BucketName, manifestKey, manifestJson);
@@ -758,22 +827,30 @@ export async function publishBatch(
   }
 
   const uploadNarinfos = new Map<string, NarinfoMeta>();
+  const ownedNarinfos = new Map<string, NarinfoMeta>();
   for (const state of targets) {
-    for (const narinfo of state.narinfos) uploadNarinfos.set(narinfo.storeHash, narinfo);
+    for (const narinfo of state.narinfos) {
+      ownedNarinfos.set(narinfo.storeHash, narinfo);
+      if (newPaths.has(narinfo.storePath)) uploadNarinfos.set(narinfo.storeHash, narinfo);
+    }
   }
-  const uniqueNarKeys = new Set([...uploadNarinfos.values()].map((narinfo) => narinfo.narKey));
+  const uniqueNarKeys = new Set(narinfos.map((narinfo) => narinfo.narKey));
   const missingNarKeys: string[] = [];
   await runPool([...uniqueNarKeys], HEAD_CONCURRENCY, async (key) => {
     if (!(await exec.r2Has(env.r2BucketName, key))) missingNarKeys.push(key);
   });
+  const uploadableNarKeys = new Set([...uploadNarinfos.values()].map((narinfo) => narinfo.narKey));
+  const missingSelfNarKey = missingNarKeys.find((key) => !uploadableNarKeys.has(key));
+  if (missingSelfNarKey) throw new Error(`self-existing NAR missing from R2: ${missingSelfNarKey}`);
   await runPool(missingNarKeys, R2_PUT_CONCURRENCY, async (key) => {
     await exec.r2Put(env.r2BucketName, key, resolve(plan.cacheDir, key));
   });
-  await runPool([...uploadNarinfos.values()], R2_PUT_CONCURRENCY, async (narinfo) => {
+  await runPool([...ownedNarinfos.values()], R2_PUT_CONCURRENCY, async (narinfo) => {
+    const narinfoDir = newPaths.has(narinfo.storePath) ? plan.cacheDir : plan.selfNarinfoDir;
     await exec.r2Put(
       env.r2BucketName,
       narinfo.narinfoKey,
-      resolve(plan.cacheDir, `${narinfo.storeHash}.narinfo`),
+      resolve(narinfoDir, `${narinfo.storeHash}.narinfo`),
     );
   });
 
@@ -787,157 +864,15 @@ export async function publishBatch(
 
   try {
     const items: Array<{ key: string; value: string }> = [];
-    for (const narinfo of uploadNarinfos.values()) {
+    for (const narinfo of ownedNarinfos.values()) {
+      const narinfoDir = newPaths.has(narinfo.storePath) ? plan.cacheDir : plan.selfNarinfoDir;
       items.push({
         key: `narinfo:${narinfo.storeHash}`,
-        value: await readFile(resolve(plan.cacheDir, `${narinfo.storeHash}.narinfo`), "utf-8"),
+        value: await readFile(resolve(narinfoDir, `${narinfo.storeHash}.narinfo`), "utf-8"),
       });
     }
     await exec.kvPutBulk(env.kvNamespaceId, items);
   } catch (e) {
-    console.warn(`[KV] warming failed (non-fatal): ${errMessage(e)}`);
-  }
-}
-
-export async function publish(
-  cacheDir: string,
-  buildMeta: BuildMeta,
-  env: {
-    apiBaseUrl: string;
-    adminToken: string;
-    r2BucketName: string;
-    kvNamespaceId: string;
-  },
-  exec: ExecAdapter,
-): Promise<void> {
-  // narinfo ファイルを列挙・パース
-  const files = await readdir(cacheDir);
-  const narinfoFiles = files.filter((f) => f.endsWith(".narinfo"));
-
-  const narinfos: NarinfoMeta[] = [];
-  for (const f of narinfoFiles) {
-    const text = await readFile(join(cacheDir, f), "utf-8");
-    narinfos.push(parseNarinfo(text));
-  }
-
-  const buildId = buildMeta.id;
-  const apiBase = env.apiBaseUrl.replace(/\/$/, "");
-  const token = env.adminToken;
-
-  // GC より先に staging closure を登録する。以降の R2 HEAD/PUT と GC が競合しても、
-  // 24 時間以内の staging build は live root なので必要な NAR は回収されない。
-  const startRes = (await exec.apiPost(
-    `${apiBase}/api/publish/start`,
-    token,
-    { build: buildMeta },
-  )) as { build_id: string };
-  const confirmedBuildId = startRes.build_id;
-  console.log(`[D1] build started: ${confirmedBuildId}`);
-
-  for (let i = 0; i < narinfos.length; i += D1_INGEST_CHUNK) {
-    const chunk = narinfos.slice(i, i + D1_INGEST_CHUNK);
-    await exec.apiPost(
-      `${apiBase}/api/publish/${confirmedBuildId}/ingest`,
-      token,
-      { storePaths: chunk },
-    );
-  }
-  console.log(`[D1] ingested ${narinfos.length} store paths`);
-
-  // Step 1: closure.json / manifest.json を R2 に put（G5）
-  const closureJsonPath = resolve(process.cwd(), "closure.json");
-  const closureJsonKey = `manifests/${buildId}/closure.json`;
-  const manifestKey = `manifests/${buildId}/manifest.json`;
-
-  await exec.r2Put(env.r2BucketName, closureJsonKey, closureJsonPath);
-  console.log(`[R2] uploaded: ${closureJsonKey}`);
-
-  const manifestJson = buildManifestJson({
-    buildId,
-    host: buildMeta.host,
-    system: buildMeta.system,
-    gitRev: buildMeta.gitRev,
-    flakeLockHash: buildMeta.flakeLockHash,
-    toplevelStorePath: buildMeta.toplevelStorePath,
-    narinfos,
-    closureJsonKey,
-  });
-  const manifestHash = sha256HexPrefixed(manifestJson);
-
-  // manifest.json を tmp ファイル経由で r2Put (既存テスト契約: r2Put 経由で 2 番目)。
-  const manifestTmpPath = resolve(cacheDir, `__manifest_${buildId}.json`);
-  await writeFile(manifestTmpPath, manifestJson, "utf-8");
-  await exec.r2Put(env.r2BucketName, manifestKey, manifestTmpPath);
-  console.log(`[R2] uploaded: ${manifestKey} (hash: ${manifestHash})`);
-
-  // Step 2: NAR upload — HEAD で R2 上の既存を検出してスキップ→不足ぶんを並列 PUT。
-  //   NAR は content-addressed (narKey に file hash が入る) なので既存ヒット時の
-  //   コンテンツ同一性は保証される。
-  const uniqueNarKeys = Array.from(new Set(narinfos.map((ni) => ni.narKey)));
-
-  const missingNarKeys: string[] = [];
-  await runPool(uniqueNarKeys, HEAD_CONCURRENCY, async (key) => {
-    const exists = await exec.r2Has(env.r2BucketName, key);
-    if (!exists) missingNarKeys.push(key);
-  });
-  console.log(
-    `[NAR] ${uniqueNarKeys.length - missingNarKeys.length}/${uniqueNarKeys.length} already on R2, uploading ${missingNarKeys.length}`,
-  );
-
-  let narUploaded = 0;
-  await runPool(missingNarKeys, R2_PUT_CONCURRENCY, async (key) => {
-    const filePath = resolve(cacheDir, key);
-    await exec.r2Put(env.r2BucketName, key, filePath);
-    narUploaded++;
-    if (narUploaded % 50 === 0 || narUploaded === missingNarKeys.length) {
-      console.log(`[NAR] uploaded ${narUploaded}/${missingNarKeys.length}`);
-    }
-  });
-
-  // Step 3: narinfo upload — 並列 PUT。narinfo は署名等で内容が変わり得るので常に上書き。
-  let narinfoUploaded = 0;
-  await runPool(narinfos, R2_PUT_CONCURRENCY, async (ni) => {
-    const filePath = resolve(cacheDir, `${ni.storeHash}.narinfo`);
-    await exec.r2Put(env.r2BucketName, ni.narinfoKey, filePath);
-    narinfoUploaded++;
-    if (narinfoUploaded % 100 === 0 || narinfoUploaded === narinfos.length) {
-      console.log(`[narinfo] uploaded ${narinfoUploaded}/${narinfos.length}`);
-    }
-  });
-
-  // Step 4: D1 published 確定。R2 object が揃うまで latest は動かさない。
-  const manifestMeta: ManifestMeta = {
-    closureJsonKey,
-    manifestKey,
-    manifestHash,
-    host: buildMeta.host,
-    system: buildMeta.system,
-    gitRev: buildMeta.gitRev,
-    flakeLockHash: buildMeta.flakeLockHash,
-    toplevelStorePath: buildMeta.toplevelStorePath,
-  };
-
-  await exec.apiPost(
-    `${apiBase}/api/publish/${confirmedBuildId}/finalize`,
-    token,
-    { manifest: manifestMeta },
-  );
-  console.log(`[D1] finalized: ${confirmedBuildId}`);
-
-  // Step 5: KV warming — 全件を bulk API で 1〜数リクエストにまとめる。失敗は警告のみ。
-  try {
-    const items: Array<{ key: string; value: string }> = [];
-    for (const ni of narinfos) {
-      const content = await readFile(
-        resolve(cacheDir, `${ni.storeHash}.narinfo`),
-        "utf-8",
-      );
-      items.push({ key: `narinfo:${ni.storeHash}`, value: content });
-    }
-    await exec.kvPutBulk(env.kvNamespaceId, items);
-    console.log(`[KV] warming complete (${items.length} entries)`);
-  } catch (e) {
-    // raw error は request detail を含み得るので message のみログ出力。
     console.warn(`[KV] warming failed (non-fatal): ${errMessage(e)}`);
   }
 }

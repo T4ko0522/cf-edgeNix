@@ -905,14 +905,21 @@ describe("POST /api/gc/dry-run（G8）", () => {
     expect(liveSet.liveNarKeys).toContain(deadNarKey);
   });
 
-  test("backfill API が R2 manifest から世代固有 nar_key を復元する", async () => {
+  test.each(["legacy", "ownership"] as const)("backfill API が %s manifest から所有NAR参照を復元する", async (format) => {
     const eenv = authedEnv();
     const db1 = eenv.CONTROL_DB;
     const buildId = "legacy-backfill-build";
     const manifestKey = `manifests/${buildId}/manifest.json`;
-    const manifestText = JSON.stringify({
+    const manifestText = JSON.stringify(format === "legacy" ? {
       buildId,
       storePaths: [{ storeHash: deadHash, narKey: deadNarKey }],
+    } : {
+      version: 2,
+      buildId,
+      closure: {
+        owned: [{ storeHash: deadHash, narKey: deadNarKey }],
+        external: [{ storePath: "/nix/store/external-external", substituterUrl: "https://cache.nixos.org" }],
+      },
     });
     const digest = new Uint8Array(
       await crypto.subtle.digest("SHA-256", new TextEncoder().encode(manifestText)),
