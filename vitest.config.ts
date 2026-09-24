@@ -11,7 +11,6 @@ export default defineConfig({
             "test/auth.test.ts",
             "test/router.test.ts",
             "test/nar/range.test.ts",
-            "test/publish/transform.test.ts",
             "test/api.routing.test.ts",
             "test/quota/evaluate.test.ts",
             "test/quota/guard.test.ts",
@@ -25,7 +24,7 @@ export default defineConfig({
             "test/schemas/publish.test.ts",
             // read path D1 非参照の静的 grep テスト（G10/B5）: node:fs を使うため unit
             "test/integration/read-path-no-d1.test.ts",
-          // G4/G5/G9: scripts/publish.ts のロジック unit テスト
+            // G4/G5/G9: scripts/publish.ts のロジック unit テスト
             "test/publish/publish-script.test.ts",
             "test/publish/publish-sh.test.ts",
           ],

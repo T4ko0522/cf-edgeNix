@@ -124,7 +124,7 @@ nar/<file-hash>.nar.zst
                        ┌────────────────┐
                        │ GitHub Actions │
                        └───────┬────────┘
-                               │ nix build / nix copy --to file://
+                               │ nix build / closure分類 / newのみNAR化
                                ▼
                        ┌────────────────┐
                        │ Publish Step   │
@@ -303,10 +303,11 @@ nar_files(
   created_at
 );
 
--- build と、その closure に含まれる store path の多対多。
+-- build と、その closure のうち自前R2が所有する store path の多対多。
 build_closure(
   build_id,
-  store_hash
+  store_hash,
+  nar_key
 );
 
 rollback_roots(
@@ -352,7 +353,7 @@ D1は以下を管理する。
 * rollback可能なbuild / 手動pinされた安定世代
 * 過去世代を remote から復元するための manifest（`build_manifests`、GC 済み世代は `restorable: false`）
 * GCしてよい / 守るべき R2 object の判定（live set）
-* system closure のうち **自前 R2 で配信している store path 一覧**（cache.nixos.org など upstream にあって R2 に上げていない path は含まない。Nix client 側で extra-substituters により upstream に fall back する前提）
+* system closure のうち **自前 R2 で配信している store path 一覧**。self-existing も含み、external は含まない
 
 つまりD1は単なるリンク集ではなく、remote binary cacheにおけるcontrol planeになる。
 
@@ -433,7 +434,7 @@ live/dead 判定は `store_paths.narKey` に加えて `nar_files.narKey` も走�
 
 GitHub Actionsでビルドした成果物をCloudflareへpublishする。
 
-`.narinfo` は自前生成せず、Nix 自身に binary cache 形式（署名 `Sig:` 込み）を作らせる。
+Nixからpath metadataと署名を取得し、publishスクリプトがbinary cache形式の`.narinfo`を構成する。
 
 複数hostは `bash scripts/publish.sh laptop desktop`、単一hostは同じ位置引数または互換形式の `HOST=laptop bash scripts/publish.sh` で実行する。位置引数と `HOST` の同時指定、重複host、不正なhost名は拒否する。共有 `CACHE_DIR` は実行開始時に空でなければならない。
 
@@ -443,14 +444,14 @@ GitHub Actionsでビルドした成果物をCloudflareへpublishする。
 1. 全hostのinstallableを単一の nix build でビルド
 2. 各flake属性から個別にtoplevel store pathを確定（build出力順には依存しない）
 3. host別closure JSONとstore path一覧を生成
-4. 全hostのtop-levelから完全なclosureを単一の再帰 nix copy で共有CACHE_DIRへ出力
-5. upstream保有pathのnarinfoを共有CACHE_DIRからprune
-6. CACHE_DIRのnarinfoを一度だけ走査し、host closureとの積集合を作る
+4. 実効 substituter と self cache を照会し、全closureを external / self-existing / new に分類
+5. new path だけ NAR + zstd と署名narinfoを共有CACHE_DIRへ生成
+6. new と self-existing のnarinfoを一度ずつ走査し、host closure内のowned pathを確定
 7. 全hostの POST /api/publish/start と ingest を完了
 8. host別closure.json / manifest.jsonをR2へ保存
-9. 全hostの和集合からNARをnarKey単位、narinfoをstoreHash単位で重複排除してupload
+9. new pathのNARをnarKey単位で重複排除してupload。owned全件のnarinfoをstoreHash単位で重複排除してupload。self-existingのNARはR2 HEADで存在を再確認
 10. hostごとにfinalize（各hostのlatestを更新）
-11. narinfoの和集合を一度だけKV warming（失敗は警告のみ）
+11. owned narinfoの和集合を一度だけKV warming（失敗は警告のみ）
 ```
 
 重要なのは公開順序である。
@@ -475,7 +476,7 @@ KV を warming（速度層・最後）
 `latest` pointer が更新されるのは `POST /api/publish/:id/finalize` の 1 ステップのみ。
 `start` / `ingest` 途中で中断しても read path（narinfo / NAR）には影響しない。
 
-manifestとD1 `build_closure` は各hostのclosureとupstream prune後narinfoの積集合に限定する。他host専用pathを混入させない。既存NARはR2 HEADでuploadを省略しつつ、新しいnarinfoをingestしてlive-set参照を維持する。全pathがupstreamに存在するhostは空closureとしてfinalizeする。複数host全体のlatest更新はatomicではなく、一部hostのfinalize後に失敗した場合は未完了hostだけを再実行する。
+R2の`closure.json`は完全な依存graphを保持する。manifest v2は`closure.owned`に自前R2で配信するpathとnarKey、`closure.external`に外部pathと照会先substituterを記録する。D1 `build_closure`にはownedだけを登録し、GCもその物理NARだけを管理する。self-existingは今回uploadしなくてもownedとして扱う。全pathがexternalなら空のowned closureでfinalizeする。複数host全体のlatest更新はatomicではなく、一部hostのfinalize後に失敗した場合は未完了hostだけを再実行する。
 
 詳細な運用手順・冪等再実行・トラブルシューティングは `docs/publish.md` を参照。
 
@@ -483,11 +484,11 @@ manifestとD1 `build_closure` は各hostのclosureとupstream prune後narinfoの
 
 ### 9.1 署名鍵・認証・サプライチェーン
 
-binary cache の真正性は署名鍵に依存する。Nix は NAR / narinfo を `trusted-public-keys` で検証するため、鍵の扱いを設計に明記する。
+binary cache の真正性はstore path metadataの署名鍵に依存する。Nix はnarinfoの署名を`trusted-public-keys`で検証し、取得したNARのhashを照合するため、鍵の扱いを設計に明記する。
 
 ```text
-private key（NAR署名用）:
-  - nix copy の secret-key として使用（秘密鍵の値は argv に渡さず一時ファイル経由で渡すこと）
+private key（narinfo署名用）:
+  - nix store sign の key-file として使用（秘密鍵の値は argv に渡さず一時ファイル経由で渡すこと）
   - GitHub Actions の secret / protected environment に置く
   - fork からの PR では絶対に露出させない
 
@@ -666,7 +667,7 @@ GitHub Actionsを signed builder、R2を NAR / narinfo の正本かつ read path
 
 ```text
 build:
-  GitHub Actions（nix copy で署名済み narinfo / NAR を生成）
+  GitHub Actions（new pathだけNARを生成し、narinfoを署名）
 
 metadata read path:
   Workers Cache(edge) → Workers KV → R2（D1 は挟まない・404 は短 TTL negative cache）

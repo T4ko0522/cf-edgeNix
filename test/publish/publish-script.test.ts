@@ -1,7 +1,7 @@
 /**
  * test/publish/publish-script.test.ts
  *
- * scripts/publish.ts の純粋ロジック + exec アダプタ注入のユニットテスト。
+ * scripts/publish.ts の分類済みplanとbatch publishのユニットテスト。
  *
  * テスト観点:
  *   G4: publish 経路の一本化（closure/manifest put → NAR → narinfo → D1 → KV の順）
@@ -13,11 +13,12 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 let mockNarinfoFiles = ["abcdef123456aaaa.narinfo"];
+let mockSelfNarinfoFiles: string[] = [];
 let mockFileContents = new Map<string, string>();
 
 // vi.mock はトップレベルに置く必要がある（vitest がホイストするため）
 vi.mock("fs/promises", () => ({
-  readdir: vi.fn(async () => mockNarinfoFiles),
+  readdir: vi.fn(async (path: string) => String(path).includes("/self") ? mockSelfNarinfoFiles : mockNarinfoFiles),
   readFile: vi.fn(async (path: string, _enc: unknown) => {
     for (const [suffix, content] of mockFileContents) {
       if (String(path).endsWith(suffix)) return content;
@@ -34,7 +35,6 @@ NarHash: sha256:bbbb0000000000000000000000000000000000000000000000000000000000bb
 NarSize: 67890
 `;
   }),
-  writeFile: vi.fn(async () => {}),
 }));
 
 import {
@@ -43,9 +43,8 @@ import {
   buildManifestJson,
   parsePublishPlan,
   parseNarinfo,
-  publish,
   publishBatch,
-  sha256Hex,
+  sha256HexPrefixed,
 } from "../../scripts/publish";
 
 // ─── フィクスチャ ─────────────────────────────────────────────────────────────
@@ -59,16 +58,6 @@ NarHash: sha256:bbbb0000000000000000000000000000000000000000000000000000000000bb
 NarSize: 67890
 `;
 
-const SAMPLE_BUILD_META = {
-  id: "test-build-001",
-  host: "test-host",
-  system: "x86_64-linux",
-  gitRev: "deadbeef",
-  flakeLockHash: "sha256:lock",
-  toplevelStorePath: "/nix/store/abcdef123456aaaa-hello-2.12.1",
-  createdAt: 1700000000000,
-};
-
 const SAMPLE_ENV = {
   apiBaseUrl: "https://cache.example.com",
   adminToken: "test-token",
@@ -78,6 +67,7 @@ const SAMPLE_ENV = {
 
 beforeEach(() => {
   mockNarinfoFiles = ["abcdef123456aaaa.narinfo"];
+  mockSelfNarinfoFiles = [];
   mockFileContents = new Map();
 });
 
@@ -96,12 +86,50 @@ describe("parsePublishPlan", () => {
     }],
   };
 
-  test("version 1 のplanを受理する", () => {
-    expect(parsePublishPlan(validPlan)).toEqual(validPlan);
+  test("version 2 の分類済みplanを受理する", () => {
+    const plan = {
+      version: 2,
+      cacheDir: "/tmp/cache",
+      selfNarinfoDir: "/tmp/self",
+      targets: [{
+        ...validPlan.targets[0],
+        externalStorePaths: [{ storePath: "/nix/store/shared", substituterUrl: "https://cache.nixos.org" }],
+        selfExistingStorePaths: [],
+        newStorePaths: ["/nix/store/laptop-system"],
+      }],
+    };
+    expect(parsePublishPlan(plan)).toEqual(plan);
+  });
+
+  test("実効設定のHTTP substituterを分類済みplanで受理する", () => {
+    const plan = {
+      version: 2, cacheDir: "/tmp/cache", selfNarinfoDir: "/tmp/self",
+      targets: [{
+        ...validPlan.targets[0],
+        externalStorePaths: [{ storePath: "/nix/store/shared", substituterUrl: "http://local-cache.example" }],
+        selfExistingStorePaths: [],
+        newStorePaths: ["/nix/store/laptop-system"],
+      }],
+    };
+    expect(parsePublishPlan(plan)).toEqual(plan);
+  });
+
+  test("分類とfull closureが一致しないplanを拒否する", () => {
+    expect(() => parsePublishPlan({
+      version: 2,
+      cacheDir: "/tmp/cache",
+      selfNarinfoDir: "/tmp/self",
+      targets: [{
+        ...validPlan.targets[0],
+        externalStorePaths: [{ storePath: "/nix/store/shared", substituterUrl: "https://cache.nixos.org" }],
+        selfExistingStorePaths: [],
+        newStorePaths: [],
+      }],
+    })).toThrow(/partition|classification/i);
   });
 
   test.each([
-    [{ ...validPlan, version: 2 }],
+    [validPlan],
     [{ ...validPlan, targets: [] }],
     [{ ...validPlan, targets: [validPlan.targets[0], validPlan.targets[0]] }],
     [{ ...validPlan, targets: [{ ...validPlan.targets[0], host: "../bad" }] }],
@@ -132,23 +160,23 @@ describe("parseNarinfo (scripts/publish.ts)", () => {
   });
 });
 
-// ─── sha256Hex ─────────────────────────────────────────────────────────────────
+// ─── sha256HexPrefixed ─────────────────────────────────────────────────────────
 
-describe("sha256Hex", () => {
+describe("sha256HexPrefixed", () => {
   test("sha256: プレフィクスを返す", () => {
-    expect(sha256Hex("hello")).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(sha256HexPrefixed("hello")).toMatch(/^sha256:[0-9a-f]{64}$/);
   });
 
   test("同じ内容なら同じハッシュ", () => {
-    expect(sha256Hex("content")).toBe(sha256Hex("content"));
+    expect(sha256HexPrefixed("content")).toBe(sha256HexPrefixed("content"));
   });
 
   test("内容が違えばハッシュも違う", () => {
-    expect(sha256Hex("aaa")).not.toBe(sha256Hex("bbb"));
+    expect(sha256HexPrefixed("aaa")).not.toBe(sha256HexPrefixed("bbb"));
   });
 
   test("placeholder でない（固定文字列と一致しない）", () => {
-    expect(sha256Hex("some content")).not.toBe("sha256:placeholder");
+    expect(sha256HexPrefixed("some content")).not.toBe("sha256:placeholder");
   });
 });
 
@@ -166,18 +194,20 @@ describe("buildManifestJson", () => {
       flakeLockHash: "sha256:lock",
       toplevelStorePath: "/nix/store/abcdef123456aaaa-hello-2.12.1",
       narinfos: [narinfo],
+      externalStorePaths: [],
       closureJsonKey: "manifests/build-001/closure.json",
     });
     const obj = JSON.parse(json) as {
       buildId: string;
       toplevelStorePath: string;
-      storePaths: Array<{ storeHash: string }>;
+      closure: { owned: Array<{ storeHash: string }>; external: unknown[] };
       closureJsonKey: string;
     };
     expect(obj.buildId).toBe("build-001");
     expect(obj.toplevelStorePath).toBe("/nix/store/abcdef123456aaaa-hello-2.12.1");
-    expect(obj.storePaths).toHaveLength(1);
-    expect(obj.storePaths[0]?.storeHash).toBe("abcdef123456aaaa");
+    expect(obj.closure.owned).toHaveLength(1);
+    expect(obj.closure.owned[0]?.storeHash).toBe("abcdef123456aaaa");
+    expect(obj.closure.external).toEqual([]);
     expect(obj.closureJsonKey).toBe("manifests/build-001/closure.json");
   });
 
@@ -190,275 +220,14 @@ describe("buildManifestJson", () => {
       flakeLockHash: "f",
       toplevelStorePath: "/nix/store/realpath-pkg",
       narinfos: [],
+      externalStorePaths: [],
       closureJsonKey: "manifests/b/closure.json",
     });
     expect(json).not.toContain("placeholder");
   });
 });
 
-// ─── r2PutIfAbsent は削除済み（NAR は常に put・上書き安全） ──────────────────
-
-// ─── publish — 呼び出し順序・内容検証 ──────────────────────────────────────────
-
-describe("publish — exec アダプタ注入によるテスト", () => {
-  type R2Call = { op: "put" | "putContent"; key: string };
-  type ApiCall = { url: string; body: unknown };
-  type KvCall = { key: string };
-
-  interface ManifestMeta {
-    closureJsonKey: string;
-    manifestKey: string;
-    manifestHash: string;
-    host: string;
-    system: string;
-    gitRev: string;
-    flakeLockHash: string;
-    toplevelStorePath: string;
-  }
-
-  function makeSpyAdapter(opts?: {
-    kvReject?: boolean;
-  }): {
-    adapter: ExecAdapter;
-    r2Calls: R2Call[];
-    apiCalls: ApiCall[];
-    kvCalls: KvCall[];
-    sequence: string[];
-  } {
-    const r2Calls: R2Call[] = [];
-    const apiCalls: ApiCall[] = [];
-    const kvCalls: KvCall[] = [];
-    const sequence: string[] = [];
-    const kvReject = opts?.kvReject ?? false;
-
-    const adapter: ExecAdapter = {
-      r2Put: vi.fn(async (_bucket: string, key: string, _file: string) => {
-        sequence.push(`r2:${key}`);
-        r2Calls.push({ op: "put", key });
-      }),
-      r2PutContent: vi.fn(async (_bucket: string, key: string, _content: string) => {
-        r2Calls.push({ op: "putContent", key });
-      }),
-      r2Has: vi.fn(async (_bucket: string, _key: string) => {
-        // 差分化テスト: デフォルトでは「既存なし」扱いとして全件 PUT させる。
-        // (存在ヒット時のスキップ挙動は別テストで検証)
-        return false;
-      }),
-      kvPutBulk: vi.fn(
-        async (
-          _ns: string,
-          items: ReadonlyArray<{ key: string; value: string }>,
-        ) => {
-          // bulk 1 リクエストに含まれる各 key を kvCalls に展開記録 (既存 assertion 互換)。
-          for (const it of items) kvCalls.push({ key: it.key });
-          if (kvReject) throw new Error("KV bulk failed");
-        },
-      ),
-      apiPost: vi.fn(async (url: string, _token: string, body: unknown) => {
-        sequence.push(`api:${url}`);
-        apiCalls.push({ url, body });
-        if (url.endsWith("/start")) {
-          return { ok: true, build_id: "test-build-001" };
-        }
-        if (url.includes("/ingest")) {
-          return { ok: true, ingested: 0 };
-        }
-        if (url.includes("/finalize")) {
-          return { ok: true, published_at: 1700000000000 };
-        }
-        return {};
-      }),
-    };
-
-    return { adapter, r2Calls, apiCalls, kvCalls, sequence };
-  }
-
-  test("staging closure を R2 操作より先に登録し finalize は R2 完了後に行う", async () => {
-    const { adapter, sequence } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    const firstR2 = sequence.findIndex((item) => item.startsWith("r2:"));
-    const start = sequence.findIndex((item) => item.endsWith("/api/publish/start"));
-    const ingest = sequence.findIndex((item) => item.includes("/ingest"));
-    const finalize = sequence.findIndex((item) => item.includes("/finalize"));
-    const lastR2 = sequence.map((item) => item.startsWith("r2:")).lastIndexOf(true);
-    expect(start).toBeLessThan(firstR2);
-    expect(ingest).toBeLessThan(firstR2);
-    expect(finalize).toBeGreaterThan(lastR2);
-  });
-
-  test("closure.json の R2 put が最初の r2Put 呼び出しになる", async () => {
-    const { adapter, r2Calls } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    const putCalls = r2Calls.filter((c) => c.op === "put");
-    expect(putCalls[0]?.key).toMatch(/closure\.json$/);
-  });
-
-  test("manifest.json の R2 put が 2 番目の put になる", async () => {
-    const { adapter, r2Calls } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    const putCalls = r2Calls.filter((c) => c.op === "put");
-    expect(putCalls[1]?.key).toMatch(/manifest\.json$/);
-  });
-
-  test("closure.json / manifest.json キーが manifests/<buildId>/ 配下", async () => {
-    const { adapter, r2Calls } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    const putCalls = r2Calls.filter((c) => c.op === "put");
-    const closureKey = putCalls.find((c) => c.key.endsWith("closure.json"))?.key;
-    const manifestKey = putCalls.find((c) => c.key.endsWith("manifest.json"))?.key;
-    expect(closureKey).toBe(`manifests/${SAMPLE_BUILD_META.id}/closure.json`);
-    expect(manifestKey).toBe(`manifests/${SAMPLE_BUILD_META.id}/manifest.json`);
-  });
-
-  test("finalize の manifestHash が placeholder でない", async () => {
-    const { adapter, apiCalls } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    const finalizeCall = apiCalls.find((c) => c.url.includes("/finalize"));
-    expect(finalizeCall).toBeDefined();
-    const manifest = (finalizeCall?.body as { manifest: ManifestMeta }).manifest;
-    expect(manifest.manifestHash).toMatch(/^sha256:[0-9a-f]{64}$/);
-    expect(manifest.manifestHash).not.toBe("sha256:placeholder");
-  });
-
-  test("finalize の toplevelStorePath が実値（placeholder でない）", async () => {
-    const { adapter, apiCalls } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    const finalizeCall = apiCalls.find((c) => c.url.includes("/finalize"));
-    const manifest = (finalizeCall?.body as { manifest: ManifestMeta }).manifest;
-    expect(manifest.toplevelStorePath).toBe("/nix/store/abcdef123456aaaa-hello-2.12.1");
-    expect(manifest.toplevelStorePath).not.toBe("placeholder");
-  });
-
-  test("NAR の存在チェック（r2Head 相当）は呼ばれない（常に r2Put で上書き安全）", async () => {
-    const { adapter, r2Calls } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    // r2PutIfAbsent / r2Head を撤去したため、put/putContent 以外の呼び出しはゼロ
-    const nonPutCalls = r2Calls.filter((c) => c.op !== "put" && c.op !== "putContent");
-    expect(nonPutCalls).toHaveLength(0);
-  });
-
-  test("NAR は常に r2Put で投入される（上書き安全・idempotent）", async () => {
-    const { adapter, r2Calls } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    const putCalls = r2Calls.filter((c) => c.op === "put");
-    const narPutCalls = putCalls.filter((c) => c.key.startsWith("nar/"));
-    expect(narPutCalls.length).toBeGreaterThan(0);
-  });
-
-  test("NAR put は narinfo put より前に来る", async () => {
-    const { adapter, r2Calls } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    const putCalls = r2Calls.filter((c) => c.op === "put");
-    const narPutIdx = putCalls.findIndex((c) => c.key.startsWith("nar/"));
-    const narinfoPutIdx = putCalls.findIndex((c) => c.key.endsWith(".narinfo"));
-    expect(narPutIdx).toBeGreaterThanOrEqual(0);
-    expect(narinfoPutIdx).toBeGreaterThanOrEqual(0);
-    expect(narPutIdx).toBeLessThan(narinfoPutIdx);
-  });
-
-  test("API 呼び出し順序: start → ingest → finalize", async () => {
-    const { adapter, apiCalls } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    const urls = apiCalls.map((c) => {
-      if (c.url.endsWith("/start")) return "start";
-      if (c.url.includes("/ingest")) return "ingest";
-      if (c.url.includes("/finalize")) return "finalize";
-      return "other";
-    });
-
-    const startIdx = urls.indexOf("start");
-    const ingestIdx = urls.indexOf("ingest");
-    const finalizeIdx = urls.indexOf("finalize");
-
-    expect(startIdx).toBeGreaterThanOrEqual(0);
-    expect(ingestIdx).toBeGreaterThanOrEqual(0);
-    expect(finalizeIdx).toBeGreaterThanOrEqual(0);
-    expect(startIdx).toBeLessThan(ingestIdx);
-    expect(ingestIdx).toBeLessThan(finalizeIdx);
-  });
-
-  test("KV warming が D1 finalize の後に来る", async () => {
-    const { adapter, apiCalls, kvCalls } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    expect(apiCalls.some((c) => c.url.includes("/finalize"))).toBe(true);
-    expect(kvCalls.length).toBeGreaterThan(0);
-  });
-
-  test("KV warming 失敗は publish 全体を失敗にしない", async () => {
-    const { adapter } = makeSpyAdapter({ kvReject: true });
-    await expect(
-      publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter),
-    ).resolves.toBeUndefined();
-  });
-
-  test("start API に buildMeta が渡される", async () => {
-    const { adapter, apiCalls } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    const startCall = apiCalls.find((c) => c.url.endsWith("/start"));
-    expect(startCall).toBeDefined();
-    const body = startCall?.body as { build: typeof SAMPLE_BUILD_META };
-    expect(body.build.host).toBe(SAMPLE_BUILD_META.host);
-    expect(body.build.system).toBe(SAMPLE_BUILD_META.system);
-    expect(body.build.toplevelStorePath).toBe(SAMPLE_BUILD_META.toplevelStorePath);
-  });
-
-  test("r2Has が NAR キーごとに呼ばれる (差分化)", async () => {
-    const { adapter } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    // narinfo は 1 件 (mock 設定)、narKey は "nar/sha256:file001.nar.zst"
-    expect(adapter.r2Has).toHaveBeenCalledWith("my-bucket", "nar/sha256:file001.nar.zst");
-  });
-
-  test("r2Has が true を返したら該当 NAR の r2Put はスキップされる", async () => {
-    const r2Calls: { op: "put" | "putContent"; key: string }[] = [];
-    const adapter: ExecAdapter = {
-      r2Put: vi.fn(async (_b: string, key: string) => {
-        r2Calls.push({ op: "put", key });
-      }),
-      r2PutContent: vi.fn(async (_b: string, key: string) => {
-        r2Calls.push({ op: "putContent", key });
-      }),
-      r2Has: vi.fn(async (_b: string, _k: string) => true), // 既存ヒット扱い
-      kvPutBulk: vi.fn(async () => {}),
-      apiPost: vi.fn(async (url: string) => {
-        if (url.endsWith("/start")) return { ok: true, build_id: "test-build-001" };
-        if (url.includes("/ingest")) return { ok: true };
-        if (url.includes("/finalize")) return { ok: true };
-        return {};
-      }),
-    };
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    const narPuts = r2Calls.filter((c) => c.op === "put" && c.key.startsWith("nar/"));
-    expect(narPuts).toHaveLength(0); // すべて既存ヒットでスキップ
-  });
-
-  test("KV warming は kvPutBulk 1 回 (narinfo 数 ≤ chunk size) で全件投入される", async () => {
-    const { adapter } = makeSpyAdapter();
-    await publish("/fake/cache", SAMPLE_BUILD_META, SAMPLE_ENV, adapter);
-
-    // narinfo が 1 件しか無いので bulk 呼び出しも 1 回
-    expect(adapter.kvPutBulk).toHaveBeenCalledTimes(1);
-    const bulkCall = (adapter.kvPutBulk as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(bulkCall?.[0]).toBe("kv-ns-001");
-    const items = bulkCall?.[1] as ReadonlyArray<{ key: string; value: string }>;
-    expect(items).toHaveLength(1);
-    expect(items[0]?.key).toBe("narinfo:abcdef123456aaaa");
-  });
-});
+// ─── batch publish ────────────────────────────────────────────────────────────
 
 describe("publishBatch", () => {
   const shared = `StorePath: /nix/store/shared0000000000-shared
@@ -482,8 +251,9 @@ NarSize: 20
 
   function batchPlan() {
     return parsePublishPlan({
-      version: 1,
+      version: 2,
       cacheDir: "/fake/cache",
+      selfNarinfoDir: "/fake/self",
       targets: [
         {
           host: "laptop",
@@ -496,6 +266,12 @@ NarSize: 20
             "/nix/store/shared0000000000-shared",
             "/nix/store/laptop000000000-laptop",
           ],
+          externalStorePaths: [],
+          selfExistingStorePaths: [],
+          newStorePaths: [
+            "/nix/store/shared0000000000-shared",
+            "/nix/store/laptop000000000-laptop",
+          ],
         },
         {
           host: "desktop",
@@ -505,6 +281,12 @@ NarSize: 20
           toplevelStorePath: "/nix/store/desktop000000000-desktop",
           closureJsonPath: "/fake/targets/desktop/closure.json",
           closureStorePaths: [
+            "/nix/store/shared0000000000-shared",
+            "/nix/store/desktop000000000-desktop",
+          ],
+          externalStorePaths: [],
+          selfExistingStorePaths: [],
+          newStorePaths: [
             "/nix/store/shared0000000000-shared",
             "/nix/store/desktop000000000-desktop",
           ],
@@ -564,14 +346,14 @@ NarSize: 20
 
     const parsed = [...manifests.entries()]
       .filter(([key]) => key.endsWith("manifest.json"))
-      .map(([, value]) => JSON.parse(value) as { host: string; storePaths: Array<{ storePath: string }> });
+      .map(([, value]) => JSON.parse(value) as { host: string; closure: { owned: Array<{ storePath: string }> } });
     const laptop = parsed.find((manifest) => manifest.host === "laptop");
     const desktop = parsed.find((manifest) => manifest.host === "desktop");
-    expect(laptop?.storePaths.map((path) => path.storePath)).toEqual([
+    expect(laptop?.closure.owned.map((path) => path.storePath)).toEqual([
       "/nix/store/shared0000000000-shared",
       "/nix/store/laptop000000000-laptop",
     ]);
-    expect(desktop?.storePaths.map((path) => path.storePath)).toEqual([
+    expect(desktop?.closure.owned.map((path) => path.storePath)).toEqual([
       "/nix/store/shared0000000000-shared",
       "/nix/store/desktop000000000-desktop",
     ]);
@@ -587,6 +369,116 @@ NarSize: 20
     expect(r2Put.mock.calls.filter((call) => String(call[1]).endsWith(".narinfo"))).toHaveLength(3);
     expect(adapter.kvPutBulk).toHaveBeenCalledTimes(1);
     expect((adapter.kvPutBulk as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]).toHaveLength(3);
+  });
+
+  test("externalはmanifestだけ、self-existingは世代参照だけ、新規pathだけuploadする", async () => {
+    mockNarinfoFiles = ["laptop000000000.narinfo"];
+    mockSelfNarinfoFiles = ["shared0000000000.narinfo"];
+    const plan = parsePublishPlan({
+      version: 2,
+      cacheDir: "/fake/cache",
+      selfNarinfoDir: "/fake/self",
+      targets: [{
+        host: "laptop", system: "x86_64-linux", gitRev: "deadbeef",
+        flakeLockHash: "sha256:lock",
+        toplevelStorePath: "/nix/store/laptop000000000-laptop",
+        closureJsonPath: "/fake/targets/laptop/closure.json",
+        closureStorePaths: [
+          "/nix/store/external00000000-external",
+          "/nix/store/shared0000000000-shared",
+          "/nix/store/laptop000000000-laptop",
+        ],
+        externalStorePaths: [{
+          storePath: "/nix/store/external00000000-external",
+          substituterUrl: "https://cache.nixos.org",
+        }],
+        selfExistingStorePaths: ["/nix/store/shared0000000000-shared"],
+        newStorePaths: ["/nix/store/laptop000000000-laptop"],
+      }],
+    });
+    const { adapter, manifests } = batchAdapter();
+    vi.mocked(adapter.r2Has).mockImplementation(async (_bucket, key) => key === "nar/shared.nar.zst");
+    await publishBatch(plan, SAMPLE_ENV, adapter);
+
+    const manifest = JSON.parse([...manifests.values()][0]!) as {
+      closure: {
+        owned: Array<{ storePath: string }>;
+        external: Array<{ storePath: string; substituterUrl: string }>;
+      };
+    };
+    expect(manifest.closure.owned.map((row) => row.storePath)).toEqual([
+      "/nix/store/shared0000000000-shared",
+      "/nix/store/laptop000000000-laptop",
+    ]);
+    expect(manifest.closure.external).toEqual([{
+      storePath: "/nix/store/external00000000-external",
+      substituterUrl: "https://cache.nixos.org",
+    }]);
+    const ingested = (adapter.apiPost as ReturnType<typeof vi.fn>).mock.calls
+      .filter((call) => String(call[0]).endsWith("/ingest"))
+      .flatMap((call) => (call[2] as { storePaths: Array<{ storePath: string }> }).storePaths);
+    expect(ingested.map((row) => row.storePath)).toEqual(manifest.closure.owned.map((row) => row.storePath));
+    expect((adapter.r2Put as ReturnType<typeof vi.fn>).mock.calls
+      .map((call) => call[1])
+      .filter((key) => String(key).startsWith("nar/") || String(key).endsWith(".narinfo")))
+      .toEqual(["nar/laptop.nar.zst", "shared0000000000.narinfo", "laptop000000000.narinfo"]);
+    expect((adapter.r2Put as ReturnType<typeof vi.fn>).mock.calls
+      .find((call) => call[1] === "shared0000000000.narinfo")?.[2])
+      .toBe("/fake/self/shared0000000000.narinfo");
+
+  });
+
+  test("self-existing NAR が R2 から消えていれば finalize しない", async () => {
+    mockNarinfoFiles = [];
+    mockSelfNarinfoFiles = ["shared0000000000.narinfo"];
+    const plan = parsePublishPlan({
+      version: 2, cacheDir: "/fake/cache", selfNarinfoDir: "/fake/self",
+      targets: [{
+        host: "shared", system: "x86_64-linux", gitRev: "deadbeef",
+        flakeLockHash: "sha256:lock",
+        toplevelStorePath: "/nix/store/shared0000000000-shared",
+        closureJsonPath: "/fake/targets/shared/closure.json",
+        closureStorePaths: ["/nix/store/shared0000000000-shared"],
+        externalStorePaths: [],
+        selfExistingStorePaths: ["/nix/store/shared0000000000-shared"],
+        newStorePaths: [],
+      }],
+    });
+    const { adapter } = batchAdapter();
+    await expect(publishBatch(plan, SAMPLE_ENV, adapter)).rejects.toThrow("self-existing NAR missing");
+    expect((adapter.apiPost as ReturnType<typeof vi.fn>).mock.calls
+      .filter((call) => String(call[0]).endsWith("/finalize"))).toHaveLength(0);
+  });
+
+  test("所有区分が変わる再試行は別build IDになる", async () => {
+    const target = {
+      host: "shared", system: "x86_64-linux", gitRev: "deadbeef",
+      flakeLockHash: "sha256:lock",
+      toplevelStorePath: "/nix/store/shared0000000000-shared",
+      closureJsonPath: "/fake/targets/shared/closure.json",
+      closureStorePaths: ["/nix/store/shared0000000000-shared"],
+    };
+    const plan = (external: boolean) => parsePublishPlan({
+      version: 2, cacheDir: "/fake/cache", selfNarinfoDir: "/fake/self",
+      targets: [{
+        ...target,
+        externalStorePaths: external ? [{
+          storePath: target.toplevelStorePath,
+          substituterUrl: "https://cache.nixos.org",
+        }] : [],
+        selfExistingStorePaths: [],
+        newStorePaths: external ? [] : [target.toplevelStorePath],
+      }],
+    });
+    const { adapter } = batchAdapter();
+    mockNarinfoFiles = [];
+    await publishBatch(plan(true), SAMPLE_ENV, adapter);
+    mockNarinfoFiles = ["shared0000000000.narinfo"];
+    await publishBatch(plan(false), SAMPLE_ENV, adapter);
+    const starts = (adapter.apiPost as ReturnType<typeof vi.fn>).mock.calls
+      .filter((call) => String(call[0]).endsWith("/start"))
+      .map((call) => (call[2] as { build: { id: string } }).build.id);
+    expect(starts[0]).not.toBe(starts[1]);
   });
 
   test("全start/ingest、manifest、NAR、narinfo、全finalize、KVの順序を守る", async () => {

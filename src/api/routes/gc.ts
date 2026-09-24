@@ -107,13 +107,25 @@ const gcBackfillRoute = createRoute({
   },
 });
 
-const StoredManifestSchema = z.object({
-  buildId: z.string(),
-  storePaths: z.array(z.object({
-    storeHash: z.string(),
-    narKey: z.string().regex(/^nar\/[0-9a-z]+\.nar(\.(xz|zst|gz|br))?$/),
-  })),
+const StoredOwnedPathSchema = z.object({
+  storeHash: z.string(),
+  narKey: z.string().regex(/^nar\/[0-9a-z]+\.nar(\.(xz|zst|gz|br))?$/),
 });
+const StoredManifestSchema = z.union([
+  z.object({
+    version: z.literal(2),
+    buildId: z.string(),
+    closure: z.object({
+      owned: z.array(StoredOwnedPathSchema),
+      external: z.array(z.object({
+        storePath: z.string(),
+        substituterUrl: z.string(),
+      })),
+    }),
+  }),
+  // Persisted manifests from before ownership classification still need GC backfill.
+  z.object({ buildId: z.string(), storePaths: z.array(StoredOwnedPathSchema) }),
+]);
 
 function manifestHashMatches(expected: string, digest: Uint8Array): boolean {
   const hex = [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -205,7 +217,8 @@ gcApp.openapi(gcBackfillRoute, async (c) => {
       }
       const manifest = StoredManifestSchema.parse(JSON.parse(text));
       if (manifest.buildId !== buildId) throw new Error("manifest buildId mismatch");
-      const byStoreHash = new Map(manifest.storePaths.map((row) => [row.storeHash, row.narKey]));
+      const owned = "closure" in manifest ? manifest.closure.owned : manifest.storePaths;
+      const byStoreHash = new Map(owned.map((row) => [row.storeHash, row.narKey]));
       const updates = rows.map((row) => {
         const narKey = byStoreHash.get(row.storeHash);
         if (!narKey) throw new Error(`manifest is missing store hash ${row.storeHash}`);

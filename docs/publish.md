@@ -1,6 +1,6 @@
 # publish 運用手順
 
-cf-edgeNix の publish は「nix copy でローカルに生成した binary cache を、R2/D1/KV へ決まった順序で反映する」一連の処理である。
+cf-edgeNix の publish は「完全なclosureを分類し、自前cacheで配信するpathのNARとnarinfoをR2/D1/KVへ決まった順序で反映する」一連の処理である。
 
 publish を実行する主体は GitHub Actions（`publish.yml`）だが、手動実行やデバッグにも使う。
 
@@ -16,13 +16,14 @@ GitHub Actions の Environment (`production`) に事前登録する値。
 
 | 変数名 | 種別 | 説明 |
 | --- | --- | --- |
-| `CACHE_PRIVATE_KEY` | Secret | NAR / narinfo の署名秘密鍵。`nix copy` が `Sig:` フィールドに書き込む。 |
+| `CACHE_PRIVATE_KEY` | Secret | narinfoの署名秘密鍵。Nixの`nix store sign`がpathへ署名を追加する。 |
 | `ADMIN_TOKEN` | Secret | Worker 管理 API（write 系）の Bearer トークン。 |
 | `CLOUDFLARE_API_TOKEN` | Secret | KV write 権限を持つ Cloudflare API トークン。 |
 | `R2_ACCESS_KEY_ID` | Secret | R2 S3 互換 API のアクセスキー。 |
 | `R2_SECRET_ACCESS_KEY` | Secret | R2 S3 互換 API のシークレットキー。 |
 | `CLOUDFLARE_ACCOUNT_ID` | Variable | Cloudflare アカウント ID。 |
 | `API_BASE_URL` | Variable | デプロイ済み Worker の URL（例: `https://cf-edgenix.<account>.workers.dev`）。 |
+| `SELF_CACHE_URL` | Variable | 自前cacheの公開URL。workflowテンプレートの既定値は `https://nix.t4ko.pet`。 |
 | `R2_BUCKET_NAME` | Variable | R2 バケット名（例: `cf-edgenix-nar`）。 |
 | `KV_NAMESPACE_ID` | Variable | KV 名前空間 ID。 |
 
@@ -37,7 +38,7 @@ GitHub Actions の Environment (`production`) に事前登録する値。
 | 変数名 | 用途 |
 | --- | --- |
 | 位置引数 / `HOST` | 対象の nixosConfiguration 名。複数は位置引数、単一は従来どおり `HOST` でも指定可能。両方の同時指定は不可。 |
-| `CACHE_DIR` | 全対象で共有する `nix copy --to file://` の出力先。既存ファイルの混入を防ぐため、実行開始時に空でなければならない。 |
+| `CACHE_DIR` | new pathのNARとnarinfoの出力先。既存ファイルの混入を防ぐため、実行開始時に空でなければならない。 |
 
 ---
 
@@ -46,9 +47,11 @@ GitHub Actions の Environment (`production`) に事前登録する値。
 ```
 全 host を単一 nix build            ← NixOS system closure をビルド
   ↓
-nix copy                              ← top-levelから完全なclosureを圧縮・署名
+full closure の metadata を取得       ← dependency graph を保持
   ↓
-upstream prune                        ← cache.nixos.org 保有pathのnarinfoを除外
+実効 substituter と self cache を照会  ← external / self-existing / new に分類
+  ↓
+new path だけ NAR + zstd・署名narinfo 生成
   ↓
 scripts/publish.ts --plan <JSON>      ← R2/D1/KV への一括反映
   │
@@ -60,28 +63,25 @@ scripts/publish.ts --plan <JSON>      ← R2/D1/KV への一括反映
   └── Step 5: 全 host の和集合を KV warming（1回、失敗は警告のみ）
 ```
 
-`scripts/publish.sh` は全hostを一度の build / copy / prune で処理し、秘密情報を含まない一時publish planを `scripts/publish.ts` へ渡す。共有 `CACHE_DIR` は一度だけ走査される。各hostのmanifestは `host closure ∩ prune後のnarinfo` で作り、他host専用pathを混入させない。全pathがupstreamにあるhostは空closureとしてfinalizeする。
+`scripts/publish.sh` は全hostを一度の build / classification / staging で処理し、秘密情報を含まない一時publish planを `scripts/publish.ts` へ渡す。host ごとの full closure は `closure.json` に残す。manifest は `closure.owned` と `closure.external` を持ち、各hostのpathだけを記録する。全pathが外部にあるhostも空の owned closure で finalize する。
 
-### upstream prune（R2容量の節約）
+### publish 前の分類
 
-`publish.sh` は全hostのtop-levelを単一の `nix copy` に渡し、参照先を含む完全なclosureを `CACHE_DIR` に生成する。その後、各store hashのnarinfoをupstreamへ並列HEADする。
+分類対象は全hostの full closure の和集合。`nix config show --json` にある実効 substituter を順に HEAD し、200なら `external` とする。self cache は別に GET して `StorePath` の一致を確認し、存在する path を `self-existing` とする。どちらにもなければ `new` とする。照会失敗は publish 対象から path を除外しない。
 
-200を返したpathはupstream所有としてnarinfoを削除する。NARはcontent-addressedで別pathから共有される場合があるため削除せず、`publish.ts` が残ったnarinfoを起点に必要なNARだけを選ぶ。先に完全なclosureを生成することで、参照先を除外した不完全なbinary cacheを `nix copy --no-recursive` で作ることによる失敗を防ぐ。
+`new` だけを NAR + zstd にして署名narinfoを作る。参照先が staging cache にないと `nix copy --no-recursive` は失敗するため、Nix の NAR 出力・path metadata・署名コマンドを使う。`self-existing` のnarinfoは取得済みの内容を D1 ingest と R2再登録に利用し、NAR が R2 に残っていることも finalize 前に確認する。
 
-Nix client 側は `extra-substituters = [ "https://nix.t4ko.pet" ];` のように cf-edgeNix と cache.nixos.org の **両方**を持つ前提なので、自前 cache に無い path は upstream から fetch される。`docs/setup.md` の C4 設定が守られていれば破綻しない。
+Nix client 側は cf-edgeNix と分類に利用した外部 substituter の両方を設定する。`external` は cf-edgeNix が配信・GCしないため、復元時にも外部cacheが利用可能である必要がある。
 
 挙動制御:
 
 | 環境変数 | 既定 | 用途 |
 | --- | --- | --- |
-| `UPSTREAM_CACHE_URL` | `https://cache.nixos.org` | 対象 substituter URL（自前で複数階層 cache を運用するときに使用） |
-| `SKIP_UPSTREAM_PRUNE` | `0` | `1` にするとcopy後のupstream除外をスキップする（デバッグ用） |
-| `PRUNE_CONCURRENCY` | `32` | 並列 curl 数 |
-| `PRUNE_TIMEOUT` | `5` | 1 リクエストの最大秒数 |
+| `SELF_CACHE_URL` | `API_BASE_URL`（publish.sh単独実行時） | self cache の公開URL。workflowテンプレートからは `https://nix.t4ko.pet` が既定で渡される |
+| `CLASSIFY_CONCURRENCY` | `32` | 並列照会数 |
+| `CLASSIFY_TIMEOUT` | `5` | 1 リクエストの最大秒数 |
 
-upstream が不通の場合（DNS NXDOMAIN / timeout / 5xx 等）は **削除しない**（=「無い扱い」ではなく「不明扱い」で安全側に倒す）。結果として R2 容量節約は効かないが、誤って必要な NAR を消す事故は起きない。
-
-既存のself cacheにあるNARは、`publish.ts` がR2をHEADしてuploadを省略する。narinfoとD1 closureは毎回更新されるため、新世代のGC live-set参照も維持される。
+upstream が不通の場合（DNS NXDOMAIN / timeout / 5xx 等）は `new` として保存する。self cache の照会失敗も `new` とし、R2の既存NARは upload 前の HEAD で再利用する。`self-existing` は今回 upload しなくても自前 R2 にあるため `owned` として D1 に登録し、新世代の GC live-set へつなぐ。
 
 ---
 
@@ -176,15 +176,15 @@ bash scripts/publish.sh laptop desktop
 1. 全installableを単一の `nix build` でbuild
 2. 各flake属性を `nix eval` し、hostとtoplevelを出力順に依存せず対応付け
 3. host別closure JSONを生成
-4. 全hostのtop-levelから完全なclosureを単一の再帰 `nix copy` で共有 `CACHE_DIR` へ出力
-5. upstream保有pathのnarinfoを `CACHE_DIR` から除外
+4. 全hostのclosureの和集合を external / self-existing / new に分類
+5. new path だけを `CACHE_DIR` にNAR化し、self-existingのnarinfoを別ディレクトリに取得
 6. `bun scripts/publish.ts --plan <plan.json>` を一度だけ実行
 
-`ZSTD_LEVEL` は Nix の binary cache store URL に渡す `compression-level` で、省略時は `9`（CI 時間と R2 サイズのバランス重視）。Nix 側の既定値を使いたい場合は `ZSTD_LEVEL=-1` を指定する。
+`ZSTD_LEVEL` はNAR圧縮時のzstd levelで、省略時は`9`。zstdの既定levelを使う場合は`ZSTD_LEVEL=-1`を指定する。
 
 `system` は各hostの `nixosConfigurations.<host>.pkgs.system` から取得する。`SYSTEM` を明示した場合だけ全targetへのoverrideとして扱う。
 
-各実行は `[timing] build=...s`、`closure-metadata`、`copy`、`upstream-prune`、`publish`、`total` をログへ出す。Actionsのstep全体だけでなく、圧縮・照会・uploadのどこに時間が移ったかをrun間で比較できる。
+各実行は `[timing] build=...s`、`closure-metadata`、`availability`、`stage`、`publish`、`total` をログへ出す。圧縮・照会・uploadの所要時間をrun間で比較できる。
 
 ---
 
@@ -198,7 +198,7 @@ bash scripts/publish.sh laptop desktop
 
 ## 再 publish（冪等再実行）
 
-`build_id` は `host:system:gitRev:flakeLockHash:toplevelStorePath` を SHA256 でハッシュした先頭 36 字から**決定的に生成**される。同一 commit・同一 host の再実行では必ず同一 `build_id` になる。
+`build_id` は host・build metadata・full closure・external分類をSHA256でハッシュした先頭36字から決定的に生成される。分類結果が同じ再実行では同一IDになり、external/ownedの境界や照会先URLが変われば別IDになる。
 
 これにより、中断した staging publish は同じ条件で再開できる:
 - `start` は既に staging なら冪等に 200 を返して保護期限を更新する。published / failed / pruned なら 409。
@@ -213,13 +213,13 @@ batchの一部だけがfinalize後に失敗した場合、完了済みbuildへ�
 
 ## 過去世代を GC する
 
-GC は host ごとの最新 3 published 世代、pin、rollback root、作成から 24 時間以内の staging build を保持する。世代ごとの `build_closure.nar_key` を live-set の正本とし、同じ store hash の NAR が世代間で変化しても個別に判定する。
+GC は host ごとの最新 3 published 世代、pin、rollback root、作成から 24 時間以内の staging build を保持する。世代ごとの `build_closure.nar_key` は owned path のみを持ち、external path はGC対象に入らない。同じ store hash の NAR が世代間で変化しても個別に判定する。
 
 Workerのhourly Cron Trigger（毎時17分）は、前回までに1時間のgraceを満たしたNARを `phase: nar` で最大10件削除してから、新しいdead候補のnarinfoを `phase: narinfo` で最大10件非公開化する。物理削除を先にすることで、直前のhourly実行で付けたtombstoneを回収し、その後に次回対象を作る。API自身がlive-set再検証とgraceを強制する。`ADMIN_TOKEN` が未設定ならscheduled GCは安全にskipする。
 
 旧migration由来closureのbackfillはエラー確認と再実行が必要な移行操作なので自動化せず、以下の管理API手順を使う。
 
-migration `0003_safe_generational_gc.sql` の適用直後は、旧 closure の `nar_key` が未解決である間、GC は fail-closed で全 NAR を live として扱う。`0004_gc_review_fixes.sql` は既存 build を `restorable=0` から開始して復元可否を永続化し、`build_closure.nar_key` の index を追加する。backfill が closure 全体の整合性を確認できた build だけを `restorable=1` にする。R2 manifest から参照を復元し、`closure_rows_remaining` が 0 になるまで backfill を繰り返す。
+migration `0003_safe_generational_gc.sql` の適用直後は、旧 closure の `nar_key` が未解決である間、GC は fail-closed で全 NAR を live として扱う。`0004_gc_review_fixes.sql` は既存 build を `restorable=0` から開始して復元可否を永続化し、`build_closure.nar_key` の index を追加する。backfill が closure 全体の整合性を確認できた build だけを `restorable=1` にする。R2 manifest の旧 `storePaths` または新 `closure.owned` から参照を復元し、`closure_rows_remaining` が 0 になるまで backfill を繰り返す。
 
 ```bash
 curl -X POST https://cf-edgenix.<account>.workers.dev/api/gc/backfill \

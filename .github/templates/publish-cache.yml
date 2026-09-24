@@ -1,42 +1,3 @@
-# cf-edgeNix へ NixOS closure を publish する GitHub Actions workflow テンプレート。
-#
-# 配置先: <あなたの NixOS flake repo>/.github/workflows/publish-cache.yml
-#
-# このテンプレートは cf-edgeNix の scripts/publish.sh を再利用するため、
-# 呼び出し側 repo に cf-edgeNix を別 path で checkout してから走らせる。
-#
-# ── 事前準備（呼び出し側 repo の Settings で登録する） ───────────────────────
-#   Environments → production を作成し、以下を登録:
-#     Secrets:
-#       CACHE_PRIVATE_KEY     NAR 署名用秘密鍵（fork PR 露出防止のため必ず environment に置く）
-#       ADMIN_TOKEN           cf-edgeNix Worker の write API Bearer
-#       CLOUDFLARE_API_TOKEN  KV bulk write の最小権限トークン（deploy 用とは分離推奨）
-#       R2_ACCESS_KEY_ID      R2 S3 API のアクセスキー（R2 dashboard → Manage R2 API tokens）
-#       R2_SECRET_ACCESS_KEY  R2 S3 API のシークレットキー
-#     Variables:
-#       CLOUDFLARE_ACCOUNT_ID
-#       API_BASE_URL          deploy 済み cf-edgeNix Worker の URL
-#       R2_BUCKET_NAME        例: cf-edgenix-nar
-#       KV_NAMESPACE_ID
-#
-# ── 設置後に書き換える箇所 ──────────────────────────────────────────────
-#   1. Resolve target hosts ステップの allowlist (host1|host2) と default list を
-#      実 nixosConfigurations 名に置き換える
-#   2. 自動実行したい場合は、別 workflow から workflow_call で呼び出す
-#
-# ── 動作概要 ────────────────────────────────────────────────────────
-#   - 呼び出し側 repo (flake source) を CWD に、cf-edgeNix を .cf-edgenix/ に checkout
-#   - /nix/store と bun install を cache し再ラン時のビルドを短縮
-#   - 全 host を 1 回の publish.sh で build/copy し、共有 closure を重複処理しない
-#   - bash .cf-edgenix/scripts/publish.sh が
-#       nix build .#nixosConfigurations.<HOST>...
-#       nix copy --to file://$CACHE_DIR (完全なclosureを圧縮・署名)
-#       cache.nixos.org が保有するnarinfoをCACHE_DIRからprune
-#       bun publish.ts → R2 (S3 API) / KV bulk へ反映
-#     を順に実行する
-#   - host 指定時も同じ batch 経路を単一引数で実行する
-#   - upstream pruneの挙動は環境変数で制御可能 (docs/publish.md)
-
 name: publish-cache
 
 on:
@@ -70,10 +31,6 @@ jobs:
       - name: Checkout flake source (this repo)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      # secret を扱う job なので cf-edgeNix も SHA pin する。
-      # branch tip 追従だと上流 commit が即座に CACHE_PRIVATE_KEY / ADMIN_TOKEN /
-      # CLOUDFLARE_API_TOKEN / R2_* を持った状態で実行されてしまうため、
-      # 更新は呼び出し側 repo で意図的に SHA を bump する PR で行う。
       - name: Checkout cf-edgeNix (publish tooling)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -81,9 +38,6 @@ jobs:
           ref: main
           path: .cf-edgenix
 
-      # workflow_call / workflow_dispatch の host が空なら全 host、指定があれば
-      # allowlist 内のもののみ。
-      # allowlist と default list を実 nixosConfigurations 名に書き換える。
       - name: Resolve target hosts
         id: hosts
         env:
@@ -103,29 +57,20 @@ jobs:
             esac
           fi
 
-      # flake.nix の nixConfig.extra-substituters は trusted-user 制約で runner では効かないため、
-      # ここで明示的に substituter / trusted-public-keys を inject する。
       - name: Install Nix
-        uses: cachix/install-nix-action@08dcb3a5e62fa31e2da3d490afc4176ef55ecd72 # v30
+        uses: cachix/install-nix-action@b4b293eae0b79aac8a161bb32925a5508c9cca93 # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-            substituters = https://cache.nixos.org https://cache.numtide.com
-            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=
+            substituters = https://nix.t4ko.pet https://vicinae.cachix.org https://cache.numtide.com https://codex-desktop-linux.cachix.org https://noctalia.cachix.org https://nix-community.cachix.org https://cache.nixos.org
+            trusted-public-keys = nix.t4ko.pet-1:0eRO18L1/5diWYWboKKPTejQGhGCHNITwELiUaX7Kps= vicinae.cachix.org-1:1kDrfienkGHPYbkpNj1mWTr7Fm1+zcenzgTizIcI3oc= niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g= codex-desktop-linux.cachix.org-1:nX/xy6AdK9hQE24A8ALGjkCKj2ObFmcnemiL5Cid4nk= noctalia.cachix.org-1:pCOR47nnMEo5thcxNDtzWpOxNFQsBRglJzxWPp3dkU4= nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
             accept-flake-config = true
 
-      # /nix/store を全 host 共通でキャッシュ。1 job 内で host を直列に build するので
-      # 共通依存は同一ランで自然に共有され、次回ラン以降は cache から復元される。
-      - name: Cache /nix/store
-        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 8G
-          purge: true
-          purge-prefixes: nix-${{ runner.os }}-
-          purge-created: 0
-          purge-primary-key: never
+      - name: Show disk usage
+        run: |
+          df -h
+          sudo du -sh /nix/store || true
+          du -sh "$RUNNER_TEMP" || true
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
@@ -144,16 +89,13 @@ jobs:
         working-directory: .cf-edgenix
         run: bun install --frozen-lockfile
 
-      # CWD は flake source のまま、scripts は .cf-edgenix/scripts/ から起動する。
-      # publish.sh は CWD の flake に対して nix build を走らせるので、
-      # 呼び出し側 repo の nixosConfigurations.<HOST> がビルドされる。
-      # publish.sh が全 host をまとめて build/copy/prune/upload する。
       - name: Build, sign & publish
         env:
           HOSTS: ${{ steps.hosts.outputs.list }}
           CACHE_DIR: ${{ runner.temp }}/cf-edgenix-cache
           CACHE_PRIVATE_KEY: ${{ secrets.CACHE_PRIVATE_KEY }}
           API_BASE_URL: ${{ vars.API_BASE_URL }}
+          SELF_CACHE_URL: ${{ vars.SELF_CACHE_URL || 'https://nix.t4ko.pet' }}
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
           KV_NAMESPACE_ID: ${{ vars.KV_NAMESPACE_ID }}
@@ -164,6 +106,7 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
+          trap 'rm -rf -- "$CACHE_DIR"' EXIT
           mkdir -p "$CACHE_DIR"
           read -r -a hosts <<< "$HOSTS"
           bash .cf-edgenix/scripts/publish.sh "${hosts[@]}"

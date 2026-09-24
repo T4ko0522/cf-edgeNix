@@ -17,23 +17,29 @@ async function runPublishSh(
   env: Record<string, string>,
   hosts: string[] = [],
 ): Promise<{
-  copyArgs: string[];
+  stagedPaths: string[];
+  zstdArgs: string[];
   cacheNarinfos: string[];
+  cacheNarinfoContents: string[];
   nixCommands: string[];
   bunArgs: string[];
-  plan: { targets: Array<{ host: string; system: string; closureStorePaths: string[] }> };
+  plan: { version: number; selfNarinfoDir: string; targets: Array<{ host: string; system: string; closureStorePaths: string[]; externalStorePaths: Array<{storePath: string; substituterUrl: string}>; selfExistingStorePaths: string[]; newStorePaths: string[] }> };
+  selfNarinfo: string | null;
   stdout: string;
 }> {
   const dir = await mkdtemp(join(tmpdir(), "cf-edgenix-publish-sh-"));
   const binDir = join(dir, "bin");
   const cacheDir = join(dir, "cache");
-  const nixLog = join(dir, "nix-args.log");
+  const nixLog = join(dir, "staged-paths.log");
   const nixCommandsLog = join(dir, "nix-commands.log");
+  const zstdLog = join(dir, "zstd-args.log");
   const bunLog = join(dir, "bun-args.log");
   const planLog = join(dir, "plan.json");
+  const selfNarinfoLog = join(dir, "self-narinfo");
   await mkdir(binDir);
   await mkdir(cacheDir);
   await writeFile(nixLog, "");
+  await writeFile(zstdLog, "");
 
   await writeExecutable(
     join(binDir, "nix"),
@@ -43,6 +49,25 @@ printf '%s' "$1" >> "$NIX_COMMANDS_LOG"
 for arg in "\${@:2}"; do printf '\\t%s' "$arg" >> "$NIX_COMMANDS_LOG"; done
 printf '\\n' >> "$NIX_COMMANDS_LOG"
 case "$1" in
+  store)
+    [ "$2" = "sign" ] || exit 64
+    cat > /dev/null
+    ;;
+  nar)
+    [ "$2" = "dump-path" ] || exit 64
+    printf '%s\\n' "$3" >> "$NIX_STUB_LOG"
+    printf 'NAR for %s' "$3"
+    ;;
+  hash)
+    printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'
+    ;;
+  config)
+    if [ "\${STUB_SELF_ALIAS:-0}" = "1" ]; then
+      printf '{"substituters":{"value":["https://cache.example.com","https://self.example.com","https://upstream.example.com"]}}\\n'
+    else
+      printf '{"substituters":{"value":["https://cache.example.com","https://upstream.example.com"]}}\\n'
+    fi
+    ;;
   build)
     ;;
   eval)
@@ -55,6 +80,17 @@ case "$1" in
     esac
     ;;
   path-info)
+    if [[ "$*" == *"--sigs"* ]]; then
+      printf '{'
+      first=1
+      while IFS= read -r store_path; do
+        if [ "$first" = 0 ]; then printf ','; fi
+        first=0
+        printf '"%s":{"narHash":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","narSize":10,"references":[],"deriver":null,"ca":"fixed:r:sha256:cccc","signatures":["test-key-1:signature"]}' "$store_path"
+      done
+      printf '}\\n'
+      exit 0
+    fi
     out="\${@: -1}"
     if [ -n "\${CLOSURE_PATH_COUNT:-}" ]; then
       printf '{'
@@ -66,30 +102,6 @@ case "$1" in
     else
       printf '{"/nix/store/shared0000000000-shared":{},"%s":{}}\\n' "$out"
     fi
-    ;;
-  copy)
-    : > "$NIX_STUB_LOG"
-    for arg in "$@"; do printf '%s\\n' "$arg" >> "$NIX_STUB_LOG"; done
-    mkdir -p "$CACHE_DIR/nar"
-    printf 'nar' > "$CACHE_DIR/nar/sha256:file001.nar.zst"
-    write_narinfo() {
-      local store_path="$1"
-      local base="\${store_path##*/}"
-      local hash="\${base%%-*}"
-      cat > "$CACHE_DIR/\${hash}.narinfo" <<EOF
-StorePath: \${store_path}
-URL: nar/sha256:file001.nar.zst
-Compression: zstd
-FileHash: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-FileSize: 3
-NarHash: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-NarSize: 10
-EOF
-    }
-    write_narinfo /nix/store/shared0000000000-shared
-    for arg in "$@"; do
-      if [[ "$arg" == /nix/store/* ]]; then write_narinfo "$arg"; fi
-    done
     ;;
   *)
     echo "unexpected nix command: $*" >&2
@@ -105,17 +117,54 @@ esac
 set -euo pipefail
 printf '%s\\n' "$@" > "$BUN_STUB_LOG"
 cp "$3" "$PLAN_LOG"
+source_dir="$(jq -r '.selfNarinfoDir' "$3")"
+if [ -d "$source_dir" ]; then cp "$source_dir"/*.narinfo "$SELF_NARINFO_LOG" 2>/dev/null || true; fi
+`,
+  );
+
+  await writeExecutable(
+    join(binDir, "zstd"),
+    `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$@" >> "$ZSTD_ARGS_LOG"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then shift; cat > "$1"; exit 0; fi
+  shift
+done
+exit 64
 `,
   );
 
   await writeExecutable(
     join(binDir, "curl"),
     `#!/usr/bin/env bash
-if [ "\${UPSTREAM_ALL_HIT:-0}" = "1" ] || { [ -n "\${UPSTREAM_HIT_HASH:-}" ] && [[ "\${*: -1}" == *"/$UPSTREAM_HIT_HASH.narinfo" ]]; }; then
-  printf '200'
-else
-  printf '404'
+url="\${*: -1}"
+hash="\${url##*/}"
+hash="\${hash%.narinfo}"
+head=0
+out=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --head) head=1 ;;
+    -o) shift; out="$1" ;;
+  esac
+  shift
+done
+status=404
+if [[ "$url" == https://upstream.example.com/* ]]; then
+  if [ "\${UPSTREAM_ALL_HIT:-0}" = "1" ] || [ "$hash" = "\${UPSTREAM_HIT_HASH:-}" ]; then status=200; fi
+elif [[ "$url" == https://cache.example.com/* || "$url" == https://self.example.com/* ]]; then
+  if [ "$hash" = "\${SELF_HIT_HASH:-}" ]; then status=200; fi
+  if [ "\${SELF_TRANSIENT_ERROR:-0}" = "1" ]; then exit 28; fi
+  if [ "$status" = 200 ] && [ "$head" = 0 ]; then
+    if [ "\${SELF_MISMATCH:-0}" = "1" ]; then
+      printf 'StorePath: /nix/store/wrong0000000000-package\\n' > "$out"
+    else
+      printf 'StorePath: /nix/store/%s-shared\\nURL: nar/example.nar.zst\\nCompression: zstd\\nFileHash: sha256:aaaaaaaa\\nFileSize: 3\\nNarHash: sha256:bbbbbbbb\\nNarSize: 10\\n' "$hash" > "$out"
+    fi
+  fi
 fi
+printf '%s' "$status"
 `,
   );
 
@@ -126,7 +175,7 @@ fi
       PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
       HOST: "test-host",
       CACHE_DIR: cacheDir,
-      CACHE_PRIVATE_KEY: "test-private-key",
+      CACHE_PRIVATE_KEY: "test-key-1:secret",
       API_BASE_URL: "https://cache.example.com",
       ADMIN_TOKEN: "test-token",
       R2_BUCKET_NAME: "test-bucket",
@@ -134,49 +183,57 @@ fi
       GIT_REV: "deadbeef",
       SYSTEM: "x86_64-linux",
       FLAKE_LOCK_HASH: "sha256:lock",
-      SKIP_UPSTREAM_PRUNE: "1",
       NIX_STUB_LOG: nixLog,
       NIX_COMMANDS_LOG: nixCommandsLog,
+      ZSTD_ARGS_LOG: zstdLog,
       BUN_STUB_LOG: bunLog,
       PLAN_LOG: planLog,
+      SELF_NARINFO_LOG: selfNarinfoLog,
       ...env,
     },
   });
 
+  const cacheNarinfos = (await readdir(cacheDir)).filter((name) => name.endsWith(".narinfo")).sort();
   return {
-    copyArgs: (await readFile(nixLog, "utf8")).trim().split("\n"),
-    cacheNarinfos: (await readdir(cacheDir)).filter((name) => name.endsWith(".narinfo")).sort(),
+    stagedPaths: (await readFile(nixLog, "utf8")).trim().split("\n").filter(Boolean),
+    zstdArgs: (await readFile(zstdLog, "utf8")).trim().split("\n"),
+    cacheNarinfos,
+    cacheNarinfoContents: await Promise.all(cacheNarinfos.map((name) => readFile(join(cacheDir, name), "utf8"))),
     nixCommands: (await readFile(nixCommandsLog, "utf8")).trim().split("\n"),
     bunArgs: (await readFile(bunLog, "utf8")).trim().split("\n"),
-    plan: JSON.parse(await readFile(planLog, "utf8")) as {
-      targets: Array<{ host: string; system: string; closureStorePaths: string[] }>;
-    },
+    plan: JSON.parse(await readFile(planLog, "utf8")),
+    selfNarinfo: (await readdir(dir)).includes("self-narinfo") ? await readFile(selfNarinfoLog, "utf8") : null,
     stdout: result.stdout,
   };
 }
 
 describe("scripts/publish.sh", () => {
-  test("ZSTD_LEVEL 未指定時は compression-level=9 を使う", async () => {
-    const { copyArgs } = await runPublishSh({});
-    expect(copyArgs[2]).toContain("?compression=zstd&compression-level=9&secret-key=");
+  test("ZSTD_LEVEL 未指定時は level 9 を使う", async () => {
+    const { zstdArgs } = await runPublishSh({});
+    expect(zstdArgs).toContain("-9");
   });
 
-  test("top-levelからclosure全体を再帰copyする", async () => {
-    const { copyArgs } = await runPublishSh({ ZSTD_LEVEL: "9" });
-    expect(copyArgs[0]).toBe("copy");
-    expect(copyArgs[1]).toBe("--to");
-    expect(copyArgs[2]).toContain("?compression=zstd&compression-level=9&secret-key=");
-    expect(copyArgs).not.toContain("--no-recursive");
-    expect(copyArgs).not.toContain("--stdin");
-    expect(copyArgs).toContain("/nix/store/abcdef123456aaaa-system");
+  test("ZSTD_LEVEL=-1 は zstd の既定 level を使う", async () => {
+    const { zstdArgs } = await runPublishSh({ ZSTD_LEVEL: "-1" });
+    expect(zstdArgs).not.toContain("--1");
+    expect(zstdArgs).toContain("-q");
+  });
+
+  test("new pathだけを参照先なしでNAR化する", async () => {
+    const { stagedPaths, plan, nixCommands, cacheNarinfoContents } = await runPublishSh({ ZSTD_LEVEL: "9" });
+    expect(stagedPaths).toEqual(plan.targets[0]?.newStorePaths);
+    expect(nixCommands.some((line) => line.startsWith("copy\t"))).toBe(false);
+    expect(plan.targets[0]?.closureStorePaths).toHaveLength(2);
+    expect(cacheNarinfoContents[0]).toMatch(/^URL: nar\/[0-9a-z]+\.nar\.zst$/m);
+    expect(cacheNarinfoContents[0]).toContain("CA: fixed:r:sha256:cccc");
   });
 
   test("主要phaseの所要時間をログへ出す", async () => {
     const { stdout } = await runPublishSh({});
     expect(stdout).toMatch(/\[timing\] build=\d+s/);
     expect(stdout).toMatch(/\[timing\] closure-metadata=\d+s/);
-    expect(stdout).toMatch(/\[timing\] copy=\d+s/);
-    expect(stdout).toMatch(/\[timing\] upstream-prune=\d+s/);
+    expect(stdout).toMatch(/\[timing\] stage=\d+s/);
+    expect(stdout).toMatch(/\[timing\] availability=\d+s/);
     expect(stdout).toMatch(/\[timing\] publish=\d+s/);
     expect(stdout).toMatch(/\[timing\] total=\d+s/);
   });
@@ -188,46 +245,78 @@ describe("scripts/publish.sh", () => {
     });
   });
 
-  test("2ホストをbuild/copy/publish各1回で処理する", async () => {
+  test("2ホストをbuild/sign/publish各1回で処理する", async () => {
     const result = await runPublishSh({ HOST: "" }, ["laptop", "desktop"]);
     expect(result.nixCommands.filter((line) => line.startsWith("build\t"))).toHaveLength(1);
-    expect(result.nixCommands.filter((line) => line.startsWith("copy\t"))).toHaveLength(1);
+    expect(result.nixCommands.filter((line) => line.startsWith("store\tsign"))).toHaveLength(1);
     expect(result.nixCommands.find((line) => line.startsWith("build\t"))).toContain("laptop");
     expect(result.nixCommands.find((line) => line.startsWith("build\t"))).toContain("desktop");
-    expect(result.copyArgs).toContain("/nix/store/laptop000000000-system");
-    expect(result.copyArgs).toContain("/nix/store/desktop000000000-system");
+    expect(result.stagedPaths).toContain("/nix/store/laptop000000000-system");
+    expect(result.stagedPaths).toContain("/nix/store/desktop000000000-system");
     expect(result.bunArgs[1]).toBe("--plan");
     expect(result.plan.targets).toHaveLength(2);
-    expect(JSON.stringify(result.plan)).not.toContain("test-private-key");
+    expect(JSON.stringify(result.plan)).not.toContain("test-key-1:secret");
   });
 
-  test("closure全体をcopyした後にupstream保有pathを除外する", async () => {
+  test("upstream保有pathを圧縮前に除外する", async () => {
     const result = await runPublishSh(
       {
         HOST: "",
-        SKIP_UPSTREAM_PRUNE: "0",
         UPSTREAM_HIT_HASH: "shared0000000000",
       },
       ["laptop", "desktop"],
     );
-    expect(result.copyArgs).toContain("/nix/store/desktop000000000-system");
-    expect(result.copyArgs).toContain("/nix/store/laptop000000000-system");
+    expect(result.stagedPaths).toContain("/nix/store/desktop000000000-system");
+    expect(result.stagedPaths).toContain("/nix/store/laptop000000000-system");
+    expect(result.stagedPaths).not.toContain("/nix/store/shared0000000000-shared");
+    expect(result.plan.targets[0]?.externalStorePaths).toEqual([{storePath: "/nix/store/shared0000000000-shared", substituterUrl: "https://upstream.example.com"}]);
     expect(result.cacheNarinfos).not.toContain("shared0000000000.narinfo");
     expect(result.cacheNarinfos).toContain("desktop000000000.narinfo");
     expect(result.cacheNarinfos).toContain("laptop000000000.narinfo");
-    expect(result.stdout).toContain("[prune] removed 1/3 (kept 2 to upload)");
   });
 
-  test("全pathがupstreamにあっても完全なclosureを生成してから除外する", async () => {
+  test("self既存narinfoを別dirに保存してplanへ分類する", async () => {
+    const result = await runPublishSh({ SELF_HIT_HASH: "shared0000000000" });
+    expect(result.plan.version).toBe(2);
+    expect(result.plan.selfNarinfoDir).toBeTruthy();
+    expect(result.plan.targets[0]?.selfExistingStorePaths).toEqual(["/nix/store/shared0000000000-shared"]);
+    expect(result.plan.targets[0]?.newStorePaths).toEqual(["/nix/store/abcdef123456aaaa-system"]);
+    expect(result.stagedPaths).not.toContain("/nix/store/shared0000000000-shared");
+    expect(result.selfNarinfo).toContain("StorePath: /nix/store/shared0000000000-shared");
+  });
+
+  test("SELF_CACHE_URL の別名はexternalでなくselfとして照会する", async () => {
     const result = await runPublishSh({
-      SKIP_UPSTREAM_PRUNE: "0",
+      STUB_SELF_ALIAS: "1",
+      SELF_CACHE_URL: "https://self.example.com",
+      SELF_HIT_HASH: "shared0000000000",
+    });
+    expect(result.plan.targets[0]?.externalStorePaths).toEqual([]);
+    expect(result.plan.targets[0]?.selfExistingStorePaths).toEqual(["/nix/store/shared0000000000-shared"]);
+  });
+
+  test("selfのStorePath不一致はnew扱いにする", async () => {
+    const result = await runPublishSh({ SELF_HIT_HASH: "shared0000000000", SELF_MISMATCH: "1" });
+    expect(result.plan.targets[0]?.selfExistingStorePaths).toEqual([]);
+    expect(result.stagedPaths).toContain("/nix/store/shared0000000000-shared");
+    expect(result.selfNarinfo).toBeNull();
+  });
+
+  test("selfの一時的な通信失敗はnew扱いにする", async () => {
+    const result = await runPublishSh({ SELF_HIT_HASH: "shared0000000000", SELF_TRANSIENT_ERROR: "1" });
+    expect(result.plan.targets[0]?.newStorePaths).toContain("/nix/store/shared0000000000-shared");
+    expect(result.stagedPaths).toContain("/nix/store/shared0000000000-shared");
+  });
+
+  test("全pathがupstreamにあるとstagingを省略する", async () => {
+    const result = await runPublishSh({
       UPSTREAM_ALL_HIT: "1",
     });
 
-    expect(result.nixCommands.filter((line) => line.startsWith("copy\t"))).toHaveLength(1);
+    expect(result.nixCommands.filter((line) => line.startsWith("store\tsign"))).toHaveLength(0);
     expect(result.cacheNarinfos).toEqual([]);
     expect(result.bunArgs[1]).toBe("--plan");
-    expect(result.stdout).toContain("[prune] removed 2/2 (kept 0 to upload)");
+    expect(result.plan.targets[0]?.newStorePaths).toEqual([]);
   });
 
   test("各hostのsystemをflake属性から個別に取得する", async () => {
@@ -242,9 +331,11 @@ describe("scripts/publish.sh", () => {
   });
 
   test("巨大なclosureをコマンドライン引数にせずplanへ格納する", async () => {
-    const result = await runPublishSh({ CLOSURE_PATH_COUNT: "3000" });
+    const result = await runPublishSh({ CLOSURE_PATH_COUNT: "3000", UPSTREAM_ALL_HIT: "1" });
     expect(result.plan.targets[0]?.closureStorePaths).toHaveLength(3001);
-  });
+    expect(result.nixCommands.filter((line) => line.startsWith("store\tsign"))).toHaveLength(0);
+    expect(result.plan.targets[0]?.externalStorePaths).toHaveLength(3001);
+  }, 120_000);
 
   test("位置引数とHOSTの同時指定、重複、不正名を拒否する", async () => {
     await expect(runPublishSh({}, ["laptop"])).rejects.toMatchObject({ code: 2 });
