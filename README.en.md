@@ -1,0 +1,144 @@
+<p align="center">
+  <img src="cf-edgeNix.png" alt="cf-edgeNix — Cloudflare-native NixOS binary cache" />
+</p>
+
+# Cloudflare-native NixOS binary cache
+
+**English** | [日本語](README.md)
+
+> cf-edgeNix is an independent project and is not affiliated with, endorsed by, or sponsored by Cloudflare.
+Cloudflare, Cloudflare Workers, and R2 are trademarks of Cloudflare, Inc.  
+
+cf-edgeNix turns a Cloudflare Workers deployment into a signed [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html).  
+R2 holds the canonical NAR / narinfo, Workers Cache and KV are the speed layer, and D1 keeps build history, `latest`, rollback roots, and the GC live-set. Reads go `Workers Cache → KV → R2` (narinfo) and `Workers Cache → R2` (NAR); D1 is never on the read path.
+
+**Self-hosted, fully on Cloudflare.** You deploy your own Worker on your own Cloudflare account — the cache is yours, the signing key is yours, nothing routes through a third party.  
+And it stays entirely inside Cloudflare's edge (Workers + R2 + KV + D1 + Workers Cache + Workers Builds): **no VPS, no origin server, no container, no GitHub Actions deploy pipeline to maintain.**  
+The only thing running outside Cloudflare is a GitHub Actions job in your NixOS flake repo that checks out cf-edgeNix and runs its `scripts/publish.sh` to build, sign, and upload NARs.  
+> Your flake repo holds no publish logic of its own — just drop in the workflow template from [`.github/templates/publish-cache.yml`](.github/templates/publish-cache.yml).
+
+The goal is a global, signed binary cache that costs nothing on Cloudflare's free tier. A 5-minute cron tracks R2 quota and trips a kill-switch before you ever bill.
+
+## Architecture
+
+### Read path — narinfo / nix-cache-info
+
+```mermaid
+flowchart LR
+    Client[Nix client] --> WC[(Workers Cache<br/>edge)]
+    WC -. miss .-> W[Worker]
+    W --> KV[(KV: META_KV)]
+    KV -. miss .-> R2[(R2: NAR_BUCKET)]
+```
+
+Three-tier lookup. A Workers Cache hit never invokes the Worker (request collapsing built in). KV is eventually consistent; R2 is the source of truth. A `404` is also edge-cached for 60 seconds (negative cache — `nixos-rebuild` queries many paths that don't exist here).
+
+### Read path — NAR body
+
+```mermaid
+flowchart LR
+    Client[Nix client] -->|GET/HEAD, Range| WC[(Workers Cache<br/>edge)]
+    WC -. miss .-> W[Worker]
+    W --> R2[(R2: NAR_BUCKET)]
+```
+
+`Range: bytes=...` is honoured end-to-end (206 responses are never edge-cached and always stream from R2). Full 200s are edge-cached as content-addressed immutable objects. Misses stream directly from R2 without buffering.
+
+### Publish path
+
+```mermaid
+flowchart LR
+    GHA[GitHub Actions<br/>publish-side repo] -->|POST /api/publish/*| W[Worker]
+    W --> R2[(R2)]
+    W --> D1[(D1: CONTROL_DB)]
+    W -. warm .-> KV[(KV)]
+```
+
+`start → ingest × N → R2 upload → finalize` is the only path that moves `latest`.
+The staging closure is registered before R2 operations so GC cannot race a publish. NAR uploads precede narinfo, and finalization precedes KV warming.
+
+### Deploy path
+
+```mermaid
+flowchart LR
+    Repo[cf-edgeNix repo<br/>push to main] --> CFB[Cloudflare<br/>Workers Builds]
+    CFB --> W[Worker]
+```
+
+No GitHub Actions deploy workflow.  
+Workers Builds runs `wrangler d1 migrations apply --remote && wrangler deploy` on every push.
+
+## Features
+
+### Nix binary cache protocol
+
+- `nix-cache-info` with configurable `Priority` and `WantMassQuery`
+- Signed `.narinfo` (Ed25519, `nix-store --generate-binary-cache-key`)
+- zstd-compressed NAR bodies under `/nar/<file-hash>.nar.zst`
+- HTTP `Range` requests (`bytes=start-end`, `bytes=start-`, `bytes=-suffix`) with `206` responses
+- OpenAPI 3.0 schema auto-generated via `hono/zod-openapi` at `/api/openapi.json`
+
+### Control plane (D1)
+
+- `staging → ingest → finalize` three-phase publish, finalize moves `latest` in a single `db.batch()`
+- Deterministic `build_id` = `sha256(host:system:gitRev:flakeLockHash:toplevelStorePath)[:36]` — re-runs are idempotent
+- Per-host build history with rollback root registration
+- Safe generational GC: keep the latest 3 builds per host plus pins/rollback roots, then enforce a one-hour narinfo-to-NAR deletion grace period
+
+### Edge & cost
+
+- Workers Cache (edge, in front of the Worker) → KV (narinfo) → R2 as source of truth; 404s get a short-TTL negative cache
+- 5-minute cron polls Cloudflare GraphQL Analytics for R2 storage / Class A / Class B usage
+- `warn` at 80% of monthly free tier, `killed` at 95% — `killed` returns `503` on read paths to prevent billing surprise
+- Manual reset via `POST /api/quota/reset`
+
+### Operations
+
+- Bearer-authenticated admin API (`ADMIN_TOKEN`); unset token fails write requests with `403`
+- Cloudflare Workers Builds auto-deploys on push to `main` (no CI deploy workflow, no Cloudflare token in GitHub Secrets)
+- Per-publish manifest stored in R2 for cold-start restoration
+- Drizzle ORM schema, migrations under `migrations/`
+
+## Using the cache from `nixos-rebuild`
+
+```nix
+{
+  nix.settings = {
+    extra-substituters = [ "https://cf-edgenix.<account>.workers.dev" ];
+    extra-trusted-public-keys = [ "nix-cache.example.com-1:xxxx=" ];
+  };
+}
+```
+
+Rebuild with `sudo nixos-rebuild switch --flake .#<host>`. For a one-off run:
+
+```bash
+sudo nixos-rebuild switch --flake .#myhost \
+  --option extra-substituters "https://cf-edgenix.<account>.workers.dev" \
+  --option extra-trusted-public-keys "nix-cache.example.com-1:xxxx="
+```
+
+`nixos-rebuild` hits the Worker in this order, all unauthenticated:
+
+1. `GET /nix-cache-info` — once per session. Nix refuses the cache if `StoreDir` mismatches.
+2. `GET /<store-hash>.narinfo` — one per store path. `404` falls through to the next substituter.
+3. `GET /nar/<file-hash>.nar.zst` — fetched only when narinfo signals a hit. Range-resumable.
+
+Quick reachability check:
+
+```bash
+curl -sSf https://cf-edgenix.<account>.workers.dev/nix-cache-info
+curl -sSfI https://cf-edgenix.<account>.workers.dev/<store-hash>.narinfo
+```
+
+## Docs
+
+| Topic | File |
+| --- | --- |
+| First-time setup (keys, Cloudflare resources, deploy, client) | [`docs/setup.md`](docs/setup.md) |
+| Publish flow, idempotency, ordering, troubleshooting | [`docs/publish.md`](docs/publish.md) |
+| Endpoint reference | [`docs/api.md`](docs/api.md) |
+| Quota kill-switch operations | [`docs/quota.md`](docs/quota.md) |
+| Full design spec | [`docs/spec.md`](docs/spec.md) |
+| Open design questions | [`docs/fixme.md`](docs/fixme.md) |
+| Development, tests, env var reference | [`CONTRIBUTING.md`](CONTRIBUTING.md) |

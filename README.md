@@ -2,24 +2,115 @@
   <img src="cf-edgeNix.png" alt="cf-edgeNix — Cloudflare-native NixOS binary cache" />
 </p>
 
-# Cloudflare-native NixOS binary cache
+# Cloudflare-native NixOS binary cache 
 
-**English** | [日本語](README.ja.md)
+[English](README.en.md) | **日本語**
 
-> cf-edgeNix is an independent project and is not affiliated with, endorsed by, or sponsored by Cloudflare.
-Cloudflare, Cloudflare Workers, and R2 are trademarks of Cloudflare, Inc.  
+> cf-edgeNixは独立したプロジェクトであり、Cloudflare社とは提携、推奨、または出資を受けているものではありません。  
+Cloudflare、Cloudflare Workers、およびR2は、Cloudflare, Inc.の商標です。  
 
-cf-edgeNix turns a Cloudflare Workers deployment into a signed [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html).  
-R2 holds the canonical NAR / narinfo, Workers Cache and KV are the speed layer, and D1 keeps build history, `latest`, rollback roots, and the GC live-set. Reads go `Workers Cache → KV → R2` (narinfo) and `Workers Cache → R2` (NAR); D1 is never on the read path.
+cf-edgeNix は Cloudflare Workers に署名付き [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html) 基盤をdeployするプロジェクトです。  
 
-**Self-hosted, fully on Cloudflare.** You deploy your own Worker on your own Cloudflare account — the cache is yours, the signing key is yours, nothing routes through a third party.  
-And it stays entirely inside Cloudflare's edge (Workers + R2 + KV + D1 + Workers Cache + Workers Builds): **no VPS, no origin server, no container, no GitHub Actions deploy pipeline to maintain.**  
-The only thing running outside Cloudflare is a GitHub Actions job in your NixOS flake repo that checks out cf-edgeNix and runs its `scripts/publish.sh` to build, sign, and upload NARs.  
-> Your flake repo holds no publish logic of its own — just drop in the workflow template from [`.github/templates/publish-cache.yml`](.github/templates/publish-cache.yml).
+**Self-hosted、かつ Cloudflare 内で完結。** 自分の Cloudflare アカウントに自分の Worker を deploy する形なので、cache も署名鍵も完全に自分の手元にあり、サードパーティを経由しない。  
+さらに実体は Cloudflare のエッジ（Workers + R2 + KV + D1 + Workers Cache + Workers Builds）に閉じており、**VPS も origin server もコンテナも、GitHub Actions の deploy pipeline も不要**。  
+Cloudflare の外で動くのは、自分の NixOS flake repo に置いた GitHub Actions job が cf-edgeNix を checkout してその `scripts/publish.sh` を回し、署名済み NAR を build & upload する部分だけ。  
+> flake repo 側に publish ロジックは持たず、[`.github/templates/publish-cache.yml`](.github/templates/publish-cache.yml) の workflow テンプレートをそのまま配置するだけで済む。
 
-The goal is a global, signed binary cache that costs nothing on Cloudflare's free tier. A 5-minute cron tracks R2 quota and trips a kill-switch before you ever bill.
+目標は **Cloudflare 無料枠で global な署名付き binary cache を持つ** こと。
 
-## Architecture
+## Deploy
+Deploy Button
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=<https://github.com/T4ko0522/cf-edegeNix>)  
+
+### Required env, Secret
+
+| 名前 | 設定場所 | 用途 |
+| --- | --- | --- |
+| `ADMIN_TOKEN` | Worker Secret | 管理 API の認証。未設定だと publish などの書き込み操作と定期 GC が動かない。 |
+| `CF_ANALYTICS_TOKEN` | Worker Secret | R2 使用量を調べる quota Cron 用。未設定だと quota チェックをスキップする。 |
+| `CF_ACCOUNT_ID` | `wrangler.toml` の `[vars]` | quota チェック対象の Cloudflare アカウント ID。 |
+| `QUOTA_R2_BUCKET_NAME` | `wrangler.toml` の `[vars]` | quota チェック対象の R2 バケット名。 |
+
+NixOS の flake リポジトリで [publish workflow](.github/templates/publish-cache.yml) を使う場合は、そのリポジトリの GitHub Environment `production` に次を登録する。`ADMIN_TOKEN` は Worker に登録した値と同じにする。
+
+| 名前 | 種別 | 用途 |
+| --- | --- | --- |
+| `CACHE_PRIVATE_KEY` | Secret | Nix binary cache の署名秘密鍵。 |
+| `ADMIN_TOKEN` | Secret | Worker 管理 API の認証。 |
+| `CLOUDFLARE_API_TOKEN` | Secret | KV への書き込みに使う Cloudflare API トークン。 |
+| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | Secret | R2 S3 API の認証情報。 |
+| `API_BASE_URL` | Variable | デプロイ済み Worker の URL。 |
+| `CLOUDFLARE_ACCOUNT_ID` | Variable | Cloudflare アカウント ID。 |
+| `R2_BUCKET_NAME` | Variable | publish 先の R2 バケット名。 |
+| `KV_NAMESPACE_ID` | Variable | publish 先の KV 名前空間 ID。 |
+
+R2・KV・D1 の binding ID の設定や鍵生成は [セットアップガイド](docs/setup.md) を参照。
+
+## 機能
+
+### Nix binary cache protocol
+
+- `nix-cache-info`（`Priority` / `WantMassQuery` 設定可）
+- 署名付き `.narinfo`（Ed25519 / `nix-store --generate-binary-cache-key`）
+- zstd 圧縮 NAR を `/nar/<file-hash>.nar.zst` で配信
+- HTTP `Range`（`bytes=start-end` / `bytes=start-` / `bytes=-suffix`）に対応し `206` を返す
+- `hono/zod-openapi` で自動生成された OpenAPI 3.0 スキーマを `/api/openapi.json` で公開
+
+### Control plane (D1)
+
+- `staging → ingest → finalize` の 3 段 publish、finalize が 1 つの `db.batch()` で `latest` を atomic に更新
+- 決定論的 `build_id` = `sha256(host:system:gitRev:flakeLockHash:toplevelStorePath)[:36]` — 再実行は冪等
+- host ごとの build 履歴 + rollback root 登録
+- host ごとの最新 3 世代と pin / rollback root を保持し、narinfo 非公開化から NAR 削除まで 1 時間の猶予を強制する世代 GC
+
+### Edge & cost
+
+- Workers Cache（edge・Worker 手前）→ KV（narinfo）→ R2（正本）の階層構造。404 も短 TTL の negative cache
+- 5 分おきの Cron が Cloudflare GraphQL Analytics から R2 storage / Class A / Class B を読む
+- 月次無料枠 80% で `warn`、95% で `killed`。`killed` 中は read path が `503` を返して課金事故を防ぐ
+- `POST /api/quota/reset` で手動解除
+
+### Operations
+
+- Bearer 認証付き管理 API（`ADMIN_TOKEN`）。未設定時は write 系を `403` で拒否
+- Cloudflare Workers Builds が `main` push で自動 deploy（CI deploy workflow も GitHub Secrets の Cloudflare token も不要）
+- publish ごとに R2 へ manifest を保存し cold-start 復元に使う
+- Drizzle ORM schema / migration は `migrations/` 配下
+
+## `nixos-rebuild` から cache を使う
+
+```nix
+{
+  nix.settings = {
+    extra-substituters = [ "https://cf-edgenix.<account>.workers.dev" ];
+    extra-trusted-public-keys = [ "nix-cache.example.com-1:xxxx=" ];
+  };
+}
+```
+
+`sudo nixos-rebuild switch --flake .#<host>` で反映。設定を書き換えず一度だけ試したい場合:
+
+```bash
+sudo nixos-rebuild switch --flake .#myhost \
+  --option extra-substituters "https://cf-edgenix.<account>.workers.dev" \
+  --option extra-trusted-public-keys "nix-cache.example.com-1:xxxx="
+```
+
+`nixos-rebuild` は以下の順で（全て認証なしで）Worker を叩く:
+
+1. `GET /nix-cache-info` — セッションごとに 1 回。`StoreDir` が一致しないと Nix はその cache を拒否する。
+2. `GET /<store-hash>.narinfo` — store path ごとに 1 回。`404` なら次の substituter にフォールバック。
+3. `GET /nar/<file-hash>.nar.zst` — narinfo がヒットしたときだけ取得。Range で途中再開可能。
+
+疎通確認:
+
+```bash
+curl -sSf https://cf-edgenix.<account>.workers.dev/nix-cache-info
+curl -sSfI https://cf-edgenix.<account>.workers.dev/<store-hash>.narinfo
+```
+
+## アーキテクチャ
 
 ### Read path — narinfo / nix-cache-info
 
@@ -31,9 +122,9 @@ flowchart LR
     KV -. miss .-> R2[(R2: NAR_BUCKET)]
 ```
 
-Three-tier lookup. A Workers Cache hit never invokes the Worker (request collapsing built in). KV is eventually consistent; R2 is the source of truth. A `404` is also edge-cached for 60 seconds (negative cache — `nixos-rebuild` queries many paths that don't exist here).
+3 段ルックアップ。Workers Cache ヒット時は Worker 自体が起動しない（request collapsing 内蔵）。KV は結果整合、R2 が正本。R2 にも無ければ `404` を返し、これも 60 秒だけ edge にキャッシュする（negative cache — `nixos-rebuild` は存在しない path を大量に引くため）。
 
-### Read path — NAR body
+### Read path — NAR 本体
 
 ```mermaid
 flowchart LR
@@ -42,20 +133,21 @@ flowchart LR
     W --> R2[(R2: NAR_BUCKET)]
 ```
 
-`Range: bytes=...` is honoured end-to-end (206 responses are never edge-cached and always stream from R2). Full 200s are edge-cached as content-addressed immutable objects. Misses stream directly from R2 without buffering.
+`Range: bytes=...` をエッジまで通す（206 は edge に保存されず常に R2 から streaming）。full 200 は content-addressed かつ immutable として edge にキャッシュされる。miss 時は R2 から buffer せず streaming で返す。
 
 ### Publish path
 
 ```mermaid
 flowchart LR
-    GHA[GitHub Actions<br/>publish-side repo] -->|POST /api/publish/*| W[Worker]
-    W --> R2[(R2)]
+    GHA[GitHub Actions<br/>publish 側 repo] --> P[closure 分類・new のみ NAR 化]
+    P -->|POST /api/publish/*| W[Worker]
+    P --> R2[(R2)]
+    P -. warm .-> KV[(KV)]
     W --> D1[(D1: CONTROL_DB)]
-    W -. warm .-> KV[(KV)]
 ```
 
-`start → ingest × N → R2 upload → finalize` is the only path that moves `latest`.
-The staging closure is registered before R2 operations so GC cannot race a publish. NAR uploads precede narinfo, and finalization precedes KV warming.
+`latest` を動かすのは `start → ingest × N → R2 upload → finalize` の 1 ルートのみ。staging closure を R2 操作より先に登録し、GC と publish の競合を防ぐ。
+full closure を分類し、external は manifest のみに記録する。owned のうち new だけ NAR 化する。NAR upload → narinfo upload → D1 確定 → KV warming の順序は `scripts/publish.ts` の batch 経路で保証し、`test/publish/publish-script.test.ts` で検証している。
 
 ### Deploy path
 
@@ -65,80 +157,17 @@ flowchart LR
     CFB --> W[Worker]
 ```
 
-No GitHub Actions deploy workflow.  
-Workers Builds runs `wrangler d1 migrations apply --remote && wrangler deploy` on every push.
+GitHub Actions の deploy workflow は持たない。  
+Workers Builds が push のたびに `wrangler d1 migrations apply --remote && wrangler deploy` を回す。
 
-## Features
+## ドキュメント
 
-### Nix binary cache protocol
-
-- `nix-cache-info` with configurable `Priority` and `WantMassQuery`
-- Signed `.narinfo` (Ed25519, `nix-store --generate-binary-cache-key`)
-- zstd-compressed NAR bodies under `/nar/<file-hash>.nar.zst`
-- HTTP `Range` requests (`bytes=start-end`, `bytes=start-`, `bytes=-suffix`) with `206` responses
-- OpenAPI 3.0 schema auto-generated via `hono/zod-openapi` at `/api/openapi.json`
-
-### Control plane (D1)
-
-- `staging → ingest → finalize` three-phase publish, finalize moves `latest` in a single `db.batch()`
-- Deterministic `build_id` = `sha256(host:system:gitRev:flakeLockHash:toplevelStorePath)[:36]` — re-runs are idempotent
-- Per-host build history with rollback root registration
-- Safe generational GC: keep the latest 3 builds per host plus pins/rollback roots, then enforce a one-hour narinfo-to-NAR deletion grace period
-
-### Edge & cost
-
-- Workers Cache (edge, in front of the Worker) → KV (narinfo) → R2 as source of truth; 404s get a short-TTL negative cache
-- 5-minute cron polls Cloudflare GraphQL Analytics for R2 storage / Class A / Class B usage
-- `warn` at 80% of monthly free tier, `killed` at 95% — `killed` returns `503` on read paths to prevent billing surprise
-- Manual reset via `POST /api/quota/reset`
-
-### Operations
-
-- Bearer-authenticated admin API (`ADMIN_TOKEN`); unset token fails write requests with `403`
-- Cloudflare Workers Builds auto-deploys on push to `main` (no CI deploy workflow, no Cloudflare token in GitHub Secrets)
-- Per-publish manifest stored in R2 for cold-start restoration
-- Drizzle ORM schema, migrations under `migrations/`
-
-## Using the cache from `nixos-rebuild`
-
-```nix
-{
-  nix.settings = {
-    extra-substituters = [ "https://cf-edgenix.<account>.workers.dev" ];
-    extra-trusted-public-keys = [ "nix-cache.example.com-1:xxxx=" ];
-  };
-}
-```
-
-Rebuild with `sudo nixos-rebuild switch --flake .#<host>`. For a one-off run:
-
-```bash
-sudo nixos-rebuild switch --flake .#myhost \
-  --option extra-substituters "https://cf-edgenix.<account>.workers.dev" \
-  --option extra-trusted-public-keys "nix-cache.example.com-1:xxxx="
-```
-
-`nixos-rebuild` hits the Worker in this order, all unauthenticated:
-
-1. `GET /nix-cache-info` — once per session. Nix refuses the cache if `StoreDir` mismatches.
-2. `GET /<store-hash>.narinfo` — one per store path. `404` falls through to the next substituter.
-3. `GET /nar/<file-hash>.nar.zst` — fetched only when narinfo signals a hit. Range-resumable.
-
-Quick reachability check:
-
-```bash
-curl -sSf https://cf-edgenix.<account>.workers.dev/nix-cache-info
-curl -sSfI https://cf-edgenix.<account>.workers.dev/<store-hash>.narinfo
-```
-
-## Docs
-
-| Topic | File |
+| 項目 | ファイル |
 | --- | --- |
-| First-time setup (keys, Cloudflare resources, deploy, client) | [`docs/setup.md`](docs/setup.md) |
-| Publish flow, idempotency, ordering, troubleshooting | [`docs/publish.md`](docs/publish.md) |
-| Endpoint reference | [`docs/api.md`](docs/api.md) |
-| Quota kill-switch operations | [`docs/quota.md`](docs/quota.md) |
-| Full design spec | [`docs/spec.md`](docs/spec.md) |
-| Open design questions | [`docs/fixme.md`](docs/fixme.md) |
-| Development, tests, env var reference | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
+| 初回セットアップ（鍵生成・Cloudflare リソース・deploy・クライアント設定） | [`docs/setup.md`](docs/setup.md) |
+| publish フロー / 冪等性 / 公開順序 / トラブルシューティング | [`docs/publish.md`](docs/publish.md) |
+| エンドポイント一覧 | [`docs/api.md`](docs/api.md) |
+| Quota kill-switch 運用 | [`docs/quota.md`](docs/quota.md) |
+| 設計仕様（フル） | [`docs/spec.md`](docs/spec.md) |
+| 未解決の設計課題 | [`docs/fixme.md`](docs/fixme.md) |
+| 開発・テスト・環境変数リファレンス | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
