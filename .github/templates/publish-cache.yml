@@ -98,11 +98,9 @@ jobs:
           SELF_CACHE_URL: ${{ vars.SELF_CACHE_URL || 'https://nix.t4ko.pet' }}
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
-          KV_NAMESPACE_ID: ${{ vars.KV_NAMESPACE_ID }}
           GIT_REV: ${{ github.sha }}
           FLAKE_LOCK_HASH: ${{ hashFiles('flake.lock') }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |

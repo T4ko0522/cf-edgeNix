@@ -4,10 +4,10 @@
  * scripts/publish.ts の分類済みplanとbatch publishのユニットテスト。
  *
  * テスト観点:
- *   G4: publish 経路の一本化（closure/manifest put → NAR → narinfo → D1 → KV の順）
+ *   G4: publish 経路の一本化（closure/manifest put → NAR → narinfo → D1 の順）
  *   G5: closure.json / manifest.json の R2 put・manifestHash が実ハッシュ・
  *       toplevelStorePath が実値・NAR 冪等スキップ
- *   A2: 公開順序保証（closure/manifest → NAR → narinfo → D1 → KV）
+ *   A2: 公開順序保証（closure/manifest → NAR → narinfo → D1）
  *   A5: 再 publish 冪等（NAR スキップ）
  */
 import { beforeEach, describe, expect, test, vi } from "vitest";
@@ -62,7 +62,6 @@ const SAMPLE_ENV = {
   apiBaseUrl: "https://cache.example.com",
   adminToken: "test-token",
   r2BucketName: "my-bucket",
-  kvNamespaceId: "kv-ns-001",
 };
 
 beforeEach(() => {
@@ -310,9 +309,6 @@ NarSize: 20
         sequence.push(`head:${key}`);
         return false;
       }),
-      kvPutBulk: vi.fn(async () => {
-        sequence.push("kv");
-      }),
       apiPost: vi.fn(async (url, _token, body) => {
         if (url.endsWith("/start")) {
           const id = (body as { build: { id: string } }).build.id;
@@ -359,7 +355,7 @@ NarSize: 20
     ]);
   });
 
-  test("共有NAR/narinfoを一度だけuploadしKVを和集合で一度だけwarmingする", async () => {
+  test("共有NAR/narinfoを一度だけuploadする", async () => {
     const { adapter } = batchAdapter();
     await publishBatch(batchPlan(), SAMPLE_ENV, adapter);
 
@@ -367,8 +363,6 @@ NarSize: 20
     const r2Put = adapter.r2Put as ReturnType<typeof vi.fn>;
     expect(r2Put.mock.calls.filter((call) => String(call[1]).startsWith("nar/"))).toHaveLength(3);
     expect(r2Put.mock.calls.filter((call) => String(call[1]).endsWith(".narinfo"))).toHaveLength(3);
-    expect(adapter.kvPutBulk).toHaveBeenCalledTimes(1);
-    expect((adapter.kvPutBulk as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]).toHaveLength(3);
   });
 
   test("externalはmanifestだけ、self-existingは世代参照だけ、新規pathだけuploadする", async () => {
@@ -481,7 +475,7 @@ NarSize: 20
     expect(starts[0]).not.toBe(starts[1]);
   });
 
-  test("全start/ingest、manifest、NAR、narinfo、全finalize、KVの順序を守る", async () => {
+  test("全start/ingest、manifest、NAR、narinfoの順序を守り全finalizeで完了する", async () => {
     const { adapter, sequence } = batchAdapter();
     await publishBatch(batchPlan(), SAMPLE_ENV, adapter);
 
@@ -491,11 +485,10 @@ NarSize: 20
     const firstNarinfo = sequence.findIndex((item) => item.endsWith(".narinfo"));
     const firstFinalize = sequence.findIndex((item) => item.startsWith("finalize:"));
     const lastFinalize = sequence.map((item) => item.startsWith("finalize:")).lastIndexOf(true);
-    const kv = sequence.indexOf("kv");
     expect(lastIngest).toBeLessThan(firstManifest);
     expect(firstManifest).toBeLessThan(firstNar);
     expect(firstNar).toBeLessThan(firstNarinfo);
     expect(firstNarinfo).toBeLessThan(firstFinalize);
-    expect(lastFinalize).toBeLessThan(kv);
+    expect(lastFinalize).toBe(sequence.length - 1);
   });
 });

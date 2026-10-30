@@ -1,6 +1,6 @@
 # publish 運用手順
 
-cf-edgeNix の publish は「完全なclosureを分類し、自前cacheで配信するpathのNARとnarinfoをR2/D1/KVへ決まった順序で反映する」一連の処理である。
+cf-edgeNix の publish は「完全なclosureを分類し、自前cacheで配信するpathのNARとnarinfoをR2へ保存し、D1で公開を確定する」一連の処理である。
 
 publish を実行する主体は GitHub Actions（`publish.yml`）だが、手動実行やデバッグにも使う。
 
@@ -18,14 +18,12 @@ GitHub Actions の Environment (`production`) に事前登録する値。
 | --- | --- | --- |
 | `CACHE_PRIVATE_KEY` | Secret | narinfoの署名秘密鍵。Nixの`nix store sign`がpathへ署名を追加する。 |
 | `ADMIN_TOKEN` | Secret | Worker 管理 API（write 系）の Bearer トークン。 |
-| `CLOUDFLARE_API_TOKEN` | Secret | KV write 権限を持つ Cloudflare API トークン。 |
 | `R2_ACCESS_KEY_ID` | Secret | R2 S3 互換 API のアクセスキー。 |
 | `R2_SECRET_ACCESS_KEY` | Secret | R2 S3 互換 API のシークレットキー。 |
 | `CLOUDFLARE_ACCOUNT_ID` | Variable | Cloudflare アカウント ID。 |
 | `API_BASE_URL` | Variable | デプロイ済み Worker の URL（例: `https://cf-edgenix.<account>.workers.dev`）。 |
 | `SELF_CACHE_URL` | Variable | 自前cacheの公開URL。workflowテンプレートの既定値は `https://nix.t4ko.pet`。 |
 | `R2_BUCKET_NAME` | Variable | R2 バケット名（例: `cf-edgenix-nar`）。 |
-| `KV_NAMESPACE_ID` | Variable | KV 名前空間 ID。 |
 
 - Secret 類は `protected environment: production` の Environment Secrets に置く（fork PR からアクセス不可）。
 - Variable 類は Environment Variables または Repository Variables に置く。
@@ -53,14 +51,13 @@ full closure の metadata を取得       ← dependency graph を保持
   ↓
 new path だけ NAR + zstd・署名narinfo 生成
   ↓
-scripts/publish.ts --plan <JSON>      ← R2/D1/KV への一括反映
+scripts/publish.ts --plan <JSON>      ← R2/D1 への一括反映
   │
   ├── Step 0: 全 host の D1 start → ingest（staging closure を先に GC 保護）
   ├── Step 1: host 別 closure.json / manifest.json を R2 に put
   ├── Step 2: NAR upload (R2)
   ├── Step 3: narinfo upload (R2)
-  ├── Step 4: host ごとに D1 finalize（latest 更新）
-  └── Step 5: 全 host の和集合を KV warming（1回、失敗は警告のみ）
+  └── Step 4: host ごとに D1 finalize（latest 更新）
 ```
 
 `scripts/publish.sh` は全hostを一度の build / classification / staging で処理し、秘密情報を含まない一時publish planを `scripts/publish.ts` へ渡す。host ごとの full closure は `closure.json` に残す。manifest は `closure.owned` と `closure.external` を持ち、各hostのpathだけを記録する。全pathが外部にあるhostも空の owned closure で finalize する。
@@ -129,25 +126,12 @@ NAR 本体 (R2)
 .narinfo (R2)
   ↓
 D1 で published / latest を確定（control plane の正本）
-  ↓  ← KV は結果整合・速度層なので D1 確定後に warming
-KV warming
 ```
 
 この順序を破ると:
 - `.narinfo` が先に見えると Nix client が NAR を取りに行って 404 になる。
-- KV を D1 より先に更新すると、R2 には NAR がないのに KV には narinfo が載る中間状態が生まれる。
 
 `scripts/publish.ts` はこの順序をコードで保証し、`test/publish/publish-script.test.ts` で staging closure が R2 より先、finalize が R2 より後になることを検証している。
-
----
-
-## KV warming 失敗時の扱い
-
-KV warming は `try/catch` で包まれており、失敗しても publish 全体を失敗にしない。
-
-理由: `finalize` で D1 の `published` 確定が済んでいるため、KV にデータがなくても read path は KV miss → R2 へフォールバックして正しく応答できる。KV warming は速度層の充填であり、正本（R2/D1）が生きていれば機能上問題ない。
-
-KV warming に失敗した場合はログに `[KV] warming failed (non-fatal):` と警告が出る。read path は R2 fallback で動作するため復旧操作は必須ではない。現時点では KV warming だけを再実行する専用コマンドはない。
 
 ---
 
@@ -162,9 +146,7 @@ ZSTD_LEVEL=9 \
 API_BASE_URL=https://cf-edgenix.<account>.workers.dev \
 ADMIN_TOKEN=your-token \
 R2_BUCKET_NAME=cf-edgenix-nar \
-KV_NAMESPACE_ID=<kv-namespace-id> \
 CLOUDFLARE_ACCOUNT_ID=<account-id> \
-CLOUDFLARE_API_TOKEN=<kv-write-token> \
 R2_ACCESS_KEY_ID=<r2-access-key> \
 R2_SECRET_ACCESS_KEY=<r2-secret-key> \
 bash scripts/publish.sh laptop desktop
@@ -293,6 +275,6 @@ publish の公開順序（NAR → narinfo）が守られていれば起きない
 - R2 に対象 NAR が存在するか確認: `wrangler r2 object get <bucket>/<nar-key> --head`。
 - 存在しない場合は `publish.sh` を再実行して NAR を再 upload する（content-addressed なので安全）。
 
-### KV に古い narinfo が残っている
+### KV に旧 narinfo が残っている
 
-KV は正本ではないため、古いデータが残っても読み取りは最終的に R2 へフォールバックする。緊急の場合は `wrangler kv key delete --namespace-id <id> narinfo:<store-hash>` で手動削除できる。
+narinfo 本文の取得・publish・GC は KV を使わないため、旧 `narinfo:*` キーは配信に影響せず、新たな書き込みもない。既存キーは自動削除されない。保存容量を空ける場合はこの接頭辞のキーだけ削除し、quota 用の `quota:state` / `quota:epoch` と `nix-cache-info` は残す。

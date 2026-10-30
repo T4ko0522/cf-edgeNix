@@ -84,7 +84,6 @@ const liveNarKey = `nar/${GC_HASH}.nar.zst`;
 const deadHash = "dddd4444dddd4444eeee5555eeee5555";
 const deadNarKey = `nar/${deadHash}.nar.zst`;
 const deadNarinfoKey = `${deadHash}.narinfo`;
-const deadKvNarinfoKey = `narinfo:${deadHash}`;
 
 const startBody = {
   build: {
@@ -182,7 +181,6 @@ async function countRows(db1: D1Database, table: string, column: string, value: 
 }
 
 async function putDeadObjects(eenv: Env, storeHash = deadHash, narKey = deadNarKey) {
-  await eenv.META_KV.put(`narinfo:${storeHash}`, `StorePath: /nix/store/${storeHash}-dead`);
   await eenv.NAR_BUCKET.put(`${storeHash}.narinfo`, `StorePath: /nix/store/${storeHash}-dead`);
   await eenv.NAR_BUCKET.put(narKey, "dead nar");
 }
@@ -1184,7 +1182,6 @@ describe("POST /api/gc/execute", () => {
     expect(body["phase"]).toBe("narinfo");
     expect(body["processed"]).toBe(1);
     expect(body["deleted"]).toEqual({
-      kv_narinfo_attempted: 0,
       r2_narinfo_attempted: 0,
       r2_nar_attempted: 0,
       d1_store_paths: 0,
@@ -1192,13 +1189,14 @@ describe("POST /api/gc/execute", () => {
       d1_build_closure: 0,
       d1_builds_pruned: 0,
     });
-    expect(await eenv.META_KV.get(deadKvNarinfoKey, "text")).not.toBeNull();
     expect(await eenv.NAR_BUCKET.get(deadNarinfoKey)).not.toBeNull();
     expect(await countRows(db1, "store_paths", "store_hash", deadHash)).toBe(1);
   });
 
-  test("phase=narinfo: KV/R2 narinfo だけ削除する", async () => {
+  test("phase=narinfo: R2 narinfo を削除し旧 KV には触れない", async () => {
     const eenv = authedEnv();
+    const deadKvNarinfoKey = `narinfo:${deadHash}`;
+    await eenv.META_KV.put(deadKvNarinfoKey, `StorePath: /nix/store/${deadHash}-dead`);
     const db1 = (env as unknown as Env).CONTROL_DB;
     await insertDeadStorePath(db1);
     await putDeadObjects(eenv);
@@ -1211,7 +1209,6 @@ describe("POST /api/gc/execute", () => {
     expect(res.status).toBe(200);
     const body = await res.json() as Record<string, unknown>;
     expect(body["deleted"]).toEqual({
-      kv_narinfo_attempted: 1,
       r2_narinfo_attempted: 1,
       r2_nar_attempted: 0,
       d1_store_paths: 0,
@@ -1219,7 +1216,8 @@ describe("POST /api/gc/execute", () => {
       d1_build_closure: 0,
       d1_builds_pruned: 0,
     });
-    expect(await eenv.META_KV.get(deadKvNarinfoKey, "text")).toBeNull();
+    expect(await eenv.META_KV.get(deadKvNarinfoKey, "text"))
+      .toBe(`StorePath: /nix/store/${deadHash}-dead`);
     expect(await eenv.NAR_BUCKET.get(deadNarinfoKey)).toBeNull();
     expect(await eenv.NAR_BUCKET.get(deadNarKey)).not.toBeNull();
     expect(await countRows(db1, "store_paths", "store_hash", deadHash)).toBe(1);
@@ -1242,7 +1240,7 @@ describe("POST /api/gc/execute", () => {
     );
 
     expect(res.status).toBe(200);
-    // KV / R2 が消えていれば即 404（メタデータ L0 が無いため stale hit しない）
+    // R2 から消えれば即 404（メタデータ L0 が無いため stale hit しない）
     const stale = await handleNarinfo(eenv, deadHash);
     expect(stale.status).toBe(404);
   });
@@ -1285,7 +1283,6 @@ describe("POST /api/gc/execute", () => {
     expect(body["processed"]).toBe(1);
     expect(body["dead_remaining"]).toBe(0);
     expect(body["deleted"]).toEqual({
-      kv_narinfo_attempted: 0,
       r2_narinfo_attempted: 0,
       r2_nar_attempted: 1,
       d1_store_paths: 1,
@@ -1293,7 +1290,6 @@ describe("POST /api/gc/execute", () => {
       d1_build_closure: 1,
       d1_builds_pruned: 1,
     });
-    expect(await eenv.META_KV.get(deadKvNarinfoKey, "text")).toBeNull();
     expect(await eenv.NAR_BUCKET.get(deadNarinfoKey)).toBeNull();
     expect(await eenv.NAR_BUCKET.get(deadNarKey)).toBeNull();
     expect(await eenv.NAR_BUCKET.get(liveNarKey)).not.toBeNull();
@@ -1493,7 +1489,6 @@ describe("POST /api/gc/execute", () => {
     expect(body["dead_total"]).toBe(1);
     expect(body["processed"]).toBe(1);
     expect(body["deleted"]).toEqual({
-      kv_narinfo_attempted: 0,
       r2_narinfo_attempted: 0,
       r2_nar_attempted: 1,
       d1_store_paths: 0,
@@ -1574,7 +1569,6 @@ describe("POST /api/gc/execute", () => {
     expect(body["dead_total"]).toBe(0);
     expect(body["processed"]).toBe(0);
     expect(body["deleted"]).toEqual({
-      kv_narinfo_attempted: 0,
       r2_narinfo_attempted: 0,
       r2_nar_attempted: 0,
       d1_store_paths: 0,

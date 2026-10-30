@@ -34,7 +34,7 @@ bun run db:migrate:remote
 
 ## 4. Worker デプロイ
 
-deploy 前に `wrangler.toml` の `[vars]` にある `CF_ACCOUNT_ID = "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID"` を実 Cloudflare Account ID へ書き換える。
+deploy 前に `wrangler.toml` の `[vars]` にある `CF_ACCOUNT_ID` を自分の Cloudflare Account ID に設定する。
 
 ### 初回デプロイ（手動・疎通確認用）
 
@@ -81,10 +81,10 @@ publish workflow は **このレポではなく、flake を持つ側の repo** �
 | --- | --- | --- |
 | `CACHE_PRIVATE_KEY` | Secret | NAR 署名用秘密鍵（§1 で生成したもの） |
 | `ADMIN_TOKEN` | Secret | Worker 管理 API の Bearer トークン |
-| `CLOUDFLARE_API_TOKEN` | Secret | KV write 最小権限トークン |
+| `R2_ACCESS_KEY_ID` | Secret | R2 S3 互換 API のアクセスキー |
+| `R2_SECRET_ACCESS_KEY` | Secret | R2 S3 互換 API のシークレットキー |
 | `CLOUDFLARE_ACCOUNT_ID` | Variable | Cloudflare アカウント ID |
 | `API_BASE_URL` | Variable | §4 で記録した Worker の URL |
 | `R2_BUCKET_NAME` | Variable | R2 バケット名（例: `cf-edgenix-nar`） |
-| `KV_NAMESPACE_ID` | Variable | KV 名前空間 ID |
 
 各値の詳細・トークン権限・publish フロー全体は [`publish.md`](publish.md) を参照。

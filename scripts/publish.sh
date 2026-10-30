@@ -54,7 +54,6 @@ fi
 : "${SELF_CACHE_URL:=$API_BASE_URL}"
 : "${ADMIN_TOKEN:?ADMIN_TOKEN is required}"
 : "${R2_BUCKET_NAME:?R2_BUCKET_NAME is required}"
-: "${KV_NAMESPACE_ID:?KV_NAMESPACE_ID is required}"
 
 git_rev="${GIT_REV:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
 flake_lock_hash="${FLAKE_LOCK_HASH:-unknown}"
@@ -136,7 +135,7 @@ jq -s --arg cacheDir "$CACHE_DIR" --arg selfNarinfoDir "$self_narinfo_dir" \
   '{version: 2, cacheDir: $cacheDir, selfNarinfoDir: $selfNarinfoDir, targets: .}' \
   "$targets_file" > "$plan_file"
 
-echo "Uploading ${#hosts[@]} host(s) to R2/D1/KV via scripts/publish.ts..."
+echo "Uploading ${#hosts[@]} host(s) to R2/D1 via scripts/publish.ts..."
 phase_started=$SECONDS
 bun "$(dirname "$0")/publish.ts" --plan "$plan_file"
 log_timing "publish" "$phase_started"

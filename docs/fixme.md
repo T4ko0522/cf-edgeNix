@@ -28,7 +28,7 @@ purge は best-effort 実装（`src/cache/purge.ts`）なので機能は degrade
 2026-07-07 のベンチマーク（[dotfiles run 28880312114](https://github.com/T4ko0522/dotfiles/actions/runs/28880312114)、laptop closure 2,546 paths）で判明。
 
 Nix は Priority 30 の本 cache に全 path の narinfo を最初に問い合わせるため、
-cache に無い約 2,290 path 分のネガティブルックアップが毎回 KV → R2 404 まで貫通する
+cache に無い約 2,290 path 分のネガティブルックアップが毎回 R2 404 まで貫通する
 （404 も R2 Class B 課金対象）。実測:
 
 | フェーズ | ΔClass B |
@@ -36,6 +36,7 @@ cache に無い約 2,290 path 分のネガティブルックアップが毎回 K
 | edge cold run | +1,860 |
 | edge warm run（約 7 分後） | +1,440 |
 
+この計測は narinfo の KV 層廃止前のもので、現構成での再計測は未実施。
 `src/handlers/narinfo.ts` の negative cache（`max-age=60`）は実装済みだが、
 rebuild の実行間隔（数分〜数日）に対して TTL 60 秒は短すぎて全滅する。
 Workers Cache API による削減は NAR 本体 + narinfo positive 分の約 420 ops (23%) のみ。

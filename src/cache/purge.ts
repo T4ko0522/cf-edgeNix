@@ -5,7 +5,7 @@
  * cache-info）が付いており、GC / publish finalize はここを通して edge の
  * エントリ（negative cache 含む）を無効化する。
  *
- * purge は KV 削除や R2 削除と同格の best-effort として扱う:
+ * purge は best-effort として扱う:
  * - ctx.cache.purge が無いランタイム（ローカル dev / vitest の miniflare）ではスキップ
  * - 失敗（throw / success:false）は warn ログのみで処理を止めない
  *   （タグ purge がプラン制限で使えない場合も degraded 動作として受容する）

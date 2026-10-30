@@ -179,7 +179,6 @@ printf '%s' "$status"
       API_BASE_URL: "https://cache.example.com",
       ADMIN_TOKEN: "test-token",
       R2_BUCKET_NAME: "test-bucket",
-      KV_NAMESPACE_ID: "test-kv",
       GIT_REV: "deadbeef",
       SYSTEM: "x86_64-linux",
       FLAKE_LOCK_HASH: "sha256:lock",
@@ -208,6 +207,34 @@ printf '%s' "$status"
 }
 
 describe("scripts/publish.sh", () => {
+  test("KV の資格情報なしで publish plan を渡せる", async () => {
+    const { bunArgs } = await runPublishSh({ KV_NAMESPACE_ID: "", CLOUDFLARE_API_TOKEN: "" });
+    expect(bunArgs[1]).toBe("--plan");
+  });
+
+  test("publish CLI は KV の資格情報なしで plan を検証する", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cf-edgenix-publish-cli-"));
+    const planPath = join(dir, "plan.json");
+    await writeFile(planPath, "null");
+
+    await expect(execFileAsync("bun", ["--no-install", resolve(repoRoot, "scripts/publish.ts"), "--plan", planPath], {
+      env: {
+        ...process.env,
+        API_BASE_URL: "https://cache.example.com",
+        ADMIN_TOKEN: "test-token",
+        R2_BUCKET_NAME: "test-bucket",
+        CLOUDFLARE_ACCOUNT_ID: "test-account",
+        R2_ACCESS_KEY_ID: "test-access-key",
+        R2_SECRET_ACCESS_KEY: "test-secret-key",
+        KV_NAMESPACE_ID: "",
+        CLOUDFLARE_API_TOKEN: "",
+      },
+    })).rejects.toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("publish failed: publish plan must be an object"),
+    });
+  });
+
   test("ZSTD_LEVEL 未指定時は level 9 を使う", async () => {
     const { zstdArgs } = await runPublishSh({});
     expect(zstdArgs).toContain("-9");

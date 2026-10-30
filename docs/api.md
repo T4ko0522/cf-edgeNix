@@ -5,7 +5,7 @@ Worker が公開する HTTP エンドポイント一覧。OpenAPI スキーマ�
 | メソッド | パス | 認証 | 説明 |
 | --- | --- | --- | --- |
 | GET | `/nix-cache-info` | 不要 | cache メタ情報（`StoreDir` / `WantMassQuery` / `Priority`） |
-| GET | `/<store-hash>.narinfo` | 不要 | narinfo（`Workers Cache → KV → R2 → 404`・404 は 60 秒 negative cache） |
+| GET | `/<store-hash>.narinfo` | 不要 | narinfo（`Workers Cache → R2 → 404`・404 は 60 秒 negative cache） |
 | GET/HEAD | `/nar/<file-hash>.nar.zst` | 不要 | NAR 本体（Range: bytes=... / 206 対応・Workers Cache → R2 streaming） |
 | GET | `/api/hosts/:host/latest` | 不要 | host の latest published build |
 | GET | `/api/hosts/:host/builds` | 不要 | build 履歴 |
@@ -45,6 +45,8 @@ read 系の応答には `Cache-Tag`（`narinfo:<store-hash>` / `nar:<file-name>`
 - `POST /api/publish/:build_id/finalize`: closure の `narinfo:<store-hash>` / `nar:<file-name>` タグを purge し、publish 直前に入った 404 negative cache（TTL 60 秒）を即時解消する。
 
 `/api/*` の応答は全て `Cache-Control: no-store` で edge キャッシュ対象外。
+
+GC の narinfo 非公開化は R2 のみを削除し、`deleted.r2_narinfo_attempted` に削除試行数を返す。`deleted.kv_narinfo_attempted` は廃止した。
 
 ## 無料枠 kill-switch
 

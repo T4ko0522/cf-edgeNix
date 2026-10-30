@@ -143,7 +143,7 @@ const finalizeBody = {
   },
 };
 
-/** GC 対象の dead store path を D1 / KV / R2 に配置する */
+/** GC 対象の dead store path を D1 に配置する */
 async function insertDeadStorePath(db1: D1Database) {
   await db1.prepare(
     `INSERT INTO store_paths (store_hash, store_path, narinfo_key, nar_key, nar_hash, nar_size, file_hash, file_size, compression, created_at)
@@ -163,7 +163,6 @@ async function insertDeadStorePath(db1: D1Database) {
 }
 
 async function putDeadObjects(eenv: Env) {
-  await eenv.META_KV.put(`narinfo:${DEAD_HASH}`, "StorePath: dead\n");
   await eenv.NAR_BUCKET.put(DEAD_NARINFO_KEY, "StorePath: dead\n");
   await eenv.NAR_BUCKET.put(DEAD_NAR_KEY, "dead nar bytes");
 }
@@ -234,7 +233,6 @@ describe("GC execute の edge purge", () => {
     const body = await res.json() as Record<string, unknown>;
     expect(body["edge_purge_attempted"]).toBe(0);
     // 実削除は完了している
-    expect(await eenv.META_KV.get(`narinfo:${DEAD_HASH}`, "text")).toBeNull();
     expect(await eenv.NAR_BUCKET.get(DEAD_NARINFO_KEY)).toBeNull();
   });
 
