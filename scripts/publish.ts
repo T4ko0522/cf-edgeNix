@@ -3,7 +3,7 @@
  * scripts/publish.ts
  *
  * cf-edgeNix の publish オーケストレーションスクリプト。
- * 分類後に生成した所有pathのNAR/narinfoを R2/D1/KV へ反映する。
+ * 分類後に生成した所有pathのNAR/narinfoを R2/D1 へ反映する。
  *
  * batch 実行順序:
  *   1. 全 host の D1 start / ingest
@@ -11,7 +11,6 @@
  *   3. NAR upload（全 host の和集合、narKey で重複排除）
  *   4. narinfo upload（storeHash で重複排除）
  *   5. host 別 finalize
- *   6. KV warming（和集合に対して一度、失敗は警告のみ）
  *
  * R2 へは S3 互換 API を直接叩く (UNSIGNED-PAYLOAD で SigV4 署名)。
  * `bunx wrangler` の起動コスト (~1s/回) を排除し、ファイルあたり数十 ms に落とす。
@@ -23,11 +22,9 @@
  *   API_BASE_URL          Worker の URL (例: https://cache.example.com)
  *   ADMIN_TOKEN           管理API の Bearer トークン
  *   CLOUDFLARE_ACCOUNT_ID CF アカウント ID
- *   CLOUDFLARE_API_TOKEN  CF API トークン (KV bulk 書き込み権限)
  *   R2_ACCESS_KEY_ID      R2 S3 互換 API のアクセスキー (R2 dashboard で発行)
  *   R2_SECRET_ACCESS_KEY  R2 S3 互換 API のシークレットキー
  *   R2_BUCKET_NAME        R2 バケット名
- *   KV_NAMESPACE_ID       KV 名前空間 ID
  */
 
 /// <reference types="@types/bun" />
@@ -94,7 +91,6 @@ export interface PublishEnv {
   apiBaseUrl: string;
   adminToken: string;
   r2BucketName: string;
-  kvNamespaceId: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -233,11 +229,6 @@ export interface ExecAdapter {
   r2PutContent(bucketName: string, key: string, content: string): Promise<void>;
   /** R2 で key が存在するか確認 (差分化用)。存在すれば true。 */
   r2Has(bucketName: string, key: string): Promise<boolean>;
-  /** KV Bulk PUT。items を chunk に切って Cloudflare KV Bulk API へ。 */
-  kvPutBulk(
-    namespaceId: string,
-    items: ReadonlyArray<{ key: string; value: string }>,
-  ): Promise<void>;
   /** 管理 API 呼び出し */
   apiPost(url: string, token: string, body: unknown): Promise<unknown>;
 }
@@ -396,8 +387,6 @@ export interface FetchAdapterOpts {
   accountId: string;
   r2AccessKeyId: string;
   r2SecretAccessKey: string;
-  /** KV Bulk API 用の CF API トークン (KV write 権限)。 */
-  cfApiToken: string;
 }
 
 /** unknown を安全にメッセージへ変換する (raw error object をログに出さない用)。 */
@@ -454,7 +443,7 @@ async function fetchWithRetry(
     : new Error("fetchWithRetry exhausted (no error captured)");
 }
 
-/** R2 S3 互換 API + CF KV Bulk API + 管理 API へ fetch で直接送るアダプタ。 */
+/** R2 S3 互換 API + 管理 API へ fetch で直接送るアダプタ。 */
 export function makeFetchAdapter(opts: FetchAdapterOpts): ExecAdapter {
   async function putR2(
     bucket: string,
@@ -526,31 +515,6 @@ export function makeFetchAdapter(opts: FetchAdapterOpts): ExecAdapter {
       if (res.status === 200) return true;
       if (res.status === 404) return false;
       throw new Error(`R2 HEAD unexpected status ${res.status}`);
-    },
-    async kvPutBulk(namespaceId, items) {
-      if (items.length === 0) return;
-      // CF KV Bulk API: 1 リクエスト最大 10000 件 / 100MB。
-      // narinfo は数百 B 〜 数 KB / 件なので 5000 件 chunk で安全マージン。
-      const CHUNK = 5000;
-      const url = `https://api.cloudflare.com/client/v4/accounts/${opts.accountId}/storage/kv/namespaces/${namespaceId}/bulk`;
-      for (let i = 0; i < items.length; i += CHUNK) {
-        const chunk = items.slice(i, i + CHUNK);
-        const body = JSON.stringify(chunk);
-        const res = await fetchWithRetry(() => ({
-          url,
-          init: {
-            method: "PUT",
-            headers: {
-              authorization: `Bearer ${opts.cfApiToken}`,
-              "content-type": "application/json",
-            },
-            body,
-          },
-        }));
-        if (!res.ok) {
-          throw new Error(`KV bulk PUT failed (status ${res.status})`);
-        }
-      }
     },
     async apiPost(url, token, body) {
       const json = JSON.stringify(body);
@@ -861,20 +825,6 @@ export async function publishBatch(
       { manifest: manifests.get(state.buildMeta.id) },
     );
   }
-
-  try {
-    const items: Array<{ key: string; value: string }> = [];
-    for (const narinfo of ownedNarinfos.values()) {
-      const narinfoDir = newPaths.has(narinfo.storePath) ? plan.cacheDir : plan.selfNarinfoDir;
-      items.push({
-        key: `narinfo:${narinfo.storeHash}`,
-        value: await readFile(resolve(narinfoDir, `${narinfo.storeHash}.narinfo`), "utf-8"),
-      });
-    }
-    await exec.kvPutBulk(env.kvNamespaceId, items);
-  } catch (e) {
-    console.warn(`[KV] warming failed (non-fatal): ${errMessage(e)}`);
-  }
 }
 
 // ─── エントリポイント ─────────────────────────────────────────────────────────
@@ -889,9 +839,7 @@ if (
   const apiBaseUrl = process.env["API_BASE_URL"];
   const adminToken = process.env["ADMIN_TOKEN"];
   const r2BucketName = process.env["R2_BUCKET_NAME"];
-  const kvNamespaceId = process.env["KV_NAMESPACE_ID"];
   const accountId = process.env["CLOUDFLARE_ACCOUNT_ID"];
-  const cfApiToken = process.env["CLOUDFLARE_API_TOKEN"];
   const r2AccessKeyId = process.env["R2_ACCESS_KEY_ID"];
   const r2SecretAccessKey = process.env["R2_SECRET_ACCESS_KEY"];
 
@@ -900,16 +848,16 @@ if (
     process.exit(1);
   }
 
-  if (!apiBaseUrl || !adminToken || !r2BucketName || !kvNamespaceId) {
+  if (!apiBaseUrl || !adminToken || !r2BucketName) {
     console.error(
-      "Missing required env: API_BASE_URL, ADMIN_TOKEN, R2_BUCKET_NAME, KV_NAMESPACE_ID",
+      "Missing required env: API_BASE_URL, ADMIN_TOKEN, R2_BUCKET_NAME",
     );
     process.exit(1);
   }
 
-  if (!accountId || !cfApiToken || !r2AccessKeyId || !r2SecretAccessKey) {
+  if (!accountId || !r2AccessKeyId || !r2SecretAccessKey) {
     console.error(
-      "Missing required env: CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY",
+      "Missing required env: CLOUDFLARE_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY",
     );
     process.exit(1);
   }
@@ -918,14 +866,13 @@ if (
     accountId,
     r2AccessKeyId,
     r2SecretAccessKey,
-    cfApiToken,
   });
 
   readFile(planPath, "utf-8")
     .then((content) => parsePublishPlan(JSON.parse(content) as unknown))
     .then((plan) => publishBatch(
       plan,
-      { apiBaseUrl, adminToken, r2BucketName, kvNamespaceId },
+      { apiBaseUrl, adminToken, r2BucketName },
       adapter,
     ))
     .then(() => {

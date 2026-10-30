@@ -10,6 +10,7 @@
 Cloudflare、Cloudflare Workers、およびR2は、Cloudflare, Inc.の商標です。  
 
 cf-edgeNix は Cloudflare Workers に署名付き [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html) 基盤をdeployするプロジェクトです。  
+R2 が NAR / narinfo の正本、Workers Cache が配信キャッシュ、D1 が build 履歴・`latest`・rollback root・GC live-set を持つ control plane。narinfo / NAR は `Workers Cache → R2` で配信し、D1 を経由しない。KV は quota 状態と任意の `nix-cache-info` コピーを保持する。
 
 **Self-hosted、かつ Cloudflare 内で完結。** 自分の Cloudflare アカウントに自分の Worker を deploy する形なので、cache も署名鍵も完全に自分の手元にあり、サードパーティを経由しない。  
 さらに実体は Cloudflare のエッジ（Workers + R2 + KV + D1 + Workers Cache + Workers Builds）に閉じており、**VPS も origin server もコンテナも、GitHub Actions の deploy pipeline も不要**。  
@@ -38,12 +39,10 @@ NixOS の flake リポジトリで [publish workflow](.github/templates/publish-
 | --- | --- | --- |
 | `CACHE_PRIVATE_KEY` | Secret | Nix binary cache の署名秘密鍵。 |
 | `ADMIN_TOKEN` | Secret | Worker 管理 API の認証。 |
-| `CLOUDFLARE_API_TOKEN` | Secret | KV への書き込みに使う Cloudflare API トークン。 |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | Secret | R2 S3 API の認証情報。 |
 | `API_BASE_URL` | Variable | デプロイ済み Worker の URL。 |
 | `CLOUDFLARE_ACCOUNT_ID` | Variable | Cloudflare アカウント ID。 |
 | `R2_BUCKET_NAME` | Variable | publish 先の R2 バケット名。 |
-| `KV_NAMESPACE_ID` | Variable | publish 先の KV 名前空間 ID。 |
 
 R2・KV・D1 の binding ID の設定や鍵生成は [セットアップガイド](docs/setup.md) を参照。
 
@@ -66,7 +65,7 @@ R2・KV・D1 の binding ID の設定や鍵生成は [セットアップガイ�
 
 ### Edge & cost
 
-- Workers Cache（edge・Worker 手前）→ KV（narinfo）→ R2（正本）の階層構造。404 も短 TTL の negative cache
+- narinfo / NAR は Workers Cache（edge・Worker 手前）→ R2（正本）。404 も短 TTL の negative cache
 - 5 分おきの Cron が Cloudflare GraphQL Analytics から R2 storage / Class A / Class B を読む
 - 月次無料枠 80% で `warn`、95% で `killed`。`killed` 中は read path が `503` を返して課金事故を防ぐ
 - `POST /api/quota/reset` で手動解除
@@ -112,17 +111,16 @@ curl -sSfI https://cf-edgenix.<account>.workers.dev/<store-hash>.narinfo
 
 ## アーキテクチャ
 
-### Read path — narinfo / nix-cache-info
+### Read path — narinfo
 
 ```mermaid
 flowchart LR
     Client[Nix client] --> WC[(Workers Cache<br/>edge)]
     WC -. miss .-> W[Worker]
-    W --> KV[(KV: META_KV)]
-    KV -. miss .-> R2[(R2: NAR_BUCKET)]
+    W --> R2[(R2: NAR_BUCKET)]
 ```
 
-3 段ルックアップ。Workers Cache ヒット時は Worker 自体が起動しない（request collapsing 内蔵）。KV は結果整合、R2 が正本。R2 にも無ければ `404` を返し、これも 60 秒だけ edge にキャッシュする（negative cache — `nixos-rebuild` は存在しない path を大量に引くため）。
+Workers Cache ヒット時は Worker 自体が起動しない（request collapsing 内蔵）。miss 時は R2 を直接読み、無ければ `404` を返して 60 秒だけ edge にキャッシュする。Worker 起動時の quota 判定は引き続き KV を読む。`nix-cache-info` は `Workers Cache → KV → R2 → 既定値` の順で解決する。
 
 ### Read path — NAR 本体
 
@@ -142,12 +140,11 @@ flowchart LR
     GHA[GitHub Actions<br/>publish 側 repo] --> P[closure 分類・new のみ NAR 化]
     P -->|POST /api/publish/*| W[Worker]
     P --> R2[(R2)]
-    P -. warm .-> KV[(KV)]
     W --> D1[(D1: CONTROL_DB)]
 ```
 
 `latest` を動かすのは `start → ingest × N → R2 upload → finalize` の 1 ルートのみ。staging closure を R2 操作より先に登録し、GC と publish の競合を防ぐ。
-full closure を分類し、external は manifest のみに記録する。owned のうち new だけ NAR 化する。NAR upload → narinfo upload → D1 確定 → KV warming の順序は `scripts/publish.ts` の batch 経路で保証し、`test/publish/publish-script.test.ts` で検証している。
+full closure を分類し、external は manifest のみに記録する。owned のうち new だけ NAR 化する。NAR upload → narinfo upload → D1 確定の順序は `scripts/publish.ts` の batch 経路で保証し、`test/publish/publish-script.test.ts` で検証している。
 
 ### Deploy path
 

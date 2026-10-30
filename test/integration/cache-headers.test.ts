@@ -14,7 +14,7 @@
  * - nar 404: negative cache（max-age=60）
  * - nar 206/416: no-store（Workers Cache は 206 を保存しないが意図を明文化）
  * - /api/*: 全応答 no-store（ヒューリスティック 2h キャッシュによる latest stale 事故防止）
- * - メタデータ L0 削除: KV/R2 削除が即座に read path へ反映される（isolate stale なし）
+ * - narinfo は旧 KV データを参照せず、R2 の更新・削除を反映する
  */
 import { describe, expect, test } from "vitest";
 import { env } from "cloudflare:test";
@@ -36,15 +36,26 @@ const NAR_CONTENT = new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
 // ─── narinfo ─────────────────────────────────────────────────────────────────
 
 describe("narinfo のキャッシュヘッダ契約", () => {
+  test("旧 KV に別の narinfo が残っていても R2 の正本を返す", async () => {
+    const eenv = getEnv();
+    await eenv.META_KV.put(`narinfo:${STORE_HASH}`, "stale narinfo\n");
+    await eenv.NAR_BUCKET.put(`${STORE_HASH}.narinfo`, NARINFO_BODY);
+
+    const res = await handleNarinfo(eenv, STORE_HASH);
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(NARINFO_BODY);
+  });
+
   test("200: Cache-Control public, max-age=3600", async () => {
-    await getEnv().META_KV.put(`narinfo:${STORE_HASH}`, NARINFO_BODY);
+    await getEnv().NAR_BUCKET.put(`${STORE_HASH}.narinfo`, NARINFO_BODY);
     const res = await handleNarinfo(getEnv(), STORE_HASH);
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("public, max-age=3600");
   });
 
   test("200: Cache-Tag narinfo,narinfo:<storeHash>", async () => {
-    await getEnv().META_KV.put(`narinfo:${STORE_HASH}`, NARINFO_BODY);
+    await getEnv().NAR_BUCKET.put(`${STORE_HASH}.narinfo`, NARINFO_BODY);
     const res = await handleNarinfo(getEnv(), STORE_HASH);
     expect(res.headers.get("cache-tag")).toBe(`narinfo,narinfo:${STORE_HASH}`);
   });
@@ -61,14 +72,14 @@ describe("narinfo のキャッシュヘッダ契約", () => {
     expect(res.headers.get("cache-tag")).toBe(`narinfo-miss,narinfo:${missing}`);
   });
 
-  test("L0 削除: KV/R2 から消えたら即座に 404 になる（isolate stale なし）", async () => {
+  test("旧 KV に narinfo が残っていても R2 から消えたら 404 を返す", async () => {
     const eenv = getEnv();
     await eenv.META_KV.put(`narinfo:${STORE_HASH}`, NARINFO_BODY);
+    await eenv.NAR_BUCKET.put(`${STORE_HASH}.narinfo`, NARINFO_BODY);
     const warm = await handleNarinfo(eenv, STORE_HASH);
     expect(warm.status).toBe(200);
 
-    // KV から削除（R2 には元々ない）→ L0 が存在しないため次リクエストで即 404
-    await eenv.META_KV.delete(`narinfo:${STORE_HASH}`);
+    await eenv.NAR_BUCKET.delete(`${STORE_HASH}.narinfo`);
     const stale = await handleNarinfo(eenv, STORE_HASH);
     expect(stale.status).toBe(404);
   });

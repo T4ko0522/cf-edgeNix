@@ -16,11 +16,6 @@ export function narR2Key(fileName: string): string {
 /** R2 上の nix-cache-info オブジェクトキー。 */
 export const CACHE_INFO_R2_KEY = "nix-cache-info";
 
-/** KV 上の narinfo キー。 */
-export function narinfoKVKey(storeHash: string): string {
-  return `narinfo:${storeHash}`;
-}
-
 /** KV 上の nix-cache-info キー。 */
 export const CACHE_INFO_KV_KEY = "nix-cache-info";
 

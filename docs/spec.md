@@ -54,7 +54,7 @@ NixOS system closureをビルド
   ↓
 Cloudflare R2へNAR本体を保存
   ↓
-Workers KV / D1にメタデータを配置
+R2へnarinfoを保存し、D1で公開を確定
   ↓
 Cloudflare WorkersがNix binary cache endpointとして配信
   ↓
@@ -107,7 +107,7 @@ nar/<file-hash>.nar.zst
 | ---------------- | ----------------------------------------------- |
 | GitHub Actions   | NixOS system closureをビルドする（signed publisher）    |
 | R2               | NAR本体と`.narinfo`の正本（source of truth / read path の終点） |
-| Workers KV       | `.narinfo`や`nix-cache-info`の速度層（結果整合。正本ではない）    |
+| Workers KV       | quota 状態・世代カウンタと任意の `nix-cache-info` コピー |
 | D1               | build履歴・latest pointer・rollback root・GC live setのcontrol plane（read path には載せない） |
 | Workers          | Nix client向けHTTP binary cache gateway + 管理API    |
 | Workers Cache    | Worker 手前の edge cache（narinfo / NAR / negative cache） |
@@ -120,35 +120,19 @@ nar/<file-hash>.nar.zst
 
 全体構成は以下のようになる。
 
-```text
-                       ┌────────────────┐
-                       │ GitHub Actions │
-                       └───────┬────────┘
-                               │ nix build / closure分類 / newのみNAR化
-                               ▼
-                       ┌────────────────┐
-                       │ Publish Step   │
-                       └───────┬────────┘
-          ┌────────────────────┼────────────────────┐
-          ▼                    ▼                    ▼
-   ┌────────────┐       ┌────────────┐       ┌────────────┐
-   │ R2          │       │ Workers KV │       │ D1          │
-   │ 正本         │       │ 速度層      │       │ control     │
-   │ NAR/narinfo│       │ narinfo    │       │ build/GC    │
-   └─────┬──────┘       └─────┬──────┘       └─────┬──────┘
-         │  read path          │                    │ 管理API
-         │  edge→KV→R2         │                    │ publish/rollback/GC
-         └──────────┬──────────┘                    │
-                    ▼                                │
-              ┌────────────┐ ◀───────────────────────┘
-              │ Workers    │
-              │ Gateway    │
-              └─────┬──────┘
-                    ▼
-            local nixos-rebuild
+```mermaid
+flowchart LR
+    GHA[GitHub Actions] --> P[closure 分類・new のみ NAR 化]
+    P --> R2[(R2: NAR / narinfo)]
+    P -->|publish API| W[Worker]
+    W --> D1[(D1: build / latest / GC)]
+    Client[Nix client] --> WC[(Workers Cache)]
+    WC -. miss .-> W
+    W -->|narinfo / NAR| R2
+    W -->|quota / nix-cache-info| KV[(KV)]
 ```
 
-read path（narinfo / nix-cache-info）は `Workers Cache(edge) → KV → R2` で完結し、D1 を挟まない。D1 は publish / rollback / GC / manifest の control plane として、管理API側からのみ参照する。
+narinfo / NAR は `Workers Cache(edge) → R2`、`nix-cache-info` は `Workers Cache(edge) → KV → R2 → 既定値` で配信し、D1 を挟まない。Worker 起動時の quota 判定は KV を読む。D1 は publish / rollback / GC / manifest の control plane として、管理API側からのみ参照する。
 
 ---
 
@@ -174,8 +158,6 @@ nix-cache-info
 GET /<hash>.narinfo
   Workers Cache (edge・Worker 手前)
     ↓ miss → Worker 起動
-  Workers KV
-    ↓ miss
   R2 (deterministic key)
     ↓ miss
   404（edge で 60 秒 negative cache）
@@ -191,13 +173,11 @@ edge: Workers Cache（wrangler.toml [cache]）
   404 も短 TTL（max-age=60）でキャッシュする negative cache を担う
   無効化は Cache-Tag ベース（narinfo:<storeHash> / nar:<fileName> / cache-info）
 
-L1: Workers KV
-  narinfo / nix-cache-info を高速に返す速度層
-  結果整合なので「正しさ」には使わない（正本ではない）
-
-L2: R2
+R2:
   narinfo / NAR本体の正本（source of truth）
 ```
+
+KV は quota 状態・世代カウンタと任意の `nix-cache-info` コピーを持つ。`nix-cache-info` は KV miss 時に R2 を読み、R2 にも無ければ `CACHE_INFO_PRIORITY` から既定値を返す。publish はこのコピーを自動投入しない。
 
 かつて存在した isolate ローカルの L0 メモリキャッシュは Workers Cache 導入で廃止した。
 edge ヒット時は Worker が起動せず L0 は参照されないため実効ヒット率がほぼゼロになる一方、
@@ -211,15 +191,7 @@ git rev -> toplevel store path
 build履歴 / rollback root / GC live set
 ```
 
-これらの正本は D1 に置く。`host -> latest` のような可変ポインタは D1 を正本とし、
-KV へ置く場合も表示・高速化用のコピーに留める。
-
-重要なのは、**KV miss 時に D1 へ落とさないこと**。
-理由は、`nixos-rebuild` が1回で大量の `.narinfo` を引くため、KV miss が D1 へ雪崩れ込むと
-D1 が control plane ではなく hot metadata server に転落するからである。
-Nix protocol 上の metadata は原則 R2 から復元し、D1 は publish / rollback / GC / manifest 管理に限定する。
-
-> KVは真実ではなく、速い噂。真実はR2とD1に置く。
+これらの正本は D1 に置く。narinfo は store hash から R2 を直接読み、D1 は publish / rollback / GC / manifest 管理に限定する。
 
 ---
 
@@ -422,7 +394,7 @@ R2 GC対象判定
 
 これにより、binary cacheを単なる高速化基盤ではなく、復旧可能な環境配布基盤として扱える。
 
-GC の **削除順序** は `POST /api/gc/execute` の `phase` で実装済み: `phase=narinfo`（KV/R2 narinfo 削除、tombstone 記録、edge の `narinfo:<storeHash>` タグ purge）→ 1 時間の grace period → `phase=nar`（live-set 再検証、NAR/D1 削除、`nar:<fileName>` タグ purge）。grace は API が `gc_marks.narinfo_deleted_at` で強制する。edge purge は Workers Cache の Cache-Tag purge を使い best-effort とする（非対応プランでは negative/positive エントリが TTL で自然失効するのを待つ）。
+GC の **削除順序** は `POST /api/gc/execute` の `phase` で実装済み: `phase=narinfo`（R2 narinfo 削除、tombstone 記録、edge の `narinfo:<storeHash>` タグ purge）→ 1 時間の grace period → `phase=nar`（live-set 再検証、NAR/D1 削除、`nar:<fileName>` タグ purge）。grace は API が `gc_marks.narinfo_deleted_at` で強制する。edge purge は Workers Cache の Cache-Tag purge を使い best-effort とする（非対応プランでは negative/positive エントリが TTL で自然失効するのを待つ）。
 
 migration 前の `build_closure` は世代固有 `nar_key` を持たない。`POST /api/gc/backfill` が R2 の `manifests/<buildId>/manifest.json` から参照を復元し、未解決行が残る間は全 NAR を live とする fail-closed 動作で誤削除を防ぐ。manifest が存在しない旧 staging は24時間保護し、期限切れ後に pruned 化する。build の復元可否は `builds.restorable` に永続化し、公開 manifest API で closure 全体を走査しない。
 
@@ -451,7 +423,6 @@ Nixからpath metadataと署名を取得し、publishスクリプトがbinary ca
 8. host別closure.json / manifest.jsonをR2へ保存
 9. new pathのNARをnarKey単位で重複排除してupload。owned全件のnarinfoをstoreHash単位で重複排除してupload。self-existingのNARはR2 HEADで存在を再確認
 10. hostごとにfinalize（各hostのlatestを更新）
-11. owned narinfoの和集合を一度だけKV warming（失敗は警告のみ）
 ```
 
 重要なのは公開順序である。
@@ -466,12 +437,9 @@ NAR本体（R2、全hostの和集合）
 .narinfo（R2）
   ↓
 host別 finalize（control plane の正本）
-  ↓
-KV を warming（速度層・最後）
 ```
 
 `.narinfo`を先に公開すると、Nix clientがまだ存在しないNARを取りに行って404になる可能性がある。
-また KV は最後に warming する。KV は発表用のテープカットであって正本ではないため、D1 で published を確定してから速度層へ反映する。
 
 `latest` pointer が更新されるのは `POST /api/publish/:id/finalize` の 1 ステップのみ。
 `start` / `ingest` 途中で中断しても read path（narinfo / NAR）には影響しない。
@@ -499,8 +467,9 @@ public key:
 key rotation:
   - 新旧 public key を一定期間併用してから旧鍵を外す
 
-Cloudflare token（publish用）:
-  - R2 write / KV write を最小権限で分離（wrangler CLI が参照する CLOUDFLARE_API_TOKEN）
+publish用認証:
+  - R2 S3 互換 API 専用の R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY を使う
+  - 管理 API は ADMIN_TOKEN を使い、KV write 用トークンは持たない
   - D1 write は Worker 側の Drizzle batch（POST /api/publish/*）で行うため、
     publish スクリプトは D1 直接操作用トークンを持たない
 
@@ -527,7 +496,6 @@ GET /nix-cache-info
 
 GET /<hash>.narinfo
   → Workers Cache (edge)
-  → KV
   → R2 (deterministic key)
   → 404（edge で 60 秒 negative cache）
 
@@ -536,7 +504,7 @@ GET /nar/<file-hash>.nar.zst
   → R2 streaming
 ```
 
-`.narinfo` などのメタデータは `edge → KV → R2` で返し、read path に D1 を挟まない。
+narinfo は `edge → R2`、`nix-cache-info` は `edge → KV → R2 → 既定値` で返し、read path に D1 を挟まない。
 NAR本体は Worker 経由で R2 から streaming で返し、full 200 のみ edge に載る（HEAD / Range / ETag を自前実装する）。
 管理系（`/api/hosts/<host>/latest`、`/api/builds/...`、rollback、GC、publish 確定）のみ D1 を参照する。
 `/api/*` は latest pointer など鮮度が意味を持つ control plane のため、全応答に `Cache-Control: no-store` を
@@ -574,7 +542,7 @@ GitHub Actionsのみでも、build artifactやcacheを保存することはで�
 | 主目的          | CI内のcache / artifact保存 | Nix client向けのglobal binary cache |
 | 配布形式         | artifact/cache中心       | `substituter`として直接利用             |
 | NAR配信        | 工夫が必要                  | R2 + Cloudflare Cacheで自然に配布      |
-| `.narinfo`配信 | 設計が必要                  | KV / Workerで高速配信                 |
+| `.narinfo`配信 | 設計が必要                  | Workers Cache / R2で配信             |
 | rollback保持   | retention制限に影響されやすい    | D1で明示的にpolicy管理                  |
 | GC           | artifact単位になりがち        | closure単位でmark-and-sweep可能       |
 | 独自API        | 作りにくい                  | Workerで作れる                       |
@@ -659,7 +627,7 @@ CloudflareエコシステムによるBinary Cache配布基盤の設計
 
 本構想は、NixOSの遅いビルドをCloudflare上のbinary cacheによって高速化するだけでなく、環境の即時再現性とrollback可能性を高めるための基盤である。
 
-GitHub Actionsを signed builder、R2を NAR / narinfo の正本かつ read path の終点、Workers Cache と KV を`.narinfo`の速度層、D1を build履歴・latest pointer・rollback root・GC live set の control plane、WorkersをNix client向けgateway + 管理APIとして使う。read path（narinfo）は `Workers Cache(edge) → KV → R2` で完結させ、D1 は挟まない。
+GitHub Actionsを signed builder、R2を NAR / narinfo の正本かつ read path の終点、Workers Cache を配信キャッシュ、KV を quota 状態と任意の `nix-cache-info` コピーの保存先、D1を build履歴・latest pointer・rollback root・GC live set の control plane、WorkersをNix client向けgateway + 管理APIとして使う。narinfo は `Workers Cache(edge) → R2` で配信し、D1 は挟まない。
 
 これにより、一般的なNix binary cache serverをCloudflare Nativeに再構築し、dotfilesやflakeで定義されたNixOS環境を、どこでも短時間で復元できるようにする。
 
@@ -669,8 +637,11 @@ GitHub Actionsを signed builder、R2を NAR / narinfo の正本かつ read path
 build:
   GitHub Actions（new pathだけNARを生成し、narinfoを署名）
 
-metadata read path:
-  Workers Cache(edge) → Workers KV → R2（D1 は挟まない・404 は短 TTL negative cache）
+narinfo read path:
+  Workers Cache(edge) → R2（D1 は挟まない・404 は短 TTL negative cache）
+
+nix-cache-info read path:
+  Workers Cache(edge) → KV → R2 → 既定値
 
 control plane:
   D1（build履歴 / latest pointer / rollback root / GC live set）

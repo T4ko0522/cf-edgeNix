@@ -10,7 +10,7 @@
 Cloudflare, Cloudflare Workers, and R2 are trademarks of Cloudflare, Inc.  
 
 cf-edgeNix turns a Cloudflare Workers deployment into a signed [Nix binary cache](https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-help-stores.html).  
-R2 holds the canonical NAR / narinfo, Workers Cache and KV are the speed layer, and D1 keeps build history, `latest`, rollback roots, and the GC live-set. Reads go `Workers Cache → KV → R2` (narinfo) and `Workers Cache → R2` (NAR); D1 is never on the read path.
+R2 holds the canonical NAR / narinfo, Workers Cache caches delivery responses, and D1 keeps build history, `latest`, rollback roots, and the GC live-set. Both narinfo and NAR reads go `Workers Cache → R2`; D1 is never on the read path. KV stores quota state and an optional `nix-cache-info` copy.
 
 **Self-hosted, fully on Cloudflare.** You deploy your own Worker on your own Cloudflare account — the cache is yours, the signing key is yours, nothing routes through a third party.  
 And it stays entirely inside Cloudflare's edge (Workers + R2 + KV + D1 + Workers Cache + Workers Builds): **no VPS, no origin server, no container, no GitHub Actions deploy pipeline to maintain.**  
@@ -21,17 +21,16 @@ The goal is a global, signed binary cache that costs nothing on Cloudflare's fre
 
 ## Architecture
 
-### Read path — narinfo / nix-cache-info
+### Read path — narinfo
 
 ```mermaid
 flowchart LR
     Client[Nix client] --> WC[(Workers Cache<br/>edge)]
     WC -. miss .-> W[Worker]
-    W --> KV[(KV: META_KV)]
-    KV -. miss .-> R2[(R2: NAR_BUCKET)]
+    W --> R2[(R2: NAR_BUCKET)]
 ```
 
-Three-tier lookup. A Workers Cache hit never invokes the Worker (request collapsing built in). KV is eventually consistent; R2 is the source of truth. A `404` is also edge-cached for 60 seconds (negative cache — `nixos-rebuild` queries many paths that don't exist here).
+A Workers Cache hit never invokes the Worker (request collapsing built in). On a miss, the Worker reads R2 directly; absent objects return a `404` cached at the edge for 60 seconds. The quota guard still reads KV when the Worker runs. `nix-cache-info` resolves through `Workers Cache → KV → R2 → defaults`.
 
 ### Read path — NAR body
 
@@ -48,14 +47,14 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    GHA[GitHub Actions<br/>publish-side repo] -->|POST /api/publish/*| W[Worker]
-    W --> R2[(R2)]
+    GHA[GitHub Actions<br/>publish-side repo] --> P[Classify closure; archive new paths]
+    P -->|POST /api/publish/*| W[Worker]
+    P --> R2[(R2)]
     W --> D1[(D1: CONTROL_DB)]
-    W -. warm .-> KV[(KV)]
 ```
 
 `start → ingest × N → R2 upload → finalize` is the only path that moves `latest`.
-The staging closure is registered before R2 operations so GC cannot race a publish. NAR uploads precede narinfo, and finalization precedes KV warming.
+The staging closure is registered before R2 operations so GC cannot race a publish. NAR uploads precede narinfo, followed by D1 finalization.
 
 ### Deploy path
 
@@ -87,7 +86,7 @@ Workers Builds runs `wrangler d1 migrations apply --remote && wrangler deploy` o
 
 ### Edge & cost
 
-- Workers Cache (edge, in front of the Worker) → KV (narinfo) → R2 as source of truth; 404s get a short-TTL negative cache
+- Workers Cache (edge, in front of the Worker) → R2 for narinfo and NAR; 404s get a short-TTL negative cache
 - 5-minute cron polls Cloudflare GraphQL Analytics for R2 storage / Class A / Class B usage
 - `warn` at 80% of monthly free tier, `killed` at 95% — `killed` returns `503` on read paths to prevent billing surprise
 - Manual reset via `POST /api/quota/reset`

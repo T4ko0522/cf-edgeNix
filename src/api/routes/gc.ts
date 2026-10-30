@@ -29,8 +29,6 @@ import {
   markBuildsPrunedForNarKeys,
   markGcCandidates,
 } from "../../db/queries";
-import { narinfoKVKey } from "../../storage/keys";
-import { deleteText as deleteKvText } from "../../storage/kv";
 import { deleteObjects } from "../../storage/r2";
 import { getText } from "../../storage/r2";
 import { purgeTags, purgerFrom } from "../../cache/purge";
@@ -249,16 +247,6 @@ gcApp.openapi(gcBackfillRoute, async (c) => {
 gcApp.openapi(gcExecuteRoute, async (c) => {
   const db = getDb(c.env);
   const body = c.req.valid("json");
-  const runWithConcurrency = async <T>(
-    items: T[],
-    limit: number,
-    fn: (item: T) => Promise<void>,
-  ): Promise<void> => {
-    const queue = [...items];
-    while (queue.length) {
-      await Promise.all(queue.splice(0, limit).map(fn));
-    }
-  };
   const liveSet = await computeLiveSet(db);
   const phaseCandidates = body.phase === "narinfo"
     ? await listPendingNarinfoKeys(db, liveSet.deadCandidates)
@@ -270,7 +258,6 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
   let processed = targetNarKeys.length;
   let deadRemaining = Math.max(deadTotal - processed, 0);
   const deleted = {
-    kv_narinfo_attempted: 0,
     r2_narinfo_attempted: 0,
     r2_nar_attempted: 0,
     d1_store_paths: 0,
@@ -355,18 +342,10 @@ gcApp.openapi(gcExecuteRoute, async (c) => {
     const confirmedDead = safeDead.filter((row) => confirmedSet.has(row.narKey));
     const uniqueStoreHashes = [...new Set(confirmedDead.map((row) => row.storeHash))];
     const uniqueNarinfoKeys = [...new Set(confirmedDead.map((row) => row.narinfoKey))];
-    await runWithConcurrency(
-      uniqueStoreHashes,
-      50,
-      async (storeHash) => {
-        await deleteKvText(c.env, narinfoKVKey(storeHash));
-      },
-    );
     await deleteObjects(c.env, uniqueNarinfoKeys);
     await confirmNarinfoDeleted(db, confirmedNarKeys);
     processed = confirmedNarKeys.length;
     deadRemaining = Math.max(deadTotal - processed, 0);
-    deleted.kv_narinfo_attempted = uniqueStoreHashes.length;
     deleted.r2_narinfo_attempted = uniqueNarinfoKeys.length;
     // edge の narinfo（positive / negative 両エントリ）を無効化する。
     edgePurgeAttempted += await purgeTags(

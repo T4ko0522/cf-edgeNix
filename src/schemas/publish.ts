@@ -20,7 +20,7 @@ const Sha256NixHashSchema = z
     "Invalid sha256 hash format (must be sha256:<hex(64)|nix-base32(52)> or sha256-<base64(43)>=)",
   );
 
-/** R2/KV key: 安全な文字集合のみ、`.` 連続・`..` 不可、先頭末尾スラッシュ不可 */
+/** R2 key: 安全な文字集合のみ、`.` 連続・`..` 不可、先頭末尾スラッシュ不可 */
 const SafeKeySchema = z
   .string()
   .min(1)

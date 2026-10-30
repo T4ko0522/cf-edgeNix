@@ -11,8 +11,8 @@ import { runScheduledGc } from "./gc/cron";
 /**
  * cf-edgeNix Worker entry。
  *
- * read path（narinfo / nix-cache-info）は memory → KV → R2 で完結し D1 を挟まない。
- * NAR 本体は Worker 経由で Cache API → R2 streaming。
+ * narinfo は Workers Cache → R2、nix-cache-info は Workers Cache → KV → R2。
+ * NAR 本体は Workers Cache → R2 streaming。read path は D1 を挟まない。
  * 管理系（/api/...）は hono OpenAPIHono アプリへ委譲し D1 を参照する。
  * 詳細は docs/spec.md §10。
  */

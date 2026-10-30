@@ -33,7 +33,7 @@ command = "bun run build:web"
 # ─────────────────────────────────────────────────────────────
 # Bindings
 #   R2  : NAR / narinfo の正本（source of truth / read path の終点）
-#   KV  : narinfo / nix-cache-info の速度層（結果整合・正本ではない）
+#   KV  : quota 状態と世代カウンタ、任意の nix-cache-info コピー
 #   D1  : control plane（build履歴 / latest / rollback root / GC live set）
 # spec docs/spec.md §4, §6, §7 を参照。
 # 実 ID は `wrangler r2 bucket create` / `kv namespace create` / `d1 create` で発行して埋める。

@@ -64,14 +64,13 @@ export const GcExecuteRequestSchema = z.object({
   // phase デフォルトは narinfo (= grace period を挟む前提で narinfo を先に unpublish する)。
   // NAR の物理削除は grace 経過後に明示的に `phase: "nar"` で呼び直すこと。
   phase: z.enum(["narinfo", "nar"]).default("narinfo"),
-  // D1 Free の invocation あたり query 数と KV subrequest に余裕を残す。
+  // D1 Free の invocation あたり query 数と R2 subrequest に余裕を残す。
   max_deletes: z.number().int().positive().max(10).default(10),
   dry_run: z.boolean().default(false),
 });
 
-// `*_attempted` は KV/R2 の delete を呼んだ件数 (no-op を含む)。`d1_*` は事前 COUNT で確定した実削除件数。
+// `*_attempted` は R2 の delete を呼んだ件数 (no-op を含む)。`d1_*` は事前 COUNT で確定した実削除件数。
 export const GcExecuteDeletedSchema = z.object({
-  kv_narinfo_attempted: z.number().int().nonnegative(),
   r2_narinfo_attempted: z.number().int().nonnegative(),
   r2_nar_attempted: z.number().int().nonnegative(),
   d1_store_paths: z.number().int().nonnegative(),

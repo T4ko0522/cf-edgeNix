@@ -5,7 +5,7 @@
 export interface Env {
   /** NAR / narinfo の正本（source of truth）。read path の終点。 */
   NAR_BUCKET: R2Bucket;
-  /** narinfo / nix-cache-info の速度層（結果整合・正本ではない）。 */
+  /** quota 状態と世代カウンタ、任意の nix-cache-info コピー。 */
   META_KV: KVNamespace;
   /** control plane（build履歴 / latest / rollback root / GC live set）。 */
   CONTROL_DB: D1Database;

@@ -69,7 +69,7 @@
   const features = [
     {
       title: "Edge-first reads",
-      body: "narinfo は memory → KV → R2、NAR 本体は Cache API → R2。D1 は read path に一切乗らない。",
+      body: "narinfo と NAR 本体は Workers Cache → R2。D1 は read path に一切乗らない。",
     },
     {
       title: "Signed & verifiable",
@@ -81,7 +81,7 @@
     },
     {
       title: "Three-phase publish",
-      body: "start → ingest × N → finalize。NAR が narinfo に先行し、D1 commit が KV warming に先行する。",
+      body: "start → ingest × N → R2 upload → finalize。NAR を narinfo より先に保存し、D1 で公開を確定する。",
     },
   ];
 </script>
@@ -139,7 +139,7 @@
         />
 
         <p class="mx-auto mt-8 max-w-2xl text-pretty text-base text-fg-muted md:text-lg">
-          R2 が正本、KV と Cache API が速度層。Workers の Free Tier だけで動く、グローバル分散の
+          R2 が正本、Workers Cache が配信キャッシュ。Cloudflare の無料枠を活用する、グローバル分散の
           Nix binary cache。5 分 cron が請求前に kill-switch を引きます。
         </p>
 
@@ -241,12 +241,11 @@
       <div class="grid items-start gap-10 md:grid-cols-[1fr_1.2fr]">
         <div>
           <h2 class="text-2xl font-semibold tracking-tight md:text-3xl">
-            3 tier lookup, 1 source of truth.
+            Edge cache, R2 source of truth.
           </h2>
           <p class="mt-4 text-sm leading-relaxed text-fg-muted">
-            narinfo の読みは memory（L0 isolate）→ KV（L1）→ R2（正本）の順。
-            KV は結果整合、R2 が常に正本です。404 はそのまま client に伝播し、次の substituter に
-            fall-through します。
+            narinfo は Workers Cache から返し、miss 時は R2 の正本を直接読みます。
+            存在しない path は 404 を返し、次の substituter に fall-through します。
           </p>
           <a
             href={SPEC_URL}
@@ -262,19 +261,15 @@
         <div
           class="overflow-hidden rounded-xl border border-border bg-bg-elev/60 p-6 font-mono text-[13px] leading-relaxed text-fg-muted"
         >
-          <div class="flex items-center gap-3">
+          <div class="flex flex-wrap items-center gap-3">
             <span class="rounded-md border border-border bg-bg px-2 py-1 text-fg">Nix client</span>
             <span class="text-fg-muted/50">─▶</span>
-            <span class="rounded-md border border-border bg-bg px-2 py-1 text-fg">Worker</span>
+            <span class="rounded-md border border-border bg-bg px-2 py-1 text-fg">Workers Cache</span>
           </div>
           <div class="ml-[5.25rem] mt-3 space-y-2 border-l border-border pl-4">
             <div class="flex items-center gap-2">
               <span class="text-fg-muted/50">└▶</span>
-              <span class="rounded-md border border-border bg-bg px-2 py-1">memory <span class="text-fg-muted/70">(L0)</span></span>
-            </div>
-            <div class="flex items-center gap-2">
-              <span class="text-fg-muted/50">└▶</span>
-              <span class="rounded-md border border-border bg-bg px-2 py-1">KV <span class="text-fg-muted/70">META_KV</span></span>
+              <span class="rounded-md border border-border bg-bg px-2 py-1">Worker</span>
             </div>
             <div class="flex items-center gap-2">
               <span class="text-fg-muted/50">└▶</span>
